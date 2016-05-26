@@ -15,41 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "kudu/util/init.h"
-
-#include <string>
-
-#include "kudu/gutil/cpu.h"
-#include "kudu/gutil/strings/substitute.h"
-#include "kudu/util/status.h"
-
-using std::string;
+#include "kudu/rpc/request_tracker.h"
+#include "kudu/gutil/map-util.h"
 
 namespace kudu {
+namespace rpc {
 
-Status BadCPUStatus(const base::CPU& cpu, const char* instruction_set) {
-  return Status::NotSupported(strings::Substitute(
-      "The CPU on this system ($0) does not support the $1 instruction "
-      "set which is required for running Kudu. If you are running inside a VM, "
-      "you may need to enable SSE4.2 pass-through.",
-      cpu.cpu_brand(), instruction_set));
-}
+RequestTracker::RequestTracker(const string& client_id)
+    : client_id_(client_id),
+      next_(0) {}
 
-Status CheckCPUFlags() {
-  base::CPU cpu;
-  if (!cpu.has_sse42()) {
-    return BadCPUStatus(cpu, "SSE4.2");
-  }
-
-  if (!cpu.has_ssse3()) {
-    return BadCPUStatus(cpu, "SSSE3");
-  }
-
+Status RequestTracker::NewSeqNo(SequenceNumber* seq_no) {
+  lock_guard<simple_spinlock> l(&lock_);
+  *seq_no = next_;
+  InsertOrDie(&incomplete_rpcs_, *seq_no);
+  next_++;
   return Status::OK();
 }
 
-void InitKuduOrDie() {
-  CHECK_OK(CheckCPUFlags());
+Status RequestTracker::FirstIncomplete(SequenceNumber* seq_no) {
+  lock_guard<simple_spinlock> l(&lock_);
+  if (incomplete_rpcs_.empty()) return Status::NotFound("There are no incomplete RPCs");
+  *seq_no = *incomplete_rpcs_.begin();
+  return Status::OK();
 }
 
+void RequestTracker::RpcCompleted(const SequenceNumber& seq_no) {
+  lock_guard<simple_spinlock> l(&lock_);
+  incomplete_rpcs_.erase(seq_no);
+}
+
+} // namespace rpc
 } // namespace kudu

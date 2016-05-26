@@ -44,6 +44,7 @@
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/rpc/retriable_rpc.h"
 #include "kudu/rpc/rpc.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/debug-util.h"
@@ -52,6 +53,7 @@
 using std::pair;
 using std::set;
 using std::shared_ptr;
+using std::unique_ptr;
 using std::unordered_map;
 using strings::Substitute;
 
@@ -59,6 +61,8 @@ namespace kudu {
 
 using rpc::ErrorStatusPB;
 using rpc::Messenger;
+using rpc::ResponseCallback;
+using rpc::RetriableRpc;
 using rpc::RetriableRpcStatus;
 using rpc::Rpc;
 using rpc::RpcController;
@@ -175,202 +179,21 @@ struct InFlightOp {
   }
 };
 
-// A ServerPicker for tablets servers, backed by the MetaCache.
-// Replicas are returned fully initialized and ready to be used.
-class MetaCacheServerPicker : public ServerPicker<RemoteTabletServer> {
- public:
-  MetaCacheServerPicker(KuduClient* client,
-                        const scoped_refptr<MetaCache>& meta_cache,
-                        const KuduTable* table,
-                        RemoteTablet* const tablet)
-   : client_(client),
-     meta_cache_(meta_cache),
-     table_(table),
-     tablet_(tablet) {}
-
-  virtual ~MetaCacheServerPicker() {}
-
-  // TODO push more of this logic into RemoteTablet or at the very least make it
-  // so that we don't run the whole algorithm if no problems occurred.
-  virtual void PickLeader(const ServerPickedCallback& callback, const MonoTime& deadline) {
-    // Choose a destination TS according to the following algorithm:
-    // 1. If the tablet metadata is stale, refresh it (goto step 5).
-    // 2. Select the leader, provided:
-    //    a. The current leader is known,
-    //    b. It hasn't failed, and
-    //    c. It isn't currently marked as a follower.
-    // 3. If there's no good leader select another replica, provided:
-    //    a. It hasn't failed, and
-    //    b. It hasn't rejected our write due to being a follower.
-    // 4. Preemptively mark the replica we selected in step 3 as "leader" in the
-    //    meta cache, so that our selection remains sticky until the next Master
-    //    metadata refresh.
-    // 5. If we're out of appropriate replicas, force a lookup to the master
-    //    to fetch new consensus configuration information.
-    // 6. When the lookup finishes, forget which replicas were followers and
-    //    retry the write (i.e. goto 2).
-    // 7. If we issue the write and it fails because the destination was a
-    //    follower, remember that fact and retry the write (i.e. goto 2).
-    // 8. Repeat steps 1-7 until the write succeeds, fails for other reasons,
-    //    or the write's deadline expires.
-    RemoteTabletServer* leader = nullptr;
-    if (!tablet_->stale()) {
-      leader = tablet_->LeaderTServer();
-      bool marked_as_follower = false;
-      {
-        lock_guard<simple_spinlock> lock(&lock_);
-        marked_as_follower = ContainsKey(followers_, leader);
-
-      }
-      if (leader && marked_as_follower) {
-        VLOG(2) << "Tablet " << tablet_->tablet_id() << ": We have a follower for a leader: "
-            << leader->ToString();
-
-        // Mark the node as a follower in the cache so that on the next go-round,
-        // LeaderTServer() will not return it as a leader unless a full metadata
-        // refresh has occurred. This also avoids LookupTabletByKey() going into
-        // "fast path" mode and not actually performing a metadata refresh from the
-        // Master when it needs to.
-        tablet_->MarkTServerAsFollower(leader);
-        leader = nullptr;
-      }
-      if (!leader) {
-        // Try to "guess" the next leader.
-        vector<RemoteTabletServer*> replicas;
-        tablet_->GetRemoteTabletServers(&replicas);
-        set<RemoteTabletServer*> followers_copy;
-        {
-          lock_guard<simple_spinlock> lock(&lock_);
-          followers_copy = followers_;
-
-        }
-        for (RemoteTabletServer* ts : replicas) {
-          if (!ContainsKey(followers_copy, ts)) {
-            leader = ts;
-            break;
-          }
-        }
-        if (leader) {
-          // Mark this next replica "preemptively" as the leader in the meta cache,
-          // so we go to it first on the next write if writing was successful.
-          VLOG(1) << "Tablet " << tablet_->tablet_id() << ": Previous leader failed. "
-              << "Preemptively marking tserver " << leader->ToString()
-              << " as leader in the meta cache.";
-          tablet_->MarkTServerAsLeader(leader);
-        }
-      }
-    }
-
-    // If we've tried all replicas, force a lookup to the master to find the
-    // new leader. This relies on some properties of LookupTabletByKey():
-    // 1. The fast path only works when there's a non-failed leader (which we
-    //    know is untrue here).
-    // 2. The slow path always fetches consensus configuration information and updates the
-    //    looked-up tablet.
-    // Put another way, we don't care about the lookup results at all; we're
-    // just using it to fetch the latest consensus configuration information.
-    //
-    // TODO: When we support tablet splits, we should let the lookup shift
-    // the write to another tablet (i.e. if it's since been split).
-    if (!leader) {
-      meta_cache_->LookupTabletByKey(
-          table_,
-          tablet_->partition().partition_key_start(),
-          deadline,
-          NULL,
-          Bind(&MetaCacheServerPicker::LookUpTabletCb, Unretained(this), callback, deadline));
-      return;
-    }
-
-    // If we have a current TS initialize the proxy.
-    // Make sure we have a working proxy before sending out the RPC.
-    leader->InitProxy(client_,
-                      Bind(&MetaCacheServerPicker::InitProxyCb,
-                           Unretained(this),
-                           callback,
-                           leader));
-  }
-
-  virtual void MarkServerFailed(RemoteTabletServer* server, const Status& status) {
-    tablet_->MarkReplicaFailed(server, status);
-  }
-
-  virtual void MarkReplicaNotLeader(RemoteTabletServer* server) {
-    {
-      lock_guard<simple_spinlock> lock(&lock_);
-      followers_.insert(server);
-    }
-  }
-
-  virtual void MarkResourceNotFound(RemoteTabletServer* server) {
-    tablet_->MarkStale();
-  }
- private:
-
-  // Called whenever a tablet lookup in the metacache completes.
-  void LookUpTabletCb(const ServerPickedCallback& callback,
-                      const MonoTime& deadline,
-                      const Status& status) {
-    // Whenever we lookup the tablet, clear the set of followers.
-    {
-      lock_guard<simple_spinlock> lock(&lock_);
-      followers_.clear();
-    }
-
-    // If we couldn't lookup the tablet call the user callback immediately.
-    if (!status.ok()) {
-      callback.Run(status, nullptr);
-      return;
-    }
-
-    // If we could lookup the tablet run the picking method again.
-    //
-    // TODO if we add new Pick* methods the method to (re-)call needs to be passed as
-    // a callback, for now we just have PickLeader so we can call it directly.
-    PickLeader(callback, deadline);
-  }
-
-  void InitProxyCb(const ServerPickedCallback& callback,
-                   RemoteTabletServer* replica,
-                   const Status& status) {
-    callback.Run(status, replica);
-  }
-
-  // Lock protecting accesses/updates to 'followers_'.
-  mutable simple_spinlock lock_;
-
-  // Reference to the client so that we can initialize a replica proxy, when we find it.
-  KuduClient* client_;
-
-  // A ref to the meta cache.
-  scoped_refptr<MetaCache> meta_cache_;
-
-  // The table we're writing to.
-  const KuduTable* table_;
-
-  // The tablet we're picking replicas for.
-  RemoteTablet* const tablet_;
-
-  // TSs that refused writes and that were marked as followers as a consequence.
-  set<RemoteTabletServer*> followers_;
-};
-
 // A Write RPC which is in-flight to a tablet. Initially, the RPC is sent
 // to the leader replica, but it may be retried with another replica if the
 // leader fails.
 //
 // Keeps a reference on the owning batcher while alive.
-class WriteRpc : public Rpc {
+class WriteRpc : public RetriableRpc<RemoteTabletServer, WriteRequestPB, WriteResponsePB> {
  public:
   WriteRpc(const scoped_refptr<Batcher>& batcher,
-           const scoped_refptr<MetaCacheServerPicker>& server_picker,
+           const scoped_refptr<MetaCacheServerPicker>& replica_picker,
            vector<InFlightOp*> ops,
            const MonoTime& deadline,
            const shared_ptr<Messenger>& messenger,
            const string& tablet_id);
   virtual ~WriteRpc();
-  virtual void SendRpc() OVERRIDE;
-  virtual string ToString() const OVERRIDE;
+  string ToString() const override;
 
   const KuduTable* table() const {
     // All of the ops for a given tablet obviously correspond to the same table,
@@ -381,39 +204,15 @@ class WriteRpc : public Rpc {
   const WriteResponsePB& resp() const { return resp_; }
   const string& tablet_id() const { return tablet_id_; }
 
+ protected:
+  void Try(RemoteTabletServer* replica, const ResponseCallback& callback) override;
+  RetriableRpcStatus AnalyzeResponse(const Status& rpc_cb_status) override;
+  void Finish(const Status& status) override;
+
  private:
-  // Analyzes the response/current status and returns a RetriableRpcStatus containing
-  // an enum that can be used to choose the action to take.
-  RetriableRpcStatus AnalyzeResponse(const Status& rpc_cb_status);
-
-  // Retries the rpc, if possible. Returns true if a retry occurred or
-  // false otherwise.
-  bool RetryIfNeeded(const RetriableRpcStatus& status,  RemoteTabletServer* replica);
-
-  // Called with an OK status when the leader has been found and the proxy initialized.
-  // Called with any other status if something failed with 'replica' set to 'nullptr'.
-  void ReplicaFoundCb(const Status& status, RemoteTabletServer* replica);
-
-  virtual void SendRpcCb(const Status& status) OVERRIDE;
-
   // Pointer back to the batcher. Processes the write response when it
   // completes, regardless of success or failure.
   scoped_refptr<Batcher> batcher_;
-
-  // The tablet that should receive this write.
-  scoped_refptr<MetaCacheServerPicker> server_picker_;
-
-  // Request body.
-  WriteRequestPB req_;
-
-  // Response body.
-  WriteResponsePB resp_;
-
-  // Keeps track of the tablet server the write was sent to.
-  // TODO Remove this and pass the used replica around. For now we need to keep this as
-  // the retrier calls the SendRpcCb directly and doesn't know the replica that was
-  // being written to.
-  RemoteTabletServer* current_ts_;
 
   // Operations which were batched into this RPC.
   // These operations are in kRequestSent state.
@@ -424,15 +223,13 @@ class WriteRpc : public Rpc {
 };
 
 WriteRpc::WriteRpc(const scoped_refptr<Batcher>& batcher,
-                   const scoped_refptr<MetaCacheServerPicker>& server_picker,
+                   const scoped_refptr<MetaCacheServerPicker>& replica_picker,
                    vector<InFlightOp*> ops,
                    const MonoTime& deadline,
                    const shared_ptr<Messenger>& messenger,
                    const string& tablet_id)
-    : Rpc(deadline, messenger),
+    : RetriableRpc(replica_picker, deadline, messenger),
       batcher_(batcher),
-      server_picker_(server_picker),
-      current_ts_(nullptr),
       ops_(std::move(ops)),
       tablet_id_(tablet_id) {
   const Schema* schema = table()->schema().schema_;
@@ -491,35 +288,29 @@ WriteRpc::~WriteRpc() {
   STLDeleteElements(&ops_);
 }
 
-void WriteRpc::SendRpc() {
-  server_picker_->PickLeader(Bind(&WriteRpc::ReplicaFoundCb,
-                                  Unretained(this)),
-                              retrier().deadline());
-}
-
 string WriteRpc::ToString() const {
   return Substitute("Write(tablet: $0, num_ops: $1, num_attempts: $2)",
                     tablet_id_, ops_.size(), num_attempts());
 }
 
-void WriteRpc::ReplicaFoundCb(const Status& status, RemoteTabletServer* replica) {
-  RetriableRpcStatus result = AnalyzeResponse(status);
-  if (RetryIfNeeded(result, replica)) return;
-
-  if (result.result == RetriableRpcStatus::NON_RETRIABLE_ERROR) {
-    batcher_->ProcessWriteResponse(*this, status);
-    delete this;
-    return;
-  }
-
-  DCHECK_EQ(result.result, RetriableRpcStatus::OK);
-
+void WriteRpc::Try(RemoteTabletServer* replica, const ResponseCallback& callback) {
   VLOG(2) << "Tablet " << tablet_id_ << ": Writing batch to replica "
-          << replica->ToString();
-  current_ts_ = replica;
+      << replica->ToString();
   replica->proxy()->WriteAsync(req_, &resp_,
                                mutable_retrier()->mutable_controller(),
-                               boost::bind(&WriteRpc::SendRpcCb, this, Status::OK()));
+                               callback);
+}
+
+void WriteRpc::Finish(const Status& status) {
+  unique_ptr<WriteRpc> this_instance(this);
+  Status final_status = status;
+  if (!final_status.ok()) {
+    final_status = final_status.CloneAndPrepend(
+        Substitute("Failed to write batch of $0 ops to tablet $1 after $2 attempt(s)",
+                   ops_.size(), tablet_id_, num_attempts()));
+    LOG(WARNING) << final_status.ToString();
+  }
+  batcher_->ProcessWriteResponse(*this, final_status);
 }
 
 RetriableRpcStatus WriteRpc::AnalyzeResponse(const Status& rpc_cb_status) {
@@ -582,62 +373,6 @@ RetriableRpcStatus WriteRpc::AnalyzeResponse(const Status& rpc_cb_status) {
     result.result = RetriableRpcStatus::NON_RETRIABLE_ERROR;
   }
   return result;
-}
-
-bool WriteRpc::RetryIfNeeded(const RetriableRpcStatus& result, RemoteTabletServer* replica) {
-  // Handle the cases where we retry.
-  switch (result.result) {
-    // For writes, always retry a SERVER_BUSY error on the same server.
-    case RetriableRpcStatus::SERVER_BUSY: {
-      break;
-    }
-    case RetriableRpcStatus::SERVER_NOT_ACCESSIBLE: {
-      VLOG(1) << "Failing " << ToString() << " to a new replica: " << result.status.ToString();
-      server_picker_->MarkServerFailed(replica, result.status);
-      break;
-    }
-    // The TabletServer was not part of the config serving the tablet.
-    // We mark our tablet cache as stale, forcing a master lookup on the next attempt.
-    // TODO: Don't backoff the first time we hit this error (see KUDU-1314).
-    case RetriableRpcStatus::RESOURCE_NOT_FOUND: {
-      server_picker_->MarkResourceNotFound(replica);
-      break;
-    }
-    // The TabletServer was not the leader of the quorum.
-    case RetriableRpcStatus::REPLICA_NOT_LEADER: {
-      server_picker_->MarkReplicaNotLeader(replica);
-      break;
-    }
-    // For the OK and NON_RETRIABLE_ERROR cases we can't/won't retry.
-    default:
-      return false;
-  }
-  resp_.Clear();
-  mutable_retrier()->DelayedRetry(this, result.status);
-  return true;
-}
-
-void WriteRpc::SendRpcCb(const Status& status) {
-  RetriableRpcStatus result = AnalyzeResponse(status);
-  if (RetryIfNeeded(result, current_ts_)) return;
-
-  // From here on out the rpc has either succeeded of suffered a non-retriable
-  // failure.
-  Status final_status = result.status;
-  if (!final_status.ok()) {
-    string current_ts_string;
-    if (current_ts_) {
-      current_ts_string = Substitute("on tablet server $0", current_ts_->ToString());
-    } else {
-      current_ts_string = "(no tablet server available)";
-    }
-    final_status = final_status.CloneAndPrepend(
-        Substitute("Failed to write batch of $0 ops to tablet $1 $2 after $3 attempt(s)",
-                   ops_.size(), tablet_id_, current_ts_string, num_attempts()));
-    LOG(WARNING) << final_status.ToString();
-  }
-  batcher_->ProcessWriteResponse(*this, final_status);
-  delete this;
 }
 
 Batcher::Batcher(KuduClient* client,

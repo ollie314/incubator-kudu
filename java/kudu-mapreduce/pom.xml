@@ -23,7 +23,7 @@
     <parent>
         <groupId>org.kududb</groupId>
         <artifactId>kudu-parent</artifactId>
-        <version>0.9.0-SNAPSHOT</version>
+        <version>1.0.0-SNAPSHOT</version>
     </parent>
 
     <artifactId>kudu-mapreduce</artifactId>
@@ -68,12 +68,6 @@
           <groupId>org.apache.hadoop</groupId>
           <artifactId>hadoop-client</artifactId>
           <version>${hadoop.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.hadoop</groupId>
-            <artifactId>hadoop-common</artifactId>
-            <version>${hadoop.version}</version>
-            <type>test-jar</type>
         </dependency>
         <dependency>
             <groupId>junit</groupId>

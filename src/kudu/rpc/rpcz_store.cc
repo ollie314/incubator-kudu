@@ -70,6 +70,13 @@ class MethodSampler {
   void GetSamplePBs(RpczMethodPB* pb);
 
  private:
+  // Convert the trace metrics from 't' into protobuf entries in 'sample_pb'.
+  // This function recurses through the parent-child relationship graph,
+  // keeping the current tree path in 'child_path' (empty at the root).
+  static void GetTraceMetrics(const Trace& t,
+                              const std::string& child_path,
+                              RpczSamplePB* sample_pb);
+
   // An individual recorded sample.
   struct Sample {
     RequestHeader header;
@@ -142,7 +149,30 @@ void MethodSampler::SampleCall(InboundCall* call) {
       std::swap(bucket->sample, new_sample);
       bucket->last_sample_time.Store(now);
     }
-    LOG(INFO) << "Sampled call " << call->ToString();
+    VLOG(1) << "Sampled call " << call->ToString();
+  }
+}
+
+void MethodSampler::GetTraceMetrics(const Trace& t,
+                                    const string& child_path,
+                                    RpczSamplePB* sample_pb) {
+  auto m = t.metrics().Get();
+  for (const auto& e : m) {
+    auto* pb = sample_pb->add_metrics();
+    pb->set_key(e.first);
+    pb->set_value(e.second);
+    if (!child_path.empty()) {
+      pb->set_child_path(child_path);
+    }
+  }
+
+  for (const auto& child_pair : t.ChildTraces()) {
+    string path = child_path;
+    if (!path.empty()) {
+      path += ".";
+    }
+    path += child_pair.first.ToString();
+    GetTraceMetrics(*child_pair.second.get(), path, sample_pb);
   }
 }
 
@@ -153,7 +183,9 @@ void MethodSampler::GetSamplePBs(RpczMethodPB* method_pb) {
     std::unique_lock<simple_spinlock> lock(bucket.sample_lock);
     auto* sample_pb = method_pb->add_samples();
     sample_pb->mutable_header()->CopyFrom(bucket.sample.header);
-    sample_pb->set_trace(bucket.sample.trace->DumpToString(Trace::INCLUDE_ALL));
+    sample_pb->set_trace(bucket.sample.trace->DumpToString(Trace::INCLUDE_TIME_DELTAS));
+
+    GetTraceMetrics(*bucket.sample.trace.get(), "", sample_pb);
     sample_pb->set_duration_ms(bucket.sample.duration_ms);
   }
 }
