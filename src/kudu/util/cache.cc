@@ -4,14 +4,17 @@
 
 #include <glog/logging.h>
 #include <memory>
+#include <mutex>
 #include <stdlib.h>
 #include <string>
 #include <vector>
 
 #include "kudu/gutil/atomic_refcount.h"
+#include "kudu/gutil/bits.h"
 #include "kudu/gutil/hash/city.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/sysinfo.h"
 #include "kudu/util/alignment.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/cache.h"
@@ -261,7 +264,7 @@ void LRUCache::LRU_Append(LRUHandle* e) {
 Cache::Handle* LRUCache::Lookup(const Slice& key, uint32_t hash, bool caching) {
   LRUHandle* e;
   {
-    lock_guard<MutexType> l(&mutex_);
+    std::lock_guard<MutexType> l(mutex_);
     e = table_.Lookup(key, hash);
     if (e != nullptr) {
       base::RefCountInc(&e->refs);
@@ -314,7 +317,7 @@ Cache::Handle* LRUCache::Insert(LRUHandle* e, Cache::EvictionCallback *eviction_
 
   LRUHandle* to_remove_head = nullptr;
   {
-    lock_guard<MutexType> l(&mutex_);
+    std::lock_guard<MutexType> l(mutex_);
 
     LRU_Append(e);
 
@@ -353,7 +356,7 @@ void LRUCache::Erase(const Slice& key, uint32_t hash) {
   LRUHandle* e;
   bool last_reference = false;
   {
-    lock_guard<MutexType> l(&mutex_);
+    std::lock_guard<MutexType> l(mutex_);
     e = table_.Remove(key, hash);
     if (e != nullptr) {
       LRU_Remove(e);
@@ -367,8 +370,13 @@ void LRUCache::Erase(const Slice& key, uint32_t hash) {
   }
 }
 
-static const int kNumShardBits = 4;
-static const int kNumShards = 1 << kNumShardBits;
+// Determine the number of bits of the hash that should be used to determine
+// the cache shard. This, in turn, determines the number of shards.
+int DetermineShardBits() {
+  int bits = Bits::Log2Ceiling(base::NumCPUs());
+  VLOG(1) << "Will use " << (1 << bits) << " shards for LRU cache.";
+  return bits;
+}
 
 class ShardedLRUCache : public Cache {
  private:
@@ -378,26 +386,31 @@ class ShardedLRUCache : public Cache {
   MutexType id_mutex_;
   uint64_t last_id_;
 
+  // Number of bits of hash used to determine the shard.
+  const int shard_bits_;
+
   static inline uint32_t HashSlice(const Slice& s) {
     return util_hash::CityHash64(
       reinterpret_cast<const char *>(s.data()), s.size());
   }
 
-  static uint32_t Shard(uint32_t hash) {
-    return hash >> (32 - kNumShardBits);
+  uint32_t Shard(uint32_t hash) {
+    return hash >> (32 - shard_bits_);
   }
 
  public:
   explicit ShardedLRUCache(size_t capacity, const string& id)
-      : last_id_(0) {
+      : last_id_(0),
+        shard_bits_(DetermineShardBits()) {
     // A cache is often a singleton, so:
     // 1. We reuse its MemTracker if one already exists, and
     // 2. It is directly parented to the root MemTracker.
     mem_tracker_ = MemTracker::FindOrCreateTracker(
         -1, strings::Substitute("$0-sharded_lru_cache", id));
 
-    const size_t per_shard = (capacity + (kNumShards - 1)) / kNumShards;
-    for (int s = 0; s < kNumShards; s++) {
+    int num_shards = 1 << shard_bits_;
+    const size_t per_shard = (capacity + (num_shards - 1)) / num_shards;
+    for (int s = 0; s < num_shards; s++) {
       gscoped_ptr<LRUCache> shard(new LRUCache(mem_tracker_.get()));
       shard->SetCapacity(per_shard);
       shards_.push_back(shard.release());
@@ -429,7 +442,7 @@ class ShardedLRUCache : public Cache {
     return reinterpret_cast<LRUHandle*>(handle)->value();
   }
   virtual uint64_t NewId() OVERRIDE {
-    lock_guard<MutexType> l(&id_mutex_);
+    std::lock_guard<MutexType> l(id_mutex_);
     return ++(last_id_);
   }
 

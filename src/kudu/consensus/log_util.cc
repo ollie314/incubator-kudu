@@ -215,7 +215,7 @@ Status LogEntryReader::HandleReadError(const Status& s) const {
   LOG(INFO) << "Ignoring log segment corruption in " << seg_->path_ << " because "
             << "there are no log entries following the corrupted one. "
             << "The server probably crashed in the middle of writing an entry "
-            << "to the write-ahead log or downloaded an active log via remote bootstrap. "
+            << "to the write-ahead log or downloaded an active log via tablet copy. "
             << "Error detail: " << corruption_status.ToString();
   return Status::EndOfFile("");
 }
@@ -308,8 +308,14 @@ Status ReadableLogSegment::Init() {
 
   Status s = ReadFooter();
   if (!s.ok()) {
-    LOG(WARNING) << "Could not read footer for segment: " << path_
-        << ": " << s.ToString();
+    if (s.IsNotFound()) {
+      LOG(INFO) << "Log segment " << path_ << " has no footer. This segment was likely "
+                << "being written when the server previously shut down.";
+    } else {
+      LOG(WARNING) << "Could not read footer for segment: " << path_
+          << ": " << s.ToString();
+      return s;
+    }
   }
 
   is_initialized_ = true;
@@ -486,14 +492,14 @@ Status ReadableLogSegment::ReadFooter() {
   RETURN_NOT_OK(ReadFooterMagicAndFooterLength(&footer_size));
 
   if (footer_size == 0 || footer_size > kLogSegmentMaxHeaderOrFooterSize) {
-    return Status::NotFound(
+    return Status::Corruption(
         Substitute("File is corrupted. "
                    "Parsed header size: $0 is zero or bigger than max header size: $1",
                    footer_size, kLogSegmentMaxHeaderOrFooterSize));
   }
 
   if (footer_size > (file_size() - first_entry_offset_)) {
-    return Status::NotFound("Footer not found. File corrupted. "
+    return Status::Corruption("Footer not found. File corrupted. "
         "Decoded footer length pointed at a footer before the first entry.");
   }
 
@@ -759,7 +765,6 @@ Status WritableLogSegment::WriteFooterAndClose(const LogSegmentFooterPB& footer)
 
   return Status::OK();
 }
-
 
 Status WritableLogSegment::WriteEntryBatch(const Slice& data) {
   DCHECK(is_header_written_);

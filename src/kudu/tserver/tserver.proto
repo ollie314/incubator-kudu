@@ -16,7 +16,7 @@
 // under the License.
 package kudu.tserver;
 
-option java_package = "org.kududb.tserver";
+option java_package = "org.apache.kudu.tserver";
 
 import "kudu/common/common.proto";
 import "kudu/common/wire_protocol.proto";
@@ -86,7 +86,7 @@ message TabletServerErrorPB {
     // The compare-and-swap specified by an atomic RPC operation failed.
     CAS_FAILED = 17;
 
-    // The requested operation is already inprogress, e.g. RemoteBootstrap.
+    // The requested operation is already inprogress, e.g. TabletCopy.
     ALREADY_INPROGRESS = 18;
 
     // The request is throttled.
@@ -156,6 +156,10 @@ message WriteResponsePB {
 
 // A list tablets request
 message ListTabletsRequestPB {
+  // Whether the server should include schema information in the response.
+  // These fields can be relatively large, so not including it can make this call
+  // less heavy-weight.
+  optional bool need_schema_info = 1 [default = true];
 }
 
 // A list tablets response
@@ -164,7 +168,10 @@ message ListTabletsResponsePB {
 
   message StatusAndSchemaPB {
     required tablet.TabletStatusPB tablet_status = 1;
-    required SchemaPB schema = 2;
+
+    // 'schema' and 'partition_schema' will only be included if the original request
+    // set 'need_schema_info'.
+    optional SchemaPB schema = 2;
     optional PartitionSchemaPB partition_schema = 3;
   }
 
@@ -298,6 +305,13 @@ message ScanRequestPB {
   optional bool close_scanner = 5;
 }
 
+// RPC's resource metrics.
+message ResourceMetricsPB {
+  // all metrics MUST be the type of int64.
+  optional int64 cfile_cache_miss_bytes = 1;
+  optional int64 cfile_cache_hit_bytes = 2;
+}
+
 message ScanResponsePB {
   // The error, if an error occurred with this request.
   optional TabletServerErrorPB error = 1;
@@ -330,6 +344,9 @@ message ScanResponsePB {
   // If this is a fault-tolerant scanner, this is set to the encoded primary
   // key of the last row returned in the response.
   optional bytes last_primary_key = 7;
+
+  // The resource usage of this RPC.
+  optional ResourceMetricsPB resource_metrics = 8;
 }
 
 // A scanner keep-alive request.

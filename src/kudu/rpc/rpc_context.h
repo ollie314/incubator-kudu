@@ -38,6 +38,7 @@ class Trace;
 namespace rpc {
 
 class InboundCall;
+class ResultTracker;
 class RpcSidecar;
 class UserCredentials;
 
@@ -63,7 +64,8 @@ class RpcContext {
   // and is not a public API.
   RpcContext(InboundCall *call,
              const google::protobuf::Message *request_pb,
-             google::protobuf::Message *response_pb);
+             google::protobuf::Message *response_pb,
+             const scoped_refptr<ResultTracker>& result_tracker);
 
   ~RpcContext();
 
@@ -80,6 +82,12 @@ class RpcContext {
   // After this method returns, this RpcContext object is destroyed. The request
   // and response protobufs are also destroyed.
   void RespondSuccess();
+
+  // Like the above, but doesn't store the results of the service call, if results
+  // are being tracked.
+  // Used in cases where a call specific error was set on the response protobuf,
+  // the call should be considered failed, thus results shouldn't be cached.
+  void RespondNoCache();
 
   // Respond with an error to the client. This sends back an error with the code
   // ERROR_APPLICATION. Because there is no more specific error code passed back
@@ -166,6 +174,18 @@ class RpcContext {
   // If the client did not specify a deadline, returns MonoTime::Max().
   MonoTime GetClientDeadline() const;
 
+  // Whether the results of this RPC are tracked with a ResultTracker.
+  // If this returns true, both result_tracker() and request_id() should return non-null results.
+  bool AreResultsTracked() const { return result_tracker_.get() != nullptr; }
+
+  // Returns this call's result tracker, if it is set.
+  const scoped_refptr<ResultTracker>& result_tracker() const {
+    return result_tracker_;
+  }
+
+  // Returns this call's request id, if it is set.
+  const rpc::RequestIdPB* request_id() const;
+
   // Panic the server. This logs a fatal error with the given message, and
   // also includes the current RPC request, requestor, trace information, etc,
   // to make it easier to debug.
@@ -175,9 +195,11 @@ class RpcContext {
     __attribute__((noreturn));
 
  private:
+  friend class ResultTracker;
   InboundCall* const call_;
   const gscoped_ptr<const google::protobuf::Message> request_pb_;
   const gscoped_ptr<google::protobuf::Message> response_pb_;
+  scoped_refptr<ResultTracker> result_tracker_;
 };
 
 } // namespace rpc

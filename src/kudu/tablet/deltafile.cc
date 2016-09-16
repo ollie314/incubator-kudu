@@ -44,6 +44,7 @@ DEFINE_int32(deltafile_default_block_size, 32*1024,
 TAG_FLAG(deltafile_default_block_size, experimental);
 
 using std::shared_ptr;
+using std::unique_ptr;
 
 namespace kudu {
 
@@ -73,6 +74,8 @@ DeltaFileWriter::DeltaFileWriter(gscoped_ptr<WritableBlock> block)
   opts.write_validx = true;
   opts.storage_attributes.cfile_block_size = FLAGS_deltafile_default_block_size;
   opts.storage_attributes.encoding = PLAIN_ENCODING;
+  // No optimization for deltafiles because a deltafile index key must decode into a DeltaKey
+  opts.optimize_index_keys = false;
   writer_.reset(new cfile::CFileWriter(opts, GetTypeInfo(BINARY), false, std::move(block)));
 }
 
@@ -268,7 +271,7 @@ Status DeltaFileReader::NewDeltaIterator(const Schema *projection,
         TRACE_COUNTER_INCREMENT("delta_iterators_lazy_initted", 1);
 
         VLOG(2) << (delta_type_ == REDO ? "REDO" : "UNDO") << " delta " << ToString()
-                << "has no delta stats"
+                << " has no delta stats"
                 << ": can't cull for " << snap.ToString();
       } else if (delta_type_ == REDO) {
         VLOG(2) << "REDO delta " << ToString()
@@ -419,7 +422,7 @@ Status DeltaFileIterator::ReadCurrentBlockOntoQueue() {
   DCHECK(initted_) << "Must call Init()";
   DCHECK(index_iter_) << "Must call SeekToOrdinal()";
 
-  gscoped_ptr<PreparedDeltaBlock> pdb(new PreparedDeltaBlock());
+  unique_ptr<PreparedDeltaBlock> pdb(new PreparedDeltaBlock());
   BlockPointer dblk_ptr = index_iter_->GetCurrentBlockPointer();
   RETURN_NOT_OK(dfr_->cfile_reader()->ReadBlock(
       dblk_ptr, cache_blocks_, &pdb->block_));
@@ -441,7 +444,7 @@ Status DeltaFileIterator::ReadCurrentBlockOntoQueue() {
     pdb->last_updated_idx_;
   #endif
 
-  delta_blocks_.push_back(pdb.release());
+  delta_blocks_.emplace_back(std::move(pdb));
   return Status::OK();
 }
 
@@ -483,7 +486,7 @@ Status DeltaFileIterator::PrepareBatch(size_t nrows, PrepareFlag flag) {
   // Remove blocks from our list which are no longer relevant to the range
   // being prepared.
   while (!delta_blocks_.empty() &&
-         delta_blocks_.front().last_updated_idx_ < start_row) {
+         delta_blocks_.front()->last_updated_idx_ < start_row) {
     delta_blocks_.pop_front();
   }
 
@@ -507,7 +510,7 @@ Status DeltaFileIterator::PrepareBatch(size_t nrows, PrepareFlag flag) {
   }
 
   if (!delta_blocks_.empty()) {
-    PreparedDeltaBlock &block = delta_blocks_.front();
+    PreparedDeltaBlock& block = *delta_blocks_.front();
     int i = 0;
     for (i = block.prepared_block_start_idx_;
          i < block.decoder_->Count();
@@ -536,12 +539,12 @@ Status DeltaFileIterator::VisitMutations(Visitor *visitor) {
 
   rowid_t start_row = prepared_idx_;
 
-  for (PreparedDeltaBlock &block : delta_blocks_) {
-    BinaryPlainBlockDecoder &bpd = *block.decoder_;
-    DVLOG(2) << "Visiting delta block " << block.first_updated_idx_ << "-"
-      << block.last_updated_idx_ << " for row block starting at " << start_row;
+  for (auto& block : delta_blocks_) {
+    BinaryPlainBlockDecoder& bpd = *block->decoder_;
+    DVLOG(2) << "Visiting delta block " << block->first_updated_idx_ << "-"
+             << block->last_updated_idx_ << " for row block starting at " << start_row;
 
-    if (PREDICT_FALSE(start_row > block.last_updated_idx_)) {
+    if (PREDICT_FALSE(start_row > block->last_updated_idx_)) {
       // The block to be updated completely falls after this delta block:
       //  <-- delta block -->      <-- delta block -->
       //                      <-- block to update     -->
@@ -553,7 +556,7 @@ Status DeltaFileIterator::VisitMutations(Visitor *visitor) {
 
     rowid_t previous_rowidx = MathLimits<rowid_t>::kMax;
     bool continue_visit = true;
-    for (int i = block.prepared_block_start_idx_; i < bpd.Count(); i++) {
+    for (int i = block->prepared_block_start_idx_; i < bpd.Count(); i++) {
       Slice slice = bpd.string_at_index(i);
 
       // Decode and check the ID of the row we're going to update.
@@ -812,6 +815,22 @@ Status DeltaFileIterator::CollectMutations(vector<Mutation *> *dst, Arena *dst_a
 
 bool DeltaFileIterator::HasNext() {
   return !exhausted_ || !delta_blocks_.empty();
+}
+
+bool DeltaFileIterator::MayHaveDeltas() {
+  // TODO: change the API to take in the col_to_apply and check for deltas on
+  // that column only.
+  DCHECK(prepared_) << "must Prepare";
+  for (auto& block : delta_blocks_) {
+    BinaryPlainBlockDecoder& bpd = *block->decoder_;
+    if (PREDICT_FALSE(prepared_idx_ > block->last_updated_idx_)) {
+      continue;
+    }
+    if (block->prepared_block_start_idx_ < bpd.Count()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 string DeltaFileIterator::ToString() const {

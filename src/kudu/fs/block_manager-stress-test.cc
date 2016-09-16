@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -253,7 +254,7 @@ void BlockManagerStressTest<T>::WriterThread() {
 
     // Publish the now sync'ed blocks to readers and deleters.
     {
-      lock_guard<rw_spinlock> l(&lock_);
+      std::lock_guard<rw_spinlock> l(lock_);
       for (WritableBlock* block : dirty_blocks) {
         written_blocks_.push_back(block->id());
       }
@@ -281,7 +282,7 @@ void BlockManagerStressTest<T>::ReaderThread() {
     gscoped_ptr<ReadableBlock> block;
     {
       // Grab a block at random.
-      shared_lock<rw_spinlock> l(&lock_);
+      shared_lock<rw_spinlock> l(lock_);
       size_t num_blocks = written_blocks_.size();
       if (num_blocks > 0) {
         uint32_t next_id = rand.Uniform(num_blocks);
@@ -346,7 +347,7 @@ void BlockManagerStressTest<T>::DeleterThread() {
     // Grab all the blocks we can.
     vector<BlockId> to_delete;
     {
-      lock_guard<rw_spinlock> l(&lock_);
+      std::lock_guard<rw_spinlock> l(lock_);
       to_delete.swap(written_blocks_);
     }
 
@@ -387,8 +388,6 @@ TYPED_TEST(BlockManagerStressTest, StressTest) {
   LOG(INFO) << "Running on fresh block manager";
   this->RunTest(FLAGS_test_duration_secs / 2);
   LOG(INFO) << "Running on populated block manager";
-  // Blow away old memtrackers before creating new block manager.
-  this->bm_.reset();
   this->bm_.reset(this->CreateBlockManager());
   ASSERT_OK(this->bm_->Open());
   this->RunTest(FLAGS_test_duration_secs / 2);

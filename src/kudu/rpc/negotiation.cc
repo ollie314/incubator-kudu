@@ -34,6 +34,7 @@
 #include "kudu/rpc/sasl_client.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/sasl_server.h"
+#include "kudu/util/errno.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/status.h"
 #include "kudu/util/trace.h"
@@ -126,8 +127,8 @@ static Status WaitForClientConnect(Connection* conn, const MonoTime& deadline) {
   MonoTime now;
   MonoDelta remaining;
   while (true) {
-    now = MonoTime::Now(MonoTime::FINE);
-    remaining = deadline.GetDeltaSince(now);
+    now = MonoTime::Now();
+    remaining = deadline - now;
     DVLOG(4) << "Client waiting to connect for negotiation, time remaining until timeout deadline: "
              << remaining.ToString();
     if (PREDICT_FALSE(remaining.ToNanoseconds() <= 0)) {

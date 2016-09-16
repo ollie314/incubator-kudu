@@ -80,6 +80,9 @@ TEST_F(TabletReplacementITest, TestMasterTombstoneEvictedReplica) {
   ASSERT_OK(itest::StartElection(leader_ts, tablet_id, timeout));
   ASSERT_OK(itest::WaitForServersToAgree(timeout, ts_map_, tablet_id, 1)); // Wait for NO_OP.
 
+  // Wait until it has committed its NO_OP, so that we can perform a config change.
+  ASSERT_OK(itest::WaitUntilCommittedOpIdIndexIs(1, leader_ts, tablet_id, timeout));
+
   // Remove a follower from the config.
   ASSERT_OK(itest::RemoveServer(leader_ts, tablet_id, follower_ts, boost::none, timeout));
 
@@ -148,6 +151,9 @@ TEST_F(TabletReplacementITest, TestMasterTombstoneOldReplicaOnReport) {
   // Elect a leader (TS 0)
   ASSERT_OK(itest::StartElection(leader_ts, tablet_id, timeout));
   ASSERT_OK(itest::WaitForServersToAgree(timeout, ts_map_, tablet_id, 1)); // Wait for NO_OP.
+
+  // Wait until it has committed its NO_OP, so that we can perform a config change.
+  ASSERT_OK(itest::WaitUntilCommittedOpIdIndexIs(1, leader_ts, tablet_id, timeout));
 
   // Shut down the follower to be removed, then remove it from the config.
   // We will wait for the Master to be notified of the config change, then shut
@@ -219,10 +225,10 @@ TEST_F(TabletReplacementITest, TestEvictAndReplaceDeadFollower) {
 // bootstrap will attempt to replay committed (and applied) config change
 // operations. This is achieved by delaying application of a write at the
 // tablet level that precedes the config change operations in the WAL, then
-// initiating a remote bootstrap to a follower. The follower will not have the
+// initiating a tablet copy to a follower. The follower will not have the
 // COMMIT for the write operation, so will ignore COMMIT messages for the
 // applied config change operations. At startup time, the newly
-// remotely-bootstrapped tablet should detect that these config change
+// copied tablet should detect that these config change
 // operations have already been applied and skip them.
 TEST_F(TabletReplacementITest, TestRemoteBoostrapWithPendingConfigChangeCommits) {
   if (!AllowSlowTests()) {
@@ -274,7 +280,7 @@ TEST_F(TabletReplacementITest, TestRemoteBoostrapWithPendingConfigChangeCommits)
 
   // Kick off an async insert, which will be delayed for 5 seconds. This is
   // normally enough time to evict a replica, tombstone it, add it back, and
-  // remotely bootstrap it when the log is only a few entries.
+  // Tablet Copy a new replica to it when the log is only a few entries.
   tserver::WriteRequestPB req;
   tserver::WriteResponsePB resp;
   CountDownLatch latch(1);

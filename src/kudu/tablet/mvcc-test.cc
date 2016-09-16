@@ -15,15 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/thread/thread.hpp>
-#include <gtest/gtest.h>
 #include <glog/logging.h>
+#include <gtest/gtest.h>
+#include <mutex>
+#include <thread>
 
 #include "kudu/server/hybrid_clock.h"
 #include "kudu/server/logical_clock.h"
 #include "kudu/tablet/mvcc.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/test_util.h"
+
+using std::thread;
 
 namespace kudu {
 namespace tablet {
@@ -42,12 +45,12 @@ class MvccTest : public KuduTest {
     MvccSnapshot s;
     CHECK_OK(mgr->WaitForCleanSnapshotAtTimestamp(ts, &s, MonoTime::Max()));
     CHECK(s.is_clean()) << "verifying postcondition";
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     result_snapshot_.reset(new MvccSnapshot(s));
   }
 
   bool HasResultSnapshot() {
-    boost::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     return result_snapshot_ != nullptr;
   }
 
@@ -396,8 +399,7 @@ TEST_F(MvccTest, TestAreAllTransactionsCommitted) {
 
 TEST_F(MvccTest, TestWaitForCleanSnapshot_SnapWithNoInflights) {
   MvccManager mgr(clock_.get());
-  boost::thread waiting_thread = boost::thread(
-      &MvccTest::WaitForSnapshotAtTSThread, this, &mgr, clock_->Now());
+  thread waiting_thread = thread(&MvccTest::WaitForSnapshotAtTSThread, this, &mgr, clock_->Now());
 
   // join immediately.
   waiting_thread.join();
@@ -411,8 +413,7 @@ TEST_F(MvccTest, TestWaitForCleanSnapshot_SnapWithInFlights) {
   Timestamp tx1 = mgr.StartTransaction();
   Timestamp tx2 = mgr.StartTransaction();
 
-  boost::thread waiting_thread = boost::thread(
-      &MvccTest::WaitForSnapshotAtTSThread, this, &mgr, clock_->Now());
+  thread waiting_thread = thread(&MvccTest::WaitForSnapshotAtTSThread, this, &mgr, clock_->Now());
 
   ASSERT_FALSE(HasResultSnapshot());
   mgr.StartApplyingTransaction(tx1);
@@ -436,8 +437,7 @@ TEST_F(MvccTest, TestWaitForApplyingTransactionsToCommit) {
 
   mgr.StartApplyingTransaction(tx1);
 
-  boost::thread waiting_thread = boost::thread(
-      &MvccManager::WaitForApplyingTransactionsToCommit, &mgr);
+  thread waiting_thread = thread(&MvccManager::WaitForApplyingTransactionsToCommit, &mgr);
   while (mgr.GetNumWaitersForTests() == 0) {
     SleepFor(MonoDelta::FromMilliseconds(5));
   }
@@ -463,8 +463,7 @@ TEST_F(MvccTest, TestWaitForCleanSnapshot_SnapAtTimestampWithInFlights) {
   Timestamp tx3 = mgr.StartTransaction();
 
   // Start a thread waiting for transactions with ts <= 2 to commit
-  boost::thread waiting_thread = boost::thread(
-      &MvccTest::WaitForSnapshotAtTSThread, this, &mgr, tx2);
+  thread waiting_thread = thread(&MvccTest::WaitForSnapshotAtTSThread, this, &mgr, tx2);
   ASSERT_FALSE(HasResultSnapshot());
 
   // Commit tx 1 - thread should still wait.
@@ -608,8 +607,7 @@ TEST_F(MvccTest, TestWaitUntilCleanDeadline) {
 
   // Wait until the 'tx1' timestamp is clean -- this won't happen because the
   // transaction isn't committed yet.
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(MonoDelta::FromMilliseconds(10));
+  MonoTime deadline = MonoTime::Now() + MonoDelta::FromMilliseconds(10);
   MvccSnapshot snap;
   Status s = mgr.WaitForCleanSnapshotAtTimestamp(tx1, &snap, deadline);
   ASSERT_TRUE(s.IsTimedOut()) << s.ToString();

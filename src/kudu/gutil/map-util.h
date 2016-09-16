@@ -204,6 +204,27 @@ FindFloorOrNull(Collection& collection,  // NOLINT
   return &(--it)->second;
 }
 
+// Returns a const-reference to the value associated with the greatest key
+// that's less than or equal to the given key, or crashes if it does not exist.
+template <class Collection>
+const typename Collection::value_type::second_type&
+FindFloorOrDie(const Collection& collection,
+               const typename Collection::value_type::first_type& key) {
+  auto it = collection.upper_bound(key);
+  CHECK(it != collection.begin());
+  return (--it)->second;
+}
+
+// Same as above, but returns a non-const reference.
+template <class Collection>
+typename Collection::value_type::second_type&
+FindFloorOrDie(Collection& collection,
+               const typename Collection::value_type::first_type& key) {
+  auto it = collection.upper_bound(key);
+  CHECK(it != collection.begin());
+  return (--it)->second;
+}
+
 // Returns the pointer value associated with the given key. If none is found,
 // NULL is returned. The function is designed to be used with a map of keys to
 // pointers.
@@ -234,6 +255,21 @@ FindPtrOrNull(Collection& collection,  // NOLINT
     return typename Collection::value_type::second_type(0);
   }
   return it->second;
+}
+
+// FindPtrOrNull like function for maps whose value is a smart pointer like shared_ptr or
+// unique_ptr.
+// Returns the raw pointer contained in the smart pointer for the first found key, if it exists,
+// or null if it doesn't.
+template <class Collection>
+typename Collection::mapped_type::element_type*
+FindPointeeOrNull(const Collection& collection,  // NOLINT,
+                  const typename Collection::key_type& key) {
+  auto it = collection.find(key);
+  if (it == collection.end()) {
+    return nullptr;
+  }
+  return it->second.get();
 }
 
 // Finds the value associated with the given key and copies it to *value (if not
@@ -662,15 +698,17 @@ void ReverseMap(const Collection& collection,
 //     if (value_ptr.get())
 //       value_ptr->DoSomething();
 //
+// Note: if 'collection' is a multimap, this will only erase and return the
+// first value.
 template <class Collection>
 typename Collection::value_type::second_type EraseKeyReturnValuePtr(
     Collection* const collection,
     const typename Collection::value_type::first_type& key) {
   auto it = collection->find(key);
   if (it == collection->end()) {
-    return NULL;
+    return typename Collection::value_type::second_type();
   }
-  typename Collection::value_type::second_type v = it->second;
+  typename Collection::value_type::second_type v = std::move(it->second);
   collection->erase(it);
   return v;
 }
@@ -766,5 +804,55 @@ void AppendValuesFromMap(const MapContainer& map_container,
     value_container->push_back(entry.second);
   }
 }
+
+// Compute and insert new value if it's absent from the map. Return a pair with a reference to the
+// value and a bool indicating whether it was absent at first.
+//
+// This inspired on a similar java construct (url split in two lines):
+// https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/ConcurrentHashMap.html
+// #computeIfAbsent-K-java.util.function.Function
+//
+// It takes a reference to the key and a lambda function. If the key exists in the map, returns
+// a pair with a pointer to the current value and 'false'. If the key does not exist in the map,
+// it uses the lambda function to create a value, inserts it into the map, and returns a pair with
+// a pointer to the new value and 'true'.
+//
+// Example usage:
+//
+// auto result = ComputeIfAbsentReturnAbsense(&my_collection,
+//                                            my_key,
+//                                            [] { return new_value; });
+// MyValue* const value = result.first;
+// if (result.second) ....
+//
+template <class MapContainer, typename Function>
+pair<typename MapContainer::mapped_type* const, bool>
+ComputeIfAbsentReturnAbsense(MapContainer* container,
+                             const typename MapContainer::key_type& key,
+                             Function compute_func) {
+  typename MapContainer::iterator iter = container->find(key);
+  bool new_value = iter == container->end();
+  if (new_value) {
+    pair<typename MapContainer::iterator, bool> result = container->emplace(key, compute_func());
+    DCHECK(result.second) << "duplicate key: " << key;
+    iter = result.first;
+  }
+  return make_pair(&iter->second, new_value);
+};
+
+// Like the above but doesn't return a pair, just returns a pointer to the value.
+// Example usage:
+//
+// MyValue* const value = ComputeIfAbsent(&my_collection,
+//                                        my_key,
+//                                        [] { return new_value; });
+//
+template <class MapContainer, typename Function>
+typename MapContainer::mapped_type* const
+ComputeIfAbsent(MapContainer* container,
+                const typename MapContainer::key_type& key,
+                Function compute_func) {
+  return ComputeIfAbsentReturnAbsense(container, key, compute_func).first;
+};
 
 #endif  // UTIL_GTL_MAP_UTIL_H_

@@ -45,7 +45,7 @@ using tserver::AlterSchemaResponsePB;
 string AlterSchemaTransactionState::ToString() const {
   return Substitute("AlterSchemaTransactionState "
                     "[timestamp=$0, schema=$1, request=$2]",
-                    timestamp().ToString(),
+                    has_timestamp() ? timestamp().ToString() : "<unassigned>",
                     schema_ == nullptr ? "(none)" : schema_->ToString(),
                     request_ == nullptr ? "(none)" : request_->ShortDebugString());
 }
@@ -111,6 +111,10 @@ Status AlterSchemaTransaction::Apply(gscoped_ptr<CommitMsg>* commit_msg) {
   state_->tablet_peer()->log()
     ->SetSchemaForNextLogSegment(*DCHECK_NOTNULL(state_->schema()),
                                                  state_->schema_version());
+
+  // Altered tablets should be included in the next tserver heartbeat so that
+  // clients waiting on IsAlterTableDone() are unblocked promptly.
+  state_->tablet_peer()->MarkTabletDirty("Alter schema finished");
 
   commit_msg->reset(new CommitMsg());
   (*commit_msg)->set_op_type(ALTER_SCHEMA_OP);

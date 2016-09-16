@@ -59,7 +59,7 @@ TEST_P(ClientFailoverParamITest, TestDeleteLeaderWhileScanning) {
   const MonoDelta kTimeout = MonoDelta::FromSeconds(30);
 
   vector<string> ts_flags = { "--enable_leader_failure_detection=false",
-                              "--enable_remote_bootstrap=false" };
+                              "--enable_tablet_copy=false" };
   vector<string> master_flags = { "--master_add_server_when_underreplicated=false",
                                   "--catalog_manager_wait_for_new_tablets_to_elect_leader=false" };
 
@@ -115,7 +115,7 @@ TEST_P(ClientFailoverParamITest, TestDeleteLeaderWhileScanning) {
   KuduInsert* insert = table->NewInsert();
   ASSERT_OK(insert->mutable_row()->SetInt32(0, 0));
   ASSERT_OK(insert->mutable_row()->SetInt32(1, 1));
-  ASSERT_OK(insert->mutable_row()->SetString(2, "a"));
+  ASSERT_OK(insert->mutable_row()->SetStringNoCopy(2, "a"));
   ASSERT_OK(session->Apply(insert));
   ASSERT_OK(session->Flush());
   ASSERT_EQ(1, CountTableRows(table.get()));
@@ -171,13 +171,13 @@ TEST_P(ClientFailoverParamITest, TestDeleteLeaderWhileScanning) {
                       boost::none, kTimeout));
   HostPort hp;
   ASSERT_OK(HostPortFromPB(leader->registration.rpc_addresses(0), &hp));
-  ASSERT_OK(StartRemoteBootstrap(to_add, tablet_id, leader->uuid(), hp, 1, kTimeout));
+  ASSERT_OK(StartTabletCopy(to_add, tablet_id, leader->uuid(), hp, 1, kTimeout));
 
   const string& new_ts_uuid = cluster_->tablet_server(missing_replica_index)->uuid();
   InsertOrDie(&replica_indexes, missing_replica_index);
   InsertOrDie(&active_ts_map, new_ts_uuid, ts_map_[new_ts_uuid]);
 
-  // Wait for remote bootstrap to complete. Then elect the new node.
+  // Wait for tablet copy to complete. Then elect the new node.
   ASSERT_OK(WaitForServersToAgree(kTimeout, active_ts_map, tablet_id,
                                   workload.batches_completed() + 5));
   leader_index = missing_replica_index;
@@ -190,7 +190,7 @@ TEST_P(ClientFailoverParamITest, TestDeleteLeaderWhileScanning) {
     KuduUpdate* update = table->NewUpdate();
     ASSERT_OK(update->mutable_row()->SetInt32(0, 0));
     ASSERT_OK(update->mutable_row()->SetInt32(1, 2));
-    ASSERT_OK(update->mutable_row()->SetString(2, "b"));
+    ASSERT_OK(update->mutable_row()->SetStringNoCopy(2, "b"));
     ASSERT_OK(session->Apply(update));
     ASSERT_OK(session->Flush());
   }

@@ -83,7 +83,7 @@ class ColumnPredicate {
   //
   // The values are not copied, and must outlive the returned predicate. The
   // arena is used for allocating an incremented upper bound to transform the
-  // bound to a exclusive. The arena must outlive the returned predicate.
+  // bound to exclusive. The arena must outlive the returned predicate.
   //
   // If a normalized column predicate cannot be created, then boost::none will
   // be returned. This indicates that the predicate would cover the entire
@@ -92,6 +92,17 @@ class ColumnPredicate {
                                                          const void* lower,
                                                          const void* upper,
                                                          Arena* arena);
+
+  // Creates a new range column predicate from an exclusive lower bound and an
+  // exclusive upper bound.
+  //
+  // The values are not copied, and must outlive the returned predicate. The
+  // arena is used for allocating an incremented lower bound to transform the
+  // bound to inclusive. The arena must outlive the returned predicate.
+  static ColumnPredicate ExclusiveRange(ColumnSchema column,
+                                        const void* lower,
+                                        const void* upper,
+                                        Arena* arena);
 
   // Creates a new IS NOT NULL predicate for the column.
   static ColumnPredicate IsNotNull(ColumnSchema column);
@@ -126,6 +137,33 @@ class ColumnPredicate {
   // NOTE: the evaluation result is stored into '*sel' which may or may not be the
   // same vector as block->selection_vector().
   void Evaluate(const ColumnBlock& block, SelectionVector* sel) const;
+
+  // Evaluate the predicate on a single cell.
+  template <DataType PhysicalType>
+  bool EvaluateCell(const void* cell) const {
+    switch (predicate_type()) {
+      case PredicateType::None: {
+        return false;
+      };
+      case PredicateType::Range: {
+        if (lower_ == nullptr) {
+          return DataTypeTraits<PhysicalType>::Compare(cell, this->upper_) < 0;
+        } else if (upper_ == nullptr) {
+          return DataTypeTraits<PhysicalType>::Compare(cell, this->lower_) >= 0;
+        } else {
+          return DataTypeTraits<PhysicalType>::Compare(cell, this->upper_) < 0 &&
+                 DataTypeTraits<PhysicalType>::Compare(cell, this->lower_) >= 0;
+        }
+      };
+      case PredicateType::Equality: {
+        return DataTypeTraits<PhysicalType>::Compare(cell, this->lower_) == 0;
+      };
+      case PredicateType::IsNotNull: {
+        return true;
+      }
+    }
+    LOG(FATAL) << "unknown predicate type";
+  }
 
   // Print the predicate for debugging.
   std::string ToString() const;
@@ -175,6 +213,12 @@ class ColumnPredicate {
 
   // Merge another predicate into this Equality predicate.
   void MergeIntoEquality(const ColumnPredicate& other);
+
+  // Templated evaluation to inline the dispatch of comparator. Templating this
+  // allows dispatch to occur only once per batch.
+  template <DataType PhysicalType>
+  void EvaluateForPhysicalType(const ColumnBlock& block,
+                               SelectionVector* sel) const;
 
   // The type of this predicate.
   PredicateType predicate_type_;

@@ -49,8 +49,6 @@
 
 METRIC_DECLARE_entity(tablet);
 
-DECLARE_int32(log_min_seconds_to_retain);
-
 namespace kudu {
 namespace log {
 
@@ -111,8 +109,7 @@ static Status AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
   Synchronizer s;
   RETURN_NOT_OK(log->AsyncAppendReplicates(replicates,
                                            s.AsStatusCallback()));
-  s.Wait();
-  return Status::OK();
+  return s.Wait();
 }
 
 static Status AppendNoOpToLogSync(const scoped_refptr<Clock>& clock,
@@ -143,8 +140,6 @@ class LogTestBase : public KuduTest {
 
     clock_.reset(new server::HybridClock());
     ASSERT_OK(clock_->Init());
-
-    FLAGS_log_min_seconds_to_retain = 0;
   }
 
   virtual void TearDown() OVERRIDE {
@@ -152,15 +147,15 @@ class LogTestBase : public KuduTest {
     STLDeleteElements(&entries_);
   }
 
-  void BuildLog() {
+  Status BuildLog() {
     Schema schema_with_ids = SchemaBuilder(schema_).Build();
-    CHECK_OK(Log::Open(options_,
-                       fs_manager_.get(),
-                       kTestTablet,
-                       schema_with_ids,
-                       0, // schema_version
-                       metric_entity_.get(),
-                       &log_));
+    return Log::Open(options_,
+                     fs_manager_.get(),
+                     kTestTablet,
+                     schema_with_ids,
+                     0, // schema_version
+                     metric_entity_.get(),
+                     &log_);
   }
 
   void CheckRightNumberOfSegmentFiles(int expected) {
@@ -266,6 +261,25 @@ class LogTestBase : public KuduTest {
     target->set_dms_id(dms_id);
     target->set_rs_id(rs_id);
     AppendCommit(std::move(commit), sync);
+  }
+
+  // Append a COMMIT message for 'original_opid', but with results
+  // indicating that the associated writes failed due to
+  // "NotFound" errors.
+  void AppendCommitWithNotFoundOpResults(const OpId& original_opid) {
+    gscoped_ptr<CommitMsg> commit(new CommitMsg);
+    commit->set_op_type(WRITE_OP);
+
+    commit->mutable_commited_op_id()->CopyFrom(original_opid);
+
+    TxResultPB* result = commit->mutable_result();
+
+    OperationResultPB* insert = result->add_ops();
+    StatusToPB(Status::NotFound("fake failed write"), insert->mutable_failed_status());
+    OperationResultPB* mutate = result->add_ops();
+    StatusToPB(Status::NotFound("fake failed write"), mutate->mutable_failed_status());
+
+    AppendCommit(std::move(commit));
   }
 
   void AppendCommit(gscoped_ptr<CommitMsg> commit, bool sync = APPEND_SYNC) {

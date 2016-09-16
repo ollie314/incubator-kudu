@@ -20,6 +20,7 @@
 #include "kudu/master/master_rpc.h"
 
 #include <boost/bind.hpp>
+#include <mutex>
 
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
@@ -28,6 +29,7 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/scoped_cleanup.h"
 
 
 using std::shared_ptr;
@@ -105,17 +107,18 @@ void GetMasterRegistrationRpc::SendRpcCb(const Status& status) {
 
 GetLeaderMasterRpc::GetLeaderMasterRpc(LeaderCallback user_cb,
                                        vector<Sockaddr> addrs,
-                                       const MonoTime& deadline,
-                                       const shared_ptr<Messenger>& messenger)
-    : Rpc(deadline, messenger),
+                                       MonoTime deadline,
+                                       MonoDelta rpc_timeout,
+                                       shared_ptr<Messenger> messenger)
+    : Rpc(std::move(deadline), std::move(messenger)),
       user_cb_(std::move(user_cb)),
       addrs_(std::move(addrs)),
+      rpc_timeout_(std::move(rpc_timeout)),
       pending_responses_(0),
       completed_(false) {
   DCHECK(deadline.Initialized());
 
-  // Using resize instead of reserve to explicitly initialized the
-  // values.
+  // Using resize instead of reserve to explicitly initialized the values.
   responses_.resize(addrs_.size());
 }
 
@@ -133,13 +136,18 @@ string GetLeaderMasterRpc::ToString() const {
 }
 
 void GetLeaderMasterRpc::SendRpc() {
-  lock_guard<simple_spinlock> l(&lock_);
+  // Compute the actual deadline to use for each RPC.
+  MonoTime rpc_deadline = MonoTime::Now() + rpc_timeout_;
+  MonoTime actual_deadline = MonoTime::Earliest(retrier().deadline(),
+                                                rpc_deadline);
+
+  std::lock_guard<simple_spinlock> l(lock_);
   for (int i = 0; i < addrs_.size(); i++) {
     GetMasterRegistrationRpc* rpc = new GetMasterRegistrationRpc(
         Bind(&GetLeaderMasterRpc::GetMasterRegistrationRpcCbForNode,
              this, ConstRef(addrs_[i]), ConstRef(responses_[i])),
         addrs_[i],
-        retrier().deadline(),
+        actual_deadline,
         retrier().messenger(),
         &responses_[i]);
     rpc->SendRpc();
@@ -148,23 +156,34 @@ void GetLeaderMasterRpc::SendRpc() {
 }
 
 void GetLeaderMasterRpc::SendRpcCb(const Status& status) {
+  // To safely retry, we must reset completed_ so that it can be reused in the
+  // next round of RPCs.
+  //
+  // The SendRpcCb invariant (see GetMasterRegistrationRpcCbForNode comments)
+  // implies that if we're to retry, we must be the last response. Thus, it is
+  // safe to reset completed_ in this case; there's no danger of a late
+  // response reading it and entering SendRpcCb inadvertently.
+  auto undo_completed = MakeScopedCleanup([&]() {
+    std::lock_guard<simple_spinlock> l(lock_);
+    completed_ = false;
+  });
+
   // If we've received replies from all of the nodes without finding
   // the leader, or if there were network errors talking to all of the
   // nodes the error is retriable and we can perform a delayed retry.
   if (status.IsNetworkError() || status.IsNotFound()) {
-    // TODO (KUDU-573): Allow cancelling delayed tasks on reactor so
-    // that we can safely use DelayedRetry here.
-    mutable_retrier()->DelayedRetryCb(this, Status::OK());
+    mutable_retrier()->DelayedRetry(this, status);
     return;
   }
-  {
-    lock_guard<simple_spinlock> l(&lock_);
-    // 'completed_' prevents 'user_cb_' from being invoked twice.
-    if (completed_) {
-      return;
-    }
-    completed_ = true;
+
+  // If our replies timed out but the deadline hasn't passed, retry.
+  if (status.IsTimedOut() && MonoTime::Now() < retrier().deadline()) {
+    mutable_retrier()->DelayedRetry(this, status);
+    return;
   }
+
+  // We are not retrying.
+  undo_completed.cancel();
   user_cb_.Run(status, leader_master_);
 }
 
@@ -180,7 +199,7 @@ void GetLeaderMasterRpc::GetMasterRegistrationRpcCbForNode(const Sockaddr& node_
   // pick the one with the highest term/index as the leader.
   Status new_status = status;
   {
-    lock_guard<simple_spinlock> lock(&lock_);
+    std::lock_guard<simple_spinlock> lock(lock_);
     if (completed_) {
       // If 'user_cb_' has been invoked (see SendRpcCb above), we can
       // stop.
@@ -198,6 +217,7 @@ void GetLeaderMasterRpc::GetMasterRegistrationRpcCbForNode(const Sockaddr& node_
       } else {
         // We've found a leader.
         leader_master_ = HostPort(node_addr);
+        completed_ = true;
       }
     }
     --pending_responses_;
@@ -208,6 +228,8 @@ void GetLeaderMasterRpc::GetMasterRegistrationRpcCbForNode(const Sockaddr& node_
         // a delayed re-try, which don't need to do unless we've
         // been unable to find a leader so far.
         return;
+      } else {
+        completed_ = true;
       }
     }
   }

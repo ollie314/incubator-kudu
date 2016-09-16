@@ -17,8 +17,9 @@
 #ifndef KUDU_TABLET_MEMROWSET_H
 #define KUDU_TABLET_MEMROWSET_H
 
-#include <boost/optional.hpp>
+#include <boost/optional/optional_fwd.hpp>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,12 @@ class MRSRow {
   Timestamp insertion_timestamp() const { return header_->insertion_timestamp; }
 
   Mutation* redo_head() { return header_->redo_head; }
+
+  // Load 'redo_head' with an 'Acquire' memory barrier.
+  Mutation* acquire_redo_head() {
+    return reinterpret_cast<Mutation*>(
+        base::subtle::Acquire_Load(reinterpret_cast<AtomicWord*>(&header_->redo_head)));
+  }
   const Mutation* redo_head() const { return header_->redo_head; }
 
   const Slice &row_slice() const { return row_slice_; }
@@ -227,7 +234,7 @@ class MemRowSet : public RowSet,
     return 0;
   }
 
-  boost::mutex *compact_flush_lock() OVERRIDE {
+  std::mutex *compact_flush_lock() OVERRIDE {
     return &compact_flush_lock_;
   }
 
@@ -360,7 +367,7 @@ class MemRowSet : public RowSet,
   volatile uint64_t debug_insert_count_;
   volatile uint64_t debug_update_count_;
 
-  boost::mutex compact_flush_lock_;
+  std::mutex compact_flush_lock_;
 
   Atomic32 has_logged_throttling_;
 

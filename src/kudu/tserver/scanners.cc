@@ -16,9 +16,8 @@
 // under the License.
 #include "kudu/tserver/scanners.h"
 
-#include <boost/bind.hpp>
-#include <boost/thread/locks.hpp>
 #include <gflags/gflags.h>
+#include <mutex>
 
 #include "kudu/common/iterator.h"
 #include "kudu/common/scan_spec.h"
@@ -111,32 +110,32 @@ void ScannerManager::NewScanner(const scoped_refptr<TabletPeer>& tablet_peer,
   while (!success) {
     // TODO(security): are these UUIDs predictable? If so, we should
     // probably generate random numbers instead, since we can safely
-    // just retry until we avoid a collission.
+    // just retry until we avoid a collision.
     string id = oid_generator_.Next();
     scanner->reset(new Scanner(id, tablet_peer, requestor_string, metrics_.get()));
 
     ScannerMapStripe& stripe = GetStripeByScannerId(id);
-    boost::lock_guard<boost::shared_mutex> l(stripe.lock_);
+    std::lock_guard<RWMutex> l(stripe.lock_);
     success = InsertIfNotPresent(&stripe.scanners_by_id_, id, *scanner);
   }
 }
 
 bool ScannerManager::LookupScanner(const string& scanner_id, SharedScanner* scanner) {
   ScannerMapStripe& stripe = GetStripeByScannerId(scanner_id);
-  boost::shared_lock<boost::shared_mutex> l(stripe.lock_);
+  shared_lock<RWMutex> l(stripe.lock_);
   return FindCopy(stripe.scanners_by_id_, scanner_id, scanner);
 }
 
 bool ScannerManager::UnregisterScanner(const string& scanner_id) {
   ScannerMapStripe& stripe = GetStripeByScannerId(scanner_id);
-  boost::lock_guard<boost::shared_mutex> l(stripe.lock_);
+  std::lock_guard<RWMutex> l(stripe.lock_);
   return stripe.scanners_by_id_.erase(scanner_id) > 0;
 }
 
 size_t ScannerManager::CountActiveScanners() const {
   size_t total = 0;
   for (const ScannerMapStripe* e : scanner_maps_) {
-    boost::shared_lock<boost::shared_mutex> l(e->lock_);
+    shared_lock<RWMutex> l(e->lock_);
     total += e->scanners_by_id_.size();
   }
   return total;
@@ -144,7 +143,7 @@ size_t ScannerManager::CountActiveScanners() const {
 
 void ScannerManager::ListScanners(std::vector<SharedScanner>* scanners) {
   for (const ScannerMapStripe* stripe : scanner_maps_) {
-    boost::shared_lock<boost::shared_mutex> l(stripe->lock_);
+    shared_lock<RWMutex> l(stripe->lock_);
     for (const ScannerMapEntry& se : stripe->scanners_by_id_) {
       scanners->push_back(se.second);
     }
@@ -155,12 +154,12 @@ void ScannerManager::RemoveExpiredScanners() {
   MonoDelta scanner_ttl = MonoDelta::FromMilliseconds(FLAGS_scanner_ttl_ms);
 
   for (ScannerMapStripe* stripe : scanner_maps_) {
-    boost::lock_guard<boost::shared_mutex> l(stripe->lock_);
+    std::lock_guard<RWMutex> l(stripe->lock_);
     for (auto it = stripe->scanners_by_id_.begin(); it != stripe->scanners_by_id_.end();) {
       SharedScanner& scanner = it->second;
       MonoDelta time_live =
-          scanner->TimeSinceLastAccess(MonoTime::Now(MonoTime::COARSE));
-      if (time_live.MoreThan(scanner_ttl)) {
+          scanner->TimeSinceLastAccess(MonoTime::Now());
+      if (time_live > scanner_ttl) {
         // TODO: once we have a metric for the number of scanners expired, make this a
         // VLOG(1).
         LOG(INFO) << "Expiring scanner id: " << it->first << ", of tablet " << scanner->tablet_id()
@@ -184,7 +183,7 @@ Scanner::Scanner(string id, const scoped_refptr<TabletPeer>& tablet_peer,
       tablet_peer_(tablet_peer),
       requestor_string_(std::move(requestor_string)),
       call_seq_id_(0),
-      start_time_(MonoTime::Now(MonoTime::COARSE)),
+      start_time_(MonoTime::Now()),
       metrics_(metrics),
       arena_(1024, 1024 * 1024) {
   UpdateAccessTime();
@@ -197,13 +196,13 @@ Scanner::~Scanner() {
 }
 
 void Scanner::UpdateAccessTime() {
-  boost::lock_guard<simple_spinlock> l(lock_);
-  last_access_time_ = MonoTime::Now(MonoTime::COARSE);
+  std::lock_guard<simple_spinlock> l(lock_);
+  last_access_time_ = MonoTime::Now();
 }
 
 void Scanner::Init(gscoped_ptr<RowwiseIterator> iter,
                    gscoped_ptr<ScanSpec> spec) {
-  boost::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   CHECK(!iter_) << "Already initialized";
   iter_.reset(iter.release());
   spec_.reset(spec.release());

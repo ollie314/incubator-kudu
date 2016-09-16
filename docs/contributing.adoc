@@ -16,7 +16,7 @@
 // under the License.
 
 [[contributing]]
-= Contributing to Apache Kudu (incubating)
+= Contributing to Apache Kudu
 :author: Kudu Team
 :imagesdir: ./images
 :icons: font
@@ -49,7 +49,7 @@ is called `origin`. When you fetch or pull, you will do so from `origin`.
 +
 [source,bash]
 ----
-git clone https://github.com/apache/incubator-kudu kudu
+git clone https://github.com/apache/kudu
 ----
 
 . Change to the new `kudu` directory.
@@ -95,6 +95,9 @@ or to push a change to the `gh-pages` branch (to update the website):
 ----
 git push gerrit HEAD:refs/for/gh-pages --no-thin
 ----
+
+TIP: While preparing a patch for review, it's a good idea to follow
+link:https://git-scm.com/book/en/v2/Distributed-Git-Contributing-to-a-Project#_commit_guidelines[generic git commit guidelines and good practices].
 
 NOTE: The `--no-thin` argument is a workaround to prevent an error in Gerrit. See
 https://code.google.com/p/gerrit/issues/detail?id=1582.
@@ -146,33 +149,24 @@ In general, Kudu follows the
 link:https://google.github.io/styleguide/cppguide.html[Google {cpp} Style Guide],
 with the following exceptions:
 
-=== Limitations on `boost` Library Use
+=== Notes on {cpp} 11
 
-`boost` libraries can be used in cases where a suitable
-replacement does not exist in the Kudu code base. However, try to avoid introducing
-dependencies on new `boost` libraries, and use Kudu code in preference
-to `boost` where available. For example, do not use `boost`'s scoped pointer
-implementations.
+Kudu uses {cpp} 11. Check out this handy guide to {cpp} 11 move semantics and rvalue
+references: https://www.chromium.org/rvalue-references
 
-.Approved `boost` Libraries
+We aim to follow most of the same guidelines, such as, where possible, migrating
+away from `foo.Pass()` in favor of `std::move(foo)`.
 
-- `boost::assign` (container literals)
-- `boost::shared_mutex` (but prefer Kudu's spin lock implementation for short
-  critical sections)
+=== Limitations on `boost` Use
 
-Check that any features from `boost` you use are present in *`boost` 1.46*
-or earlier, for compatibility with RHEL 6.
-
-.`boost` Libraries and the Kudu {cpp} Client
-Do not use `boost` in any public headers for the Kudu {cpp} client, because
-`boost` commonly breaks backward compatibility, and passing data between two `boost`
-versions (one by the user, one by Kudu) causes serious issues.
-
-In addition, do not create dependencies from the Kudu {cpp} client to any `boost`
-libraries. `libboost_system` is particularly troublesome, as any `boost` code
-that throws exceptions will grow a dependency on it. Among other things, you
-cannot use `boost::{lock_guard,unique_lock,shared_lock}` in any code consumed
-by the {cpp} client (such as _common/_ and _util/_).
+`boost` classes from header-only libraries can be used in cases where a suitable
+replacement does not exist in the Kudu code base. However:
+* Do not introduce dependencies on `boost` classes not already depended on. We
+  are actively trying to remove `boost` from the Kudu code base, and new
+  dependencies make that work more difficult.
+* Do not use `boost` in any public headers for the Kudu {cpp} client, because
+  `boost` commonly breaks backward compatibility, and passing data between two
+  `boost` versions (one by the user, one by Kudu) causes serious issues.
 
 === Line length
 
@@ -185,7 +179,8 @@ keep under 80 where possible, but you can spill over to 100 or so if necessary.
 
 Generally, most objects should have clear "single-owner" semantics.
 Most of the time, singly-owned objects can be wrapped in a `gscoped_ptr<>`
-which ensures deletion on scope exit and prevents accidental copying.
+or in a `unique_ptr` which ensures deletion on scope
+exit and prevents accidental copying.
 `gscoped_ptr` is similar to {cpp}11's `unique_ptr` in that it has a `release`
 method and also provides emulated `move` semantics (see _gscoped_ptr.h_ for
 example usage).
@@ -210,13 +205,14 @@ semantics (owned or un-owned). Use utility code from _gutil/stl_util.h_, such as
 contained elements.
 
 WARNING: Using `std::auto_ptr` is strictly disallowed because of its difficult and
-bug-prone semantics.
+bug-prone semantics. Besides, `std::auto_ptr` is declared deprecated
+since {cpp}11.
 
 .Smart Pointers for Multiply-Owned Pointers:
 
 Although single ownership is ideal, sometimes it is not possible, particularly
 when multiple threads are in play and the lifetimes of the pointers are not
-clearly defined. In these cases, you can use either `std::tr1::shared_ptr` or
+clearly defined. In these cases, you can use either `std::shared_ptr` or
 Kudu's own `scoped_refptr` from _gutil/ref_counted.hpp_. Each of these mechanisms
 relies on reference counting to automatically delete the referent once no more
 pointers remain. The key difference between these two types of pointers is that
@@ -232,14 +228,21 @@ The pros and cons are:
 object deriving from a special base class
 * icon:plus-circle[role="green",alt="pro"] part of the standard library and familiar to most
 {cpp} developers
-* icon:minus-circle[role="red",alt="con"] creating a new object requires two allocations instead
-of one (one to create the ref count, and one to create the object)
+* icon:plus-circle[role="green",alt="pro"] supports the `weak_ptr` use cases:
+ ** a temporary ownership when an object needs to be accessed only if it exists
+ ** break circular references of `shared_ptr`, if any exists due to aggregation
+* icon:minus-circle[role="green",alt="pro"] you can convert from the
+`shared_ptr` into the `weak_ptr` and back
+* icon:plus-circle[role="green",alt="pro"] if creating an instance with
+`std::make_shared<>()` only one allocation is made (since {cpp}11;
+a non-binding requirement in the Standard, though)
+* icon:minus-circle[role="red",alt="con"] if creating a new object with
+`shared_ptr<T> p(new T)` requires two allocations (one to create the ref count,
+and one to create the object)
 * icon:minus-circle[role="red",alt="con"] the ref count may not be near the object on the heap,
 so extra cache misses may be incurred on access
 * icon:minus-circle[role="red",alt="con"] the `shared_ptr` instance itself requires 16 bytes
 (pointer to the ref count and pointer to the object)
-* icon:minus-circle[role="red",alt="con"] if you convert from the `shared_ptr` to a raw pointer,
-you can't get back the `shared_ptr`
 
 
 .`scoped_refptr`
@@ -257,7 +260,7 @@ can implement features, such as debug builds that capture the stack trace of eve
 referent to help debug leaks.
 * icon:minus-circle[con, role="red"] the referred-to object must inherit
 from `RefCounted`
-* icon:minus-circle[con, role="red"] does not support `weak_ptr<>` use cases
+* icon:minus-circle[con, role="red"] does not support the `weak_ptr` use cases
 
 Since `scoped_refptr` is generally faster and smaller, try to use it
 rather than `shared_ptr` in new code. Existing code uses `shared_ptr`
@@ -313,7 +316,7 @@ Reference].
   used to group similar gflags together. If the gflag affects the entire
   process, it should not be prefixed.
 - If the gflag is for a quantity, the name should be suffixed with the units.
-  For example, `remote_bootstrap_idle_timeout_ms`.
+  For example, `tablet_copy_idle_timeout_ms`.
 - Where possible, use short names. This will save time for those entering
   command line options by hand.
 - The name is part of Kudu's compatibility contract, and should not change

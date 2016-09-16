@@ -189,6 +189,14 @@ Status InboundCall::AddRpcSidecar(gscoped_ptr<RpcSidecar> car, int* idx) {
 }
 
 string InboundCall::ToString() const {
+  if (header_.has_request_id()) {
+    return Substitute("Call $0 from $1 (ReqId={client: $2, seq_no=$3, attempt_no=$4})",
+                      remote_method_.ToString(),
+                      conn_->remote().ToString(),
+                      header_.request_id().client_id(),
+                      header_.request_id().seq_no(),
+                      header_.request_id().attempt_no());
+  }
   return Substitute("Call $0 from $1 (request call id $2)",
                       remote_method_.ToString(),
                       conn_->remote().ToString(),
@@ -201,7 +209,7 @@ void InboundCall::DumpPB(const DumpRunningRpcsRequestPB& req,
   if (req.include_traces() && trace_) {
     resp->set_trace_buffer(trace_->DumpToString());
   }
-  resp->set_micros_elapsed(MonoTime::Now(MonoTime::FINE).GetDeltaSince(timing_.time_received)
+  resp->set_micros_elapsed((MonoTime::Now() - timing_.time_received)
                            .ToMicroseconds());
 }
 
@@ -224,20 +232,20 @@ Trace* InboundCall::trace() {
 void InboundCall::RecordCallReceived() {
   TRACE_EVENT_ASYNC_BEGIN0("rpc", "InboundCall", this);
   DCHECK(!timing_.time_received.Initialized());  // Protect against multiple calls.
-  timing_.time_received = MonoTime::Now(MonoTime::FINE);
+  timing_.time_received = MonoTime::Now();
 }
 
 void InboundCall::RecordHandlingStarted(scoped_refptr<Histogram> incoming_queue_time) {
   DCHECK(incoming_queue_time != nullptr);
   DCHECK(!timing_.time_handled.Initialized());  // Protect against multiple calls.
-  timing_.time_handled = MonoTime::Now(MonoTime::FINE);
+  timing_.time_handled = MonoTime::Now();
   incoming_queue_time->Increment(
-      timing_.time_handled.GetDeltaSince(timing_.time_received).ToMicroseconds());
+      (timing_.time_handled - timing_.time_received).ToMicroseconds());
 }
 
 void InboundCall::RecordHandlingCompleted() {
   DCHECK(!timing_.time_completed.Initialized());  // Protect against multiple calls.
-  timing_.time_completed = MonoTime::Now(MonoTime::FINE);
+  timing_.time_completed = MonoTime::Now();
 
   if (!timing_.time_handled.Initialized()) {
     // Sometimes we respond to a call before we begin handling it (e.g. due to queue
@@ -247,7 +255,7 @@ void InboundCall::RecordHandlingCompleted() {
 
   if (method_info_) {
     method_info_->handler_latency_histogram->Increment(
-        timing_.time_completed.GetDeltaSince(timing_.time_handled).ToMicroseconds());
+        (timing_.time_completed - timing_.time_handled).ToMicroseconds());
   }
 }
 
@@ -256,8 +264,8 @@ bool InboundCall::ClientTimedOut() const {
     return false;
   }
 
-  MonoTime now = MonoTime::Now(MonoTime::FINE);
-  int total_time = now.GetDeltaSince(timing_.time_received).ToMilliseconds();
+  MonoTime now = MonoTime::Now();
+  int total_time = (now - timing_.time_received).ToMilliseconds();
   return total_time > header_.timeout_millis();
 }
 
@@ -265,9 +273,7 @@ MonoTime InboundCall::GetClientDeadline() const {
   if (!header_.has_timeout_millis() || header_.timeout_millis() == 0) {
     return MonoTime::Max();
   }
-  MonoTime deadline = timing_.time_received;
-  deadline.AddDelta(MonoDelta::FromMilliseconds(header_.timeout_millis()));
-  return deadline;
+  return timing_.time_received + MonoDelta::FromMilliseconds(header_.timeout_millis());
 }
 
 MonoTime InboundCall::GetTimeReceived() const {

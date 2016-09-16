@@ -29,7 +29,6 @@
 #include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
 #include "kudu/util/malloc.h"
-#include "kudu/util/memenv/memenv.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
@@ -419,20 +418,18 @@ static void WriteTestFile(Env* env, const string& path, size_t size) {
   ASSERT_OK(wf->Close());
 }
 
-
-
 TEST_F(TestEnv, TestReadFully) {
   SeedRandom();
-  const string kTestPath = "test";
+  const string kTestPath = GetTestPath("test");
   const int kFileSize = 64 * 1024;
-  gscoped_ptr<Env> mem(NewMemEnv(Env::Default()));
+  Env* env = Env::Default();
 
-  WriteTestFile(mem.get(), kTestPath, kFileSize);
+  WriteTestFile(env, kTestPath, kFileSize);
   ASSERT_NO_FATAL_FAILURE();
 
   // Reopen for read
   shared_ptr<RandomAccessFile> raf;
-  ASSERT_OK(env_util::OpenFileForRandom(mem.get(), kTestPath, &raf));
+  ASSERT_OK(env_util::OpenFileForRandom(env, kTestPath, &raf));
 
   ShortReadRandomAccessFile sr_raf(raf);
 
@@ -751,6 +748,30 @@ TEST_F(TestEnv, TestTempRWFile) {
   ASSERT_EQ(0, path.find("foo."));
   ASSERT_OK(file->Close());
   ASSERT_OK(env_->DeleteFile(path));
+}
+
+TEST_F(TestEnv, TestGetBytesFree) {
+  const string kDataDir = GetTestPath("parent");
+  const string kTestFilePath = JoinPathSegments(kDataDir, "testfile");
+  const int kFileSizeBytes = 256;
+  int64_t orig_bytes_free;
+  int64_t cur_bytes_free;
+  ASSERT_OK(env_->CreateDir(kDataDir));
+
+  // Loop several times in case there are concurrent tests running that are
+  // modifying the filesystem.
+  const int kIters = 100;
+  for (int i = 0; i < kIters; i++) {
+    if (env_->FileExists(kTestFilePath)) {
+      ASSERT_OK(env_->DeleteFile(kTestFilePath));
+    }
+    ASSERT_OK(env_->GetBytesFree(kDataDir, &orig_bytes_free));
+    NO_FATALS(WriteTestFile(env_.get(), kTestFilePath, kFileSizeBytes));
+    ASSERT_OK(env_->GetBytesFree(kDataDir, &cur_bytes_free));
+    if (orig_bytes_free - cur_bytes_free >= kFileSizeBytes) break;
+  }
+  ASSERT_GE(orig_bytes_free - cur_bytes_free, kFileSizeBytes)
+      << "Failed after " << kIters << " attempts";
 }
 
 }  // namespace kudu

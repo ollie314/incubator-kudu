@@ -29,6 +29,7 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/os-util.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/url-coding.h"
 #include "kudu/util/version_info.h"
@@ -57,6 +58,24 @@ DEFINE_string(heap_profile_path, "", "Output path to store heap profiles. If not
     "profiles are stored in /tmp/<process-name>.<pid>.<n>.heap.");
 TAG_FLAG(heap_profile_path, stable);
 TAG_FLAG(heap_profile_path, advanced);
+
+DEFINE_bool(disable_core_dumps, false, "Disable core dumps when this process crashes.");
+TAG_FLAG(disable_core_dumps, advanced);
+TAG_FLAG(disable_core_dumps, evolving);
+
+DEFINE_bool(unlock_experimental_flags, false,
+            "Unlock flags marked as 'experimental'. These flags are not guaranteed to "
+            "be maintained across releases of Kudu, and may enable features or behavior "
+            "known to be unstable. Use at your own risk.");
+TAG_FLAG(unlock_experimental_flags, advanced);
+TAG_FLAG(unlock_experimental_flags, stable);
+
+DEFINE_bool(unlock_unsafe_flags, false,
+            "Unlock flags marked as 'unsafe'. These flags are not guaranteed to "
+            "be maintained across releases of Kudu, and enable features or behavior "
+            "known to be unsafe. Use at your own risk.");
+TAG_FLAG(unlock_unsafe_flags, advanced);
+TAG_FLAG(unlock_unsafe_flags, stable);
 
 // Tag a bunch of the flags that we inherit from glog/gflags.
 
@@ -255,10 +274,60 @@ void ShowVersionAndExit() {
   exit(0);
 }
 
+// Check that, if any flags tagged with 'tag' have been specified to
+// non-default values, that 'unlocked' is true. If so (i.e. if the
+// flags have been appropriately unlocked), emits a warning message
+// for each flag and returns false. Otherwise, emits an error message
+// and returns true.
+bool CheckFlagsAndWarn(const string& tag, bool unlocked) {
+  vector<CommandLineFlagInfo> flags;
+  GetAllFlags(&flags);
+
+  int use_count = 0;
+  for (const auto& f : flags) {
+    if (f.is_default) continue;
+    unordered_set<string> tags;
+    GetFlagTags(f.name, &tags);
+    if (!ContainsKey(tags, tag)) continue;
+
+    if (unlocked) {
+      LOG(WARNING) << "Enabled " << tag << " flag: --" << f.name << "=" << f.current_value;
+    } else {
+      LOG(ERROR) << "Flag --" << f.name << " is " << tag << " and unsupported.";
+      use_count++;
+    }
+  }
+
+  if (!unlocked && use_count > 0) {
+    LOG(ERROR) << use_count << " " << tag << " flag(s) in use.";
+    LOG(ERROR) << "Use --unlock_" << tag << "_flags to proceed at your own risk.";
+    return true;
+  }
+  return false;
+}
+
+// Check that any flags specified on the command line are allowed
+// to be set. This ensures that, if the user is using any unsafe
+// or experimental flags, they have explicitly unlocked them.
+void CheckFlagsAllowed() {
+  bool should_exit = false;
+  should_exit |= CheckFlagsAndWarn("unsafe", FLAGS_unlock_unsafe_flags);
+  should_exit |= CheckFlagsAndWarn("experimental", FLAGS_unlock_experimental_flags);
+  if (should_exit) {
+    exit(1);
+  }
+}
+
 } // anonymous namespace
 
 int ParseCommandLineFlags(int* argc, char*** argv, bool remove_flags) {
   int ret = google::ParseCommandLineNonHelpFlags(argc, argv, remove_flags);
+  HandleCommonFlags();
+  return ret;
+}
+
+void HandleCommonFlags() {
+  CheckFlagsAllowed();
 
   if (FLAGS_helpxml) {
     DumpFlagsXML();
@@ -275,13 +344,15 @@ int ParseCommandLineFlags(int* argc, char*** argv, bool remove_flags) {
         "/tmp/$0.$1", google::ProgramInvocationShortName(), getpid());
   }
 
+  if (FLAGS_disable_core_dumps) {
+    DisableCoreDumps();
+  }
+
 #ifdef TCMALLOC_ENABLED
   if (FLAGS_enable_process_lifetime_heap_profiling) {
     HeapProfilerStart(FLAGS_heap_profile_path.c_str());
   }
 #endif
-
-  return ret;
 }
 
 } // namespace kudu

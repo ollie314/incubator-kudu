@@ -156,7 +156,7 @@ TEST_F(HybridClockTest, TestUpdate_LogicalValueIncreasesByAmount) {
 // Test that the incoming event is in the past, i.e. less than now - max_error
 TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase1) {
   MonoTime no_deadline;
-  MonoTime before = MonoTime::Now(MonoTime::FINE);
+  MonoTime before = MonoTime::Now();
 
   Timestamp past_ts;
   uint64_t max_error;
@@ -171,8 +171,8 @@ TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase1) {
 
   ASSERT_OK(s);
 
-  MonoTime after = MonoTime::Now(MonoTime::FINE);
-  MonoDelta delta = after.GetDeltaSince(before);
+  MonoTime after = MonoTime::Now();
+  MonoDelta delta = after - before;
   // The delta should be close to 0, but it takes some time for the hybrid
   // logical clock to decide that it doesn't need to wait.
   ASSERT_LT(delta.ToMicroseconds(), 25000);
@@ -181,7 +181,7 @@ TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase1) {
 // The normal case for transactions. Obtain a timestamp and then wait until
 // we're sure that tx_latest < now_earliest.
 TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase2) {
-  MonoTime before = MonoTime::Now(MonoTime::FINE);
+  MonoTime before = MonoTime::Now();
 
   // we do no time adjustment, this event should fall right within the possible
   // error interval
@@ -208,13 +208,12 @@ TEST_F(HybridClockTest, TestWaitUntilAfter_TestCase2) {
 
   // Wait with a deadline well in the future. This should succeed.
   {
-    MonoTime deadline = before;
-    deadline.AddDelta(MonoDelta::FromSeconds(60));
+    MonoTime deadline = before + MonoDelta::FromSeconds(60);
     ASSERT_OK(clock_->WaitUntilAfter(wait_until, deadline));
   }
 
-  MonoTime after = MonoTime::Now(MonoTime::FINE);
-  MonoDelta delta = after.GetDeltaSince(before);
+  MonoTime after = MonoTime::Now();
+  MonoDelta delta = after - before;
 
   // In the common case current_max_error >= past_max_error and we should have waited
   // 2 * past_max_error, but if the clock's error is reset between the two reads we might

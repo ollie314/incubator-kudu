@@ -39,7 +39,7 @@ INT64 = KUDU_INT64
 FLOAT = KUDU_FLOAT
 DOUBLE = KUDU_DOUBLE
 
-TIMESTAMP = KUDU_TIMESTAMP
+UNIXTIME_MICROS = KUDU_UNIXTIME_MICROS
 BINARY = KUDU_BINARY
 
 
@@ -110,7 +110,7 @@ bool_ = KuduType(KUDU_BOOL)
 float_ = KuduType(KUDU_FLOAT)
 double_ = KuduType(KUDU_DOUBLE)
 binary = KuduType(KUDU_BINARY)
-timestamp = KuduType(KUDU_TIMESTAMP)
+unixtime_micros = KuduType(KUDU_UNIXTIME_MICROS)
 
 
 cdef dict _type_names = {
@@ -123,7 +123,7 @@ cdef dict _type_names = {
     FLOAT: 'float',
     DOUBLE: 'double',
     BINARY: 'binary',
-    TIMESTAMP: 'timestamp'
+    UNIXTIME_MICROS: 'unixtime_micros'
 }
 
 
@@ -139,7 +139,7 @@ cdef dict _type_to_obj = {
     FLOAT: float_,
     DOUBLE: double_,
     BINARY: binary,
-    TIMESTAMP: timestamp
+    UNIXTIME_MICROS: unixtime_micros
 }
 
 
@@ -319,6 +319,31 @@ cdef class ColumnSpec:
 
 
 cdef class SchemaBuilder:
+
+    def copy_column(self, colschema):
+        """
+        Add a new column to the schema by copying it from an existing one.
+        Returns a ColumnSpec object for further configuration and use in a
+        fluid programming style. This method allows the SchemaBuilder to be
+        more easily used to build a new Schema from an existing one.
+
+        Parameters
+        ----------
+        colschema : ColumnSchema
+
+        Examples
+        --------
+        for col in scanner.get_projection_schema():
+            builder.copy_column(col).compression('lz4')
+        builder.set_primary_keys(['key'])
+
+        Returns
+        -------
+        spec : ColumnSpec
+        """
+        return self.add_column(colschema.name,
+                               colschema.type,
+                               colschema.nullable)
 
     def add_column(self, name, type_=None, nullable=None, compression=None,
                    encoding=None, primary_key=False):

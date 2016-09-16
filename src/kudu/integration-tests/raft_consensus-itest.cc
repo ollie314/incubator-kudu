@@ -50,6 +50,7 @@ DEFINE_int64(client_inserts_per_thread, 50,
 DEFINE_int64(client_num_batches_per_thread, 5,
              "In how many batches to group the rows, for each client");
 DECLARE_int32(consensus_rpc_timeout_ms);
+DECLARE_int64(rpc_negotiation_timeout_ms);
 
 METRIC_DECLARE_entity(tablet);
 METRIC_DECLARE_counter(transaction_memory_pressure_rejections);
@@ -147,9 +148,8 @@ class RaftConsensusITest : public TabletServerIntegrationTestBase {
                        int expected_count,
                        vector<string>* results) {
     LOG(INFO) << "Waiting for row count " << expected_count << "...";
-    MonoTime start = MonoTime::Now(MonoTime::FINE);
-    MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-    deadline.AddDelta(MonoDelta::FromSeconds(90));
+    MonoTime start = MonoTime::Now();
+    MonoTime deadline = start + MonoDelta::FromSeconds(90);
     while (true) {
       results->clear();
       NO_FATALS(ScanReplica(replica_proxy, results));
@@ -157,14 +157,14 @@ class RaftConsensusITest : public TabletServerIntegrationTestBase {
         return;
       }
       SleepFor(MonoDelta::FromMilliseconds(10));
-      if (!MonoTime::Now(MonoTime::FINE).ComesBefore(deadline)) {
+      if (MonoTime::Now() >= deadline) {
         break;
       }
     }
-    MonoTime end = MonoTime::Now(MonoTime::FINE);
+    MonoTime end = MonoTime::Now();
     LOG(WARNING) << "Didn't reach row count " << expected_count;
     FAIL() << "Did not reach expected row count " << expected_count
-           << " after " << end.GetDeltaSince(start).ToString()
+           << " after " << (end - start).ToString()
            << ": rows: " << *results;
   }
 
@@ -198,6 +198,11 @@ class RaftConsensusITest : public TabletServerIntegrationTestBase {
     return ret;
   }
 
+  // Insert 'num_rows' rows starting with row key 'start_row'.
+  // Each row will have size 'payload_size'. A short (100ms) timeout is
+  // used. If the flush generates any errors they will be ignored.
+  void InsertPayloadIgnoreErrors(int start_row, int num_rows, int payload_size);
+
   void InsertTestRowsRemoteThread(uint64_t first_row,
                                   uint64_t count,
                                   uint64_t num_batches,
@@ -222,26 +227,9 @@ class RaftConsensusITest : public TabletServerIntegrationTestBase {
         CHECK_OK(session->Apply(insert.release()));
       }
 
-      // We don't handle write idempotency yet. (i.e making sure that when a leader fails
-      // writes to it that were eventually committed by the new leader but un-ackd to the
-      // client are not retried), so some errors are expected.
-      // It's OK as long as the errors are Status::AlreadyPresent();
+      FlushSessionOrDie(session);
 
       int inserted = last_row_in_batch - first_row_in_batch;
-
-      Status s = session->Flush();
-      if (PREDICT_FALSE(!s.ok())) {
-        std::vector<client::KuduError*> errors;
-        ElementDeleter d(&errors);
-        bool overflow;
-        session->GetPendingErrors(&errors, &overflow);
-        CHECK(!overflow);
-        for (const client::KuduError* e : errors) {
-          CHECK(e->status().IsAlreadyPresent()) << "Unexpected error: " << e->status().ToString();
-        }
-        inserted -= errors.size();
-      }
-
       for (CountDownLatch* latch : latches) {
         latch->CountDown(inserted);
       }
@@ -337,14 +325,6 @@ class RaftConsensusITest : public TabletServerIntegrationTestBase {
   // has a payload of around 128KB. Causes a gtest failure on error.
   void Write128KOpsToLeader(int num_writes);
 
-  // Check for and restart any TS that have crashed.
-  // Returns the number of servers restarted.
-  int RestartAnyCrashedTabletServers();
-
-  // Assert that no tablet servers have crashed.
-  // Tablet servers that have been manually Shutdown() are allowed.
-  void AssertNoTabletServersCrashed();
-
   // Ensure that a majority of servers is required for elections and writes.
   // This is done by pausing a majority and asserting that writes and elections fail,
   // then unpausing the majority and asserting that elections and writes succeed.
@@ -407,7 +387,7 @@ void RaftConsensusITest::AddFlagsForLogRolls(vector<string>* extra_tserver_flags
   extra_tserver_flags->push_back("--log_segment_size_mb=1");
   extra_tserver_flags->push_back("--log_async_preallocate_segments=false");
   extra_tserver_flags->push_back("--log_min_segments_to_retain=1");
-  extra_tserver_flags->push_back("--log_min_seconds_to_retain=0");
+  extra_tserver_flags->push_back("--log_max_segments_to_retain=3");
   extra_tserver_flags->push_back("--maintenance_manager_polling_interval_ms=100");
 }
 
@@ -635,10 +615,20 @@ void RaftConsensusITest::Write128KOpsToLeader(int num_writes) {
 // Test that when a follower is stopped for a long time, the log cache
 // properly evicts operations, but still allows the follower to catch
 // up when it comes back.
+//
+// Also asserts that the other replicas retain logs for the stopped
+// follower to catch up from.
 TEST_F(RaftConsensusITest, TestCatchupAfterOpsEvicted) {
-  vector<string> extra_flags;
-  extra_flags.push_back("--log_cache_size_limit_mb=1");
-  extra_flags.push_back("--consensus_max_batch_size_bytes=500000");
+  vector<string> extra_flags = {
+    "--log_cache_size_limit_mb=1",
+    "--consensus_max_batch_size_bytes=500000",
+    // Use short and synchronous rolls so that we can test log segment retention.
+    "--log_segment_size_mb=1",
+    "--log_async_preallocate_segments=false",
+    // Run the maintenance manager frequently so that we don't have to wait
+    // long for GC.
+    "--maintenance_manager_polling_interval_ms=100"
+  };
   BuildAndStart(extra_flags);
   TServerDetails* replica = (*tablet_replicas_.begin()).second;
   ASSERT_TRUE(replica != nullptr);
@@ -648,14 +638,40 @@ TEST_F(RaftConsensusITest, TestCatchupAfterOpsEvicted) {
   ASSERT_OK(replica_ets->Pause());
   LOG(INFO)<< "Paused one of the replicas, starting to write.";
 
-  // Insert 3MB worth of data.
-  const int kNumWrites = 25;
+  // Insert 5MB worth of data.
+  const int kNumWrites = 40;
   NO_FATALS(Write128KOpsToLeader(kNumWrites));
+
+  // Sleep a bit to give the maintenance manager time to GC logs, if it were
+  // going to.
+  SleepFor(MonoDelta::FromSeconds(1));
+
+  // Check that the leader and non-paused follower have not GCed any logs (since
+  // the third peer needs them to catch up).
+  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+    int num_wals = inspect_->CountFilesInWALDirForTS(i, tablet_id_, "wal-*");
+    if (cluster_->tablet_server(i) == replica_ets) {
+      ASSERT_EQ(1, num_wals) << "Replica should have only one segment";
+    } else {
+      ASSERT_EQ(6, num_wals)
+          << "Other nodes should retain segments for the frozen replica to catch up";
+    }
+  }
 
   // Now unpause the replica, the lagging replica should eventually catch back up.
   ASSERT_OK(replica_ets->Resume());
 
   ASSERT_ALL_REPLICAS_AGREE(kNumWrites);
+
+  // Once the follower has caught up, all replicas should eventually GC the earlier
+  // log segments that they were retaining.
+  AssertEventually([&]() {
+      for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+        SCOPED_TRACE(Substitute("TS $0", i));
+        int num_wals = inspect_->CountFilesInWALDirForTS(i, tablet_id_, "wal-*");
+        ASSERT_EQ(2, num_wals);
+      }
+    });
 }
 
 void RaftConsensusITest::CauseFollowerToFallBehindLogGC(string* leader_uuid,
@@ -784,28 +800,6 @@ TEST_F(RaftConsensusITest, TestFollowerFallsBehindLeaderGC) {
   }
 }
 
-int RaftConsensusITest::RestartAnyCrashedTabletServers() {
-  int restarted = 0;
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
-    if (!cluster_->tablet_server(i)->IsProcessAlive()) {
-      LOG(INFO) << "TS " << i << " appears to have crashed. Restarting.";
-      cluster_->tablet_server(i)->Shutdown();
-      CHECK_OK(cluster_->tablet_server(i)->Restart());
-      restarted++;
-    }
-  }
-  return restarted;
-}
-
-void RaftConsensusITest::AssertNoTabletServersCrashed() {
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
-    if (cluster_->tablet_server(i)->IsShutdown()) continue;
-
-    ASSERT_TRUE(cluster_->tablet_server(i)->IsProcessAlive())
-      << "Tablet server " << i << " crashed";
-  }
-}
-
 // This test starts several tablet servers, and configures them with
 // fault injection so that the leaders frequently crash just before
 // sending RPCs to followers.
@@ -851,7 +845,7 @@ TEST_F(RaftConsensusITest, InsertWithCrashyNodes) {
   TestWorkload workload(cluster_.get());
   workload.set_num_replicas(FLAGS_num_replicas);
   workload.set_timeout_allowed(true);
-  workload.set_write_timeout_millis(1000);
+  workload.set_write_timeout_millis(10000);
   workload.set_num_write_threads(10);
   workload.set_write_batch_size(1);
   workload.Setup();
@@ -975,6 +969,10 @@ TEST_F(RaftConsensusITest, MultiThreadedInsertWithFailovers) {
   // Reset consensus rpc timeout to the default value or the election might fail often.
   FLAGS_consensus_rpc_timeout_ms = 1000;
 
+  // TODO(KUDU-1580): this test seems to frequently trigger RPC negotiation timeouts,
+  // and the client doesn't properly fail over in this case.
+  FLAGS_rpc_negotiation_timeout_ms = 10000;
+
   // Start a 7 node configuration cluster (since we can't bring leaders back we start with a
   // higher replica count so that we kill more leaders).
 
@@ -1011,6 +1009,7 @@ TEST_F(RaftConsensusITest, MultiThreadedInsertWithFailovers) {
   }
 
   for (CountDownLatch* latch : latches) {
+    NO_FATALS(cluster_->AssertNoCrashes());
     latch->Wait();
     StopOrKillLeaderAndElectNewOne();
   }
@@ -1072,12 +1071,11 @@ TEST_F(RaftConsensusITest, TestAutomaticLeaderElection) {
 TEST_F(RaftConsensusITest, TestAutomaticLeaderElectionOneReplica) {
   FLAGS_num_tablet_servers = 1;
   FLAGS_num_replicas = 1;
-  vector<string> ts_flags;
-  vector<string> master_flags = { "--catalog_manager_allow_local_consensus=false" };
-  BuildAndStart(ts_flags, master_flags);
-
-  TServerDetails* leader;
-  ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &leader));
+  NO_FATALS(BuildAndStart());
+  // Ensure that single-node Raft configs elect themselves as leader
+  // immediately upon Consensus startup.
+  ASSERT_OK(GetReplicaStatusAndCheckIfLeader(tablet_servers_[cluster_->tablet_server(0)->uuid()],
+                                             tablet_id_, MonoDelta::FromMilliseconds(500)));
 }
 
 void RaftConsensusITest::StubbornlyWriteSameRowThread(int replica_idx, const AtomicBool* finish) {
@@ -1214,7 +1212,8 @@ TEST_F(RaftConsensusITest, TestReplicaBehaviorViaRPC) {
   req.set_dest_uuid(replica_ts->uuid());
   req.set_caller_uuid("fake_caller");
   req.set_caller_term(2);
-  req.mutable_committed_index()->CopyFrom(MakeOpId(1, 1));
+  req.set_all_replicated_index(0);
+  req.set_committed_index(1);
   req.mutable_preceding_id()->CopyFrom(MakeOpId(1, 1));
 
   ASSERT_OK(c_proxy->UpdateConsensus(req, &resp, &rpc));
@@ -1273,7 +1272,7 @@ TEST_F(RaftConsensusITest, TestReplicaBehaviorViaRPC) {
   req.clear_ops();
   req.mutable_preceding_id()->CopyFrom(MakeOpId(2, 2));
   AddOp(MakeOpId(2, 3), &req);
-  req.mutable_committed_index()->CopyFrom(MakeOpId(2, 4));
+  req.set_committed_index(4);
   rpc.Reset();
   ASSERT_OK(c_proxy->UpdateConsensus(req, &resp, &rpc));
   ASSERT_FALSE(resp.has_error()) << resp.DebugString();
@@ -1288,7 +1287,7 @@ TEST_F(RaftConsensusITest, TestReplicaBehaviorViaRPC) {
   resp.Clear();
   req.clear_ops();
   // Now send some more ops, and commit the earlier ones.
-  req.mutable_committed_index()->CopyFrom(MakeOpId(2, 4));
+  req.set_committed_index(4);
   req.mutable_preceding_id()->CopyFrom(MakeOpId(2, 4));
   AddOp(MakeOpId(2, 5), &req);
   AddOp(MakeOpId(2, 6), &req);
@@ -1353,7 +1352,7 @@ TEST_F(RaftConsensusITest, TestReplicaBehaviorViaRPC) {
   // the earlier ops.
   {
     req.mutable_preceding_id()->CopyFrom(MakeOpId(leader_term, 6));
-    req.mutable_committed_index()->CopyFrom(MakeOpId(leader_term, 6));
+    req.set_committed_index(6);
     req.clear_ops();
     rpc.Reset();
     ASSERT_OK(c_proxy->UpdateConsensus(req, &resp, &rpc));
@@ -1503,8 +1502,7 @@ void RaftConsensusITest::WaitForReplicasReportedToMaster(
     WaitForLeader wait_for_leader,
     bool* has_leader,
     master::TabletLocationsPB* tablet_locations) {
-  MonoTime deadline(MonoTime::Now(MonoTime::FINE));
-  deadline.AddDelta(timeout);
+  MonoTime deadline(MonoTime::Now() + timeout);
   while (true) {
     ASSERT_OK(GetTabletLocations(tablet_id, timeout, tablet_locations));
     *has_leader = false;
@@ -1520,7 +1518,7 @@ void RaftConsensusITest::WaitForReplicasReportedToMaster(
         break;
       }
     }
-    if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) break;
+    if (deadline < MonoTime::Now()) break;
     SleepFor(MonoDelta::FromMilliseconds(20));
   }
   ASSERT_EQ(num_replicas, tablet_locations->replicas_size()) << tablet_locations->DebugString();
@@ -1635,7 +1633,7 @@ TEST_F(RaftConsensusITest, TestReplaceChangeConfigOperation) {
   ASSERT_OK(StartElection(leader_tserver, tablet_id_, MonoDelta::FromSeconds(10)));
   ASSERT_OK(WaitForServersToAgree(MonoDelta::FromSeconds(10), tablet_servers_, tablet_id_, 1));
 
-  // Shut down servers 1 and 2, so that server 1 can't replicate anything.
+  // Shut down servers 1 and 2, so that server 0 can't replicate anything.
   cluster_->tablet_server_by_uuid(tservers[1]->uuid())->Shutdown();
   cluster_->tablet_server_by_uuid(tservers[2]->uuid())->Shutdown();
 
@@ -1656,6 +1654,7 @@ TEST_F(RaftConsensusITest, TestReplaceChangeConfigOperation) {
 
   // Elect one of the other servers.
   ASSERT_OK(StartElection(tservers[1], tablet_id_, MonoDelta::FromSeconds(10)));
+  ASSERT_OK(WaitUntilLeader(tservers[1], tablet_id_, MonoDelta::FromSeconds(10)));
   leader_tserver = tservers[1];
 
   // Resume the original leader. Its change-config operation will now be aborted
@@ -1999,7 +1998,7 @@ TEST_F(RaftConsensusITest, TestMasterNotifiedOnConfigChange) {
   // Wait for initial NO_OP to be committed by the leader.
   TServerDetails* leader_ts;
   ASSERT_OK(FindTabletLeader(tablet_servers_, tablet_id, timeout, &leader_ts));
-  ASSERT_OK(WaitForServersToAgree(timeout, active_tablet_servers, tablet_id, 1));
+  ASSERT_OK(itest::WaitUntilCommittedOpIdIndexIs(1, leader_ts, tablet_id, timeout));
 
   // Change the config.
   TServerDetails* tserver_to_add = tablet_servers_[uuid_to_add];
@@ -2073,7 +2072,8 @@ TEST_F(RaftConsensusITest, TestEarlyCommitDespiteMemoryPressure) {
   req.set_tablet_id(tablet_id_);
   req.set_caller_uuid(tservers[2]->instance_id.permanent_uuid());
   req.set_caller_term(1);
-  req.mutable_committed_index()->CopyFrom(MakeOpId(1, 1));
+  req.set_committed_index(1);
+  req.set_all_replicated_index(0);
   req.mutable_preceding_id()->CopyFrom(MakeOpId(1, 1));
   for (int i = 0; i < kNumOps; i++) {
     AddOp(MakeOpId(1, 2 + i), &req);
@@ -2097,7 +2097,7 @@ TEST_F(RaftConsensusITest, TestEarlyCommitDespiteMemoryPressure) {
   // 1. Replicate just one new operation.
   // 2. Tell the follower that the previous set of operations were committed.
   req.mutable_preceding_id()->CopyFrom(last_opid);
-  req.mutable_committed_index()->CopyFrom(last_opid);
+  req.set_committed_index(last_opid.index());
   req.mutable_ops()->Clear();
   AddOp(MakeOpId(1, last_opid.index() + 1), &req);
   rpc.Reset();
@@ -2112,7 +2112,7 @@ TEST_F(RaftConsensusITest, TestEarlyCommitDespiteMemoryPressure) {
   WaitForRowCount(replica_ts->tserver_proxy.get(), kNumOps, &rows);
 }
 
-// Test that we can create (vivify) a new tablet via remote bootstrap.
+// Test that we can create (vivify) a new tablet via tablet copy.
 TEST_F(RaftConsensusITest, TestAutoCreateReplica) {
   FLAGS_num_tablet_servers = 3;
   FLAGS_num_replicas = 2;
@@ -2241,8 +2241,7 @@ TEST_F(RaftConsensusITest, TestMemoryRemainsConstantDespiteTwoDeadFollowers) {
   workload.Start();
 
   // Run until the leader has rejected several transactions.
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(kMaxWaitTime);
+  MonoTime deadline = MonoTime::Now() + kMaxWaitTime;
   while (true) {
     int64_t num_rejections = 0;
     ASSERT_OK(cluster_->tablet_server(leader_ts_idx)->GetInt64Metric(
@@ -2253,7 +2252,7 @@ TEST_F(RaftConsensusITest, TestMemoryRemainsConstantDespiteTwoDeadFollowers) {
         &num_rejections));
     if (num_rejections >= kMinRejections) {
       break;
-    } else if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) {
+    } else if (deadline < MonoTime::Now()) {
       FAIL() << "Ran for " << kMaxWaitTime.ToString() << ", deadline expired";
     }
     SleepFor(MonoDelta::FromMilliseconds(200));
@@ -2289,6 +2288,128 @@ TEST_F(RaftConsensusITest, TestSlowLeader) {
   workload.Setup();
   workload.Start();
   SleepFor(MonoDelta::FromSeconds(60));
+}
+
+void RaftConsensusITest::InsertPayloadIgnoreErrors(int start_row, int num_rows, int payload_size) {
+  shared_ptr<KuduTable> table;
+  CHECK_OK(client_->OpenTable(kTableId, &table));
+  shared_ptr<KuduSession> session = client_->NewSession();
+  session->SetTimeoutMillis(100);
+  CHECK_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
+  string payload(payload_size, 'x');
+  for (int i = 0; i < num_rows; i++) {
+    gscoped_ptr<KuduInsert> insert(table->NewInsert());
+    KuduPartialRow* row = insert->mutable_row();
+    CHECK_OK(row->SetInt32(0, i + start_row));
+    CHECK_OK(row->SetInt32(1, 0));
+    CHECK_OK(row->SetStringCopy(2, payload));
+    CHECK_OK(session->Apply(insert.release()));
+    ignore_result(session->Flush());
+  }
+}
+
+// Regression test for KUDU-1469, a case in which a leader and follower could get "stuck"
+// in a tight RPC loop, in which the leader would repeatedly send a batch of ops that the
+// follower already had, the follower would fully de-dupe them, and yet the leader would
+// never advance to the next batch.
+//
+// The 'perfect storm' reproduced here consists of:
+// - the commit index has fallen far behind due to a slow log on the leader
+//   and one of the three replicas being inaccessible
+// - the other replica elects itself
+// - before the old leader notices it has been ousted, it writes at least one more
+//   operation to its local log.
+// - before the replica can replicate anything to the old leader, it receives
+//   more writes, such that the first batch's preceding_op_id is ahead of
+//   the old leader's last written
+//
+// See the detailed comments below for more details.
+TEST_F(RaftConsensusITest, TestCommitIndexFarBehindAfterLeaderElection) {
+  const MonoDelta kTimeout = MonoDelta::FromSeconds(10);
+
+  if (!AllowSlowTests()) return;
+
+  // Set the batch size low so that, after the new leader takes
+  // over below, the ops required to catch up from the committed index
+  // to the newly replicated index don't fit into a single batch.
+  BuildAndStart({"--consensus_max_batch_size_bytes=50000"});
+
+  // Get the leader and the two replica tablet servers.
+  // These will have the following roles in this test:
+  // 1) 'first_leader_ts' is the initial leader.
+  // 2) 'second_leader_ts' will be forced to be elected as the second leader
+  // 3) 'only_vote_ts' will simulate a heavily overloaded (or corrupted) TS
+  //     which is far enough behind (or failed) such that it only participates
+  //     by voting.
+  TServerDetails* leader;
+  ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &leader));
+  ExternalTabletServer* first_leader_ts = cluster_->tablet_server_by_uuid(leader->uuid());
+  ExternalTabletServer* second_leader_ts = nullptr;
+  ExternalTabletServer* only_vote_ts = nullptr;
+  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+    ExternalTabletServer* ts = cluster_->tablet_server(i);
+    if (ts->instance_id().permanent_uuid() != leader->uuid()) {
+      if (second_leader_ts == nullptr) {
+        second_leader_ts = ts;
+      } else {
+        only_vote_ts = ts;
+      }
+    }
+  }
+
+  // The 'only_vote' tablet server doesn't participate in replication.
+  ASSERT_OK(cluster_->SetFlag(only_vote_ts, "follower_reject_update_consensus_requests", "true"));
+
+  // Inject a long delay in the log of the first leader, and write 10 operations.
+  // This delay ensures that it will replicate them to both itself and its follower,
+  // but due to its log sync not completing, it won't know that it is safe to advance its
+  // commit index until long after it has lost its leadership.
+  ASSERT_OK(cluster_->SetFlag(first_leader_ts, "log_inject_latency_ms_mean", "6000"));
+  ASSERT_OK(cluster_->SetFlag(first_leader_ts, "log_inject_latency", "true"));
+  InsertPayloadIgnoreErrors(0, 10, 10000);
+
+  // Write one more operation to the leader, but disable consensus on the follower so that
+  // it doesn't get replicated.
+  ASSERT_OK(cluster_->SetFlag(
+      second_leader_ts, "follower_reject_update_consensus_requests", "true"));
+  InsertPayloadIgnoreErrors(10, 1, 10000);
+
+  // Pause the initial leader and wait for the replica to elect itself. The third TS participates
+  // here by voting.
+  first_leader_ts->Pause();
+  ASSERT_OK(WaitUntilLeader(tablet_servers_[second_leader_ts->uuid()], tablet_id_, kTimeout));
+
+  // The voter TS has done its duty. Shut it down to avoid log spam where it tries to run
+  // elections.
+  only_vote_ts->Shutdown();
+
+  // Perform one insert on the new leader. The new leader has not yet replicated its NO_OP to
+  // the old leader, since the old leader is still paused.
+  NO_FATALS(CreateClient(&client_));
+  InsertPayloadIgnoreErrors(13, 1, 10000);
+
+  // Now we expect to have the following logs:
+  //
+  // first_leader_ts         second_leader_ts
+  // -------------------     ------------
+  // 1.1  NO_OP      1.1     NO_OP
+  // 1.2  WRITE_OP   1.2     WRITE_OP
+  // ................................
+  // 1.11 WRITE_OP   1.11    WRITE_OP
+  // 1.12 WRITE_OP   2.12    NO_OP
+  //                 2.13    WRITE_OP
+  //
+  // Both servers should have a committed_idx of 1.1 since the log was delayed.
+
+  // Now, when we resume the original leader, we expect them to recover properly.
+  // Previously this triggered KUDU-1469.
+  first_leader_ts->Resume();
+
+  TabletServerMap active_tservers = tablet_servers_;
+  active_tservers.erase(only_vote_ts->uuid());
+  ASSERT_OK(WaitForServersToAgree(MonoDelta::FromSeconds(30),
+                                  active_tservers,
+                                  tablet_id_, 13));
 }
 
 // Run a regular workload with one follower that's writing to its WAL slowly.
@@ -2335,7 +2456,7 @@ TEST_F(RaftConsensusITest, TestHammerOneRow) {
 
   TestWorkload workload(cluster_.get());
   workload.set_table_name(kTableId);
-  workload.set_pathological_one_row_enabled(true);
+  workload.set_write_pattern(TestWorkload::UPDATE_ONE_ROW);
   workload.set_num_write_threads(20);
   workload.Setup();
   workload.Start();
@@ -2366,8 +2487,8 @@ TEST_F(RaftConsensusITest, TestEvictAbandonedFollowers) {
   ASSERT_OK(WaitForServersToAgree(timeout, active_tablet_servers, tablet_id_, 2));
 }
 
-// Test that followers that fall behind the leader's log GC threshold are
-// evicted from the config.
+// Test that, after followers are evicted from the config, the master re-adds a new
+// replica for that follower and it eventually catches back up.
 TEST_F(RaftConsensusITest, TestMasterReplacesEvictedFollowers) {
   vector<string> extra_flags;
   AddFlagsForLogRolls(&extra_flags); // For CauseFollowerToFallBehindLogGC().
@@ -2381,7 +2502,7 @@ TEST_F(RaftConsensusITest, TestMasterReplacesEvictedFollowers) {
   NO_FATALS(CauseFollowerToFallBehindLogGC(&leader_uuid, &orig_term, &follower_uuid));
 
   // The follower will be evicted. Now wait for the master to cause it to be
-  // remotely bootstrapped.
+  // copied.
   ASSERT_OK(WaitForServersToAgree(timeout, tablet_servers_, tablet_id_, 2));
 
   ClusterVerifier v(cluster_.get());
@@ -2447,7 +2568,7 @@ TEST_F(RaftConsensusITest, TestUpdateConsensusErrorNonePrepared) {
 
   // Configure the first server to fail all on prepare.
   TServerDetails *replica_ts = tservers[0];
-  ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(0),
+  ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server_by_uuid(replica_ts->uuid()),
                 "follower_fail_all_prepare", "true"));
 
   // Pretend to be the leader and send a request that should return an error.
@@ -2458,7 +2579,8 @@ TEST_F(RaftConsensusITest, TestUpdateConsensusErrorNonePrepared) {
   req.set_tablet_id(tablet_id_);
   req.set_caller_uuid(tservers[2]->instance_id.permanent_uuid());
   req.set_caller_term(0);
-  req.mutable_committed_index()->CopyFrom(MakeOpId(0, 0));
+  req.set_committed_index(0);
+  req.set_all_replicated_index(0);
   req.mutable_preceding_id()->CopyFrom(MakeOpId(0, 0));
   for (int i = 0; i < kNumOps; i++) {
     AddOp(MakeOpId(0, 1 + i), &req);
@@ -2509,6 +2631,114 @@ TEST_F(RaftConsensusITest, TestCorruptReplicaMetadata) {
                                    tablet_id_,
                                    tablet::RUNNING,
                                    MonoDelta::FromSeconds(30)));
+}
+
+// Test that an IOError when writing to the write-ahead log is a fatal error.
+// First, we test that failed replicates are fatal. Then, we test that failed
+// commits are fatal.
+TEST_F(RaftConsensusITest, TestLogIOErrorIsFatal) {
+  FLAGS_num_replicas = 3;
+  FLAGS_num_tablet_servers = 3;
+  vector<string> ts_flags, master_flags;
+  ts_flags = {"--enable_leader_failure_detection=false",
+              // Disable core dumps since we will inject FATAL errors, and dumping
+              // core can take a long time.
+              "--disable_core_dumps"};
+  master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
+  NO_FATALS(BuildAndStart(ts_flags, master_flags));
+
+  vector<TServerDetails*> tservers;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ASSERT_EQ(3, tservers.size());
+  vector<ExternalTabletServer*> ext_tservers;
+  for (auto* details : tservers) {
+    ext_tservers.push_back(cluster_->tablet_server_by_uuid(details->uuid()));
+  }
+
+  // Test failed replicates.
+
+  // Elect server 2 as leader and wait for log index 1 to propagate to all servers.
+  ASSERT_OK(StartElection(tservers[2], tablet_id_, MonoDelta::FromSeconds(10)));
+  ASSERT_OK(WaitForServersToAgree(MonoDelta::FromSeconds(10), tablet_servers_, tablet_id_, 1));
+
+  // Inject an IOError the next time servers 1 and 2 write to their WAL.
+  // Then, cause server 0 to start and win a leader election.
+  // This will cause servers 0 and 1 to crash.
+  for (int i = 1; i <= 2; i++) {
+    ASSERT_OK(cluster_->SetFlag(ext_tservers[i],
+              "log_inject_io_error_on_append_fraction", "1.0"));
+  }
+  ASSERT_OK(StartElection(tservers[0], tablet_id_, MonoDelta::FromSeconds(10)));
+  for (int i = 1; i <= 2; i++) {
+    ASSERT_OK(ext_tservers[i]->WaitForCrash(MonoDelta::FromSeconds(10)));
+  }
+
+  // Now we know followers crash when they write to their log.
+  // Let's verify the same for the leader (server 0).
+  ASSERT_OK(cluster_->SetFlag(ext_tservers[0],
+            "log_inject_io_error_on_append_fraction", "1.0"));
+
+  // Attempt to write to the leader, but with a short timeout.
+  TestWorkload workload(cluster_.get());
+  workload.set_table_name(kTableId);
+  workload.set_timeout_allowed(true);
+  workload.set_write_timeout_millis(100);
+  workload.set_num_write_threads(1);
+  workload.set_write_batch_size(1);
+  workload.Setup();
+  workload.Start();
+
+  // Leader should crash as well.
+  ASSERT_OK(ext_tservers[0]->WaitForCrash(MonoDelta::FromSeconds(10)));
+  workload.StopAndJoin();
+
+  LOG(INFO) << "Everything crashed!";
+
+  // Test failed commits.
+
+  cluster_->Shutdown();
+  ASSERT_OK(cluster_->Restart());
+  NO_FATALS(WaitForTSAndReplicas());
+  tservers.clear();
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ASSERT_EQ(3, tservers.size());
+
+  // Elect server 0 as leader, wait until writes are going through.
+  ASSERT_OK(StartElection(tservers[0], tablet_id_, MonoDelta::FromSeconds(10)));
+  workload.Start();
+  int64_t prev_inserted = workload.rows_inserted();
+  while (workload.rows_inserted() == prev_inserted) {
+    SleepFor(MonoDelta::FromMilliseconds(10));
+  }
+  workload.StopAndJoin();
+  ASSERT_OK(WaitForServersToAgree(MonoDelta::FromSeconds(10), tablet_servers_, tablet_id_, 1));
+
+  // Now shutdown servers 1 and 2 so that writes cannot commit. Write to the
+  // leader, set flags so that commits crash the server, then bring the
+  // followers back up.
+  for (int i = 1; i <= 2; i++) {
+    ext_tservers[i]->Shutdown();
+  }
+
+  OpId prev_opid, cur_opid;
+  ASSERT_OK(GetLastOpIdForReplica(tablet_id_, tservers[0], consensus::RECEIVED_OPID,
+                                  MonoDelta::FromSeconds(10), &prev_opid));
+  VLOG(1) << "Previous OpId on server 0: " << OpIdToString(prev_opid);
+  workload.Start();
+  // Wait until we've got (uncommitted) entries into the leader's log.
+  do {
+    ASSERT_OK(GetLastOpIdForReplica(tablet_id_, tservers[0], consensus::RECEIVED_OPID,
+                                    MonoDelta::FromSeconds(10), &cur_opid));
+    VLOG(1) << "Current OpId on server 0: " << OpIdToString(cur_opid);
+  } while (consensus::OpIdEquals(prev_opid, cur_opid));
+  workload.StopAndJoin();
+  ASSERT_OK(cluster_->SetFlag(ext_tservers[0],
+            "log_inject_io_error_on_append_fraction", "1.0"));
+  for (int i = 1; i <= 2; i++) {
+    ASSERT_OK(ext_tservers[i]->Restart());
+  }
+  // Leader will crash.
+  ASSERT_OK(ext_tservers[0]->WaitForCrash(MonoDelta::FromSeconds(10)));
 }
 
 }  // namespace tserver

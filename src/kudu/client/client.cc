@@ -18,11 +18,14 @@
 #include "kudu/client/client.h"
 
 #include <algorithm>
-#include <boost/bind.hpp>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+#include <boost/bind.hpp>
 
 #include "kudu/client/batcher.h"
 #include "kudu/client/callbacks.h"
@@ -31,6 +34,7 @@
 #include "kudu/client/error-internal.h"
 #include "kudu/client/error_collector.h"
 #include "kudu/client/meta_cache.h"
+#include "kudu/client/replica-internal.h"
 #include "kudu/client/row_result.h"
 #include "kudu/client/scan_predicate-internal.h"
 #include "kudu/client/scan_token-internal.h"
@@ -40,6 +44,7 @@
 #include "kudu/client/table-internal.h"
 #include "kudu/client/table_alterer-internal.h"
 #include "kudu/client/table_creator-internal.h"
+#include "kudu/client/tablet-internal.h"
 #include "kudu/client/tablet_server-internal.h"
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
@@ -48,13 +53,14 @@
 #include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/master/master.h" // TODO: remove this include - just needed for default port
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/rpc/request_tracker.h"
 #include "kudu/util/init.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/net/dns_resolver.h"
+#include "kudu/util/oid_generator.h"
 #include "kudu/util/version_info.h"
 
 using kudu::master::AlterTableRequestPB;
@@ -66,6 +72,8 @@ using kudu::master::DeleteTableRequestPB;
 using kudu::master::DeleteTableResponsePB;
 using kudu::master::GetTableSchemaRequestPB;
 using kudu::master::GetTableSchemaResponsePB;
+using kudu::master::GetTabletLocationsRequestPB;
+using kudu::master::GetTabletLocationsResponsePB;
 using kudu::master::ListTablesRequestPB;
 using kudu::master::ListTablesResponsePB;
 using kudu::master::ListTabletServersRequestPB;
@@ -73,13 +81,17 @@ using kudu::master::ListTabletServersResponsePB;
 using kudu::master::ListTabletServersResponsePB_Entry;
 using kudu::master::MasterServiceProxy;
 using kudu::master::TabletLocationsPB;
+using kudu::master::TSInfoPB;
 using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
 using kudu::rpc::RpcController;
 using kudu::tserver::ScanResponsePB;
+using std::pair;
 using std::set;
 using std::string;
+using std::unique_ptr;
 using std::vector;
+using strings::Substitute;
 
 MAKE_ENUM_LIMITS(kudu::client::KuduSession::FlushMode,
                  kudu::client::KuduSession::AUTO_FLUSH_SYNC,
@@ -223,8 +235,7 @@ Status KuduClientBuilder::Build(shared_ptr<KuduClient>* client) {
 
   // Let's allow for plenty of time for discovering the master the first
   // time around.
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(c->default_admin_operation_timeout());
+  MonoTime deadline = MonoTime::Now() + c->default_admin_operation_timeout();
   RETURN_NOT_OK_PREPEND(c->data_->SetMasterServerProxy(c.get(), deadline),
                         "Could not locate the leader master");
 
@@ -235,12 +246,16 @@ Status KuduClientBuilder::Build(shared_ptr<KuduClient>* client) {
   RETURN_NOT_OK_PREPEND(c->data_->InitLocalHostNames(),
                         "Could not determine local host names");
 
+  c->data_->request_tracker_ = new rpc::RequestTracker(c->data_->client_id_);
+
   client->swap(c);
   return Status::OK();
 }
 
 KuduClient::KuduClient()
   : data_(new KuduClient::Data()) {
+  static ObjectIdGenerator oid_generator;
+  data_->client_id_ = oid_generator.Next();
 }
 
 KuduClient::~KuduClient() {
@@ -253,14 +268,12 @@ KuduTableCreator* KuduClient::NewTableCreator() {
 
 Status KuduClient::IsCreateTableInProgress(const string& table_name,
                                            bool *create_in_progress) {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(default_admin_operation_timeout());
+  MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
   return data_->IsCreateTableInProgress(this, table_name, deadline, create_in_progress);
 }
 
 Status KuduClient::DeleteTable(const string& table_name) {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(default_admin_operation_timeout());
+  MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
   return data_->DeleteTable(this, table_name, deadline);
 }
 
@@ -270,50 +283,47 @@ KuduTableAlterer* KuduClient::NewTableAlterer(const string& name) {
 
 Status KuduClient::IsAlterTableInProgress(const string& table_name,
                                           bool *alter_in_progress) {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(default_admin_operation_timeout());
+  MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
   return data_->IsAlterTableInProgress(this, table_name, deadline, alter_in_progress);
 }
 
 Status KuduClient::GetTableSchema(const string& table_name,
                                   KuduSchema* schema) {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(default_admin_operation_timeout());
-  string table_id_ignored;
-  PartitionSchema partition_schema;
+  MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
   return data_->GetTableSchema(this,
                                table_name,
                                deadline,
                                schema,
-                               &partition_schema,
-                               &table_id_ignored);
+                               nullptr, // partition schema
+                               nullptr, // table id
+                               nullptr); // number of replicas
 }
 
 Status KuduClient::ListTabletServers(vector<KuduTabletServer*>* tablet_servers) {
   ListTabletServersRequestPB req;
   ListTabletServersResponsePB resp;
 
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(default_admin_operation_timeout());
+  MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
   Status s =
       data_->SyncLeaderMasterRpc<ListTabletServersRequestPB, ListTabletServersResponsePB>(
           deadline,
           this,
           req,
           &resp,
-          nullptr,
           "ListTabletServers",
-          &MasterServiceProxy::ListTabletServers);
+          &MasterServiceProxy::ListTabletServers,
+          {});
   RETURN_NOT_OK(s);
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
   }
   for (int i = 0; i < resp.servers_size(); i++) {
     const ListTabletServersResponsePB_Entry& e = resp.servers(i);
-    auto ts = new KuduTabletServer();
-    ts->data_ = new KuduTabletServer::Data(e.instance_id().permanent_uuid(),
-                                           e.registration().rpc_addresses(0).host());
-    tablet_servers->push_back(ts);
+    HostPort hp;
+    RETURN_NOT_OK(HostPortFromPB(e.registration().rpc_addresses(0), &hp));
+    unique_ptr<KuduTabletServer> ts(new KuduTabletServer);
+    ts->data_ = new KuduTabletServer::Data(e.instance_id().permanent_uuid(), hp);
+    tablet_servers->push_back(ts.release());
   }
   return Status::OK();
 }
@@ -326,17 +336,16 @@ Status KuduClient::ListTables(vector<string>* tables,
   if (!filter.empty()) {
     req.set_name_filter(filter);
   }
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(default_admin_operation_timeout());
+  MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
   Status s =
       data_->SyncLeaderMasterRpc<ListTablesRequestPB, ListTablesResponsePB>(
           deadline,
           this,
           req,
           &resp,
-          nullptr,
           "ListTables",
-          &MasterServiceProxy::ListTables);
+          &MasterServiceProxy::ListTables,
+          {});
   RETURN_NOT_OK(s);
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
@@ -364,23 +373,22 @@ Status KuduClient::OpenTable(const string& table_name,
                              shared_ptr<KuduTable>* table) {
   KuduSchema schema;
   string table_id;
+  int num_replicas;
   PartitionSchema partition_schema;
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(default_admin_operation_timeout());
+  MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
   RETURN_NOT_OK(data_->GetTableSchema(this,
                                       table_name,
                                       deadline,
                                       &schema,
                                       &partition_schema,
-                                      &table_id));
+                                      &table_id,
+                                      &num_replicas));
 
-  // In the future, probably will look up the table in some map to reuse KuduTable
-  // instances.
-  shared_ptr<KuduTable> ret(new KuduTable(shared_from_this(), table_name, table_id,
-                                          schema, partition_schema));
-  RETURN_NOT_OK(ret->data_->Open());
-  table->swap(ret);
-
+  // TODO: in the future, probably will look up the table in some map to reuse
+  // KuduTable instances.
+  table->reset(new KuduTable(shared_from_this(),
+                             table_name, table_id, num_replicas,
+                             schema, partition_schema));
   return Status::OK();
 }
 
@@ -388,6 +396,61 @@ shared_ptr<KuduSession> KuduClient::NewSession() {
   shared_ptr<KuduSession> ret(new KuduSession(shared_from_this()));
   ret->data_->Init(ret);
   return ret;
+}
+
+Status KuduClient::GetTablet(const string& tablet_id, KuduTablet** tablet) {
+  GetTabletLocationsRequestPB req;
+  GetTabletLocationsResponsePB resp;
+
+  req.add_tablet_ids(tablet_id);
+  MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
+  Status s =
+      data_->SyncLeaderMasterRpc<GetTabletLocationsRequestPB, GetTabletLocationsResponsePB>(
+          deadline,
+          this,
+          req,
+          &resp,
+          "GetTabletLocations",
+          &MasterServiceProxy::GetTabletLocations,
+          {});
+  RETURN_NOT_OK(s);
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  if (resp.tablet_locations_size() != 1) {
+    return Status::IllegalState(Substitute(
+        "Expected only one tablet, but received $0",
+        resp.tablet_locations_size()));
+  }
+  const TabletLocationsPB& t = resp.tablet_locations(0);
+
+  vector<const KuduReplica*> replicas;
+  ElementDeleter deleter(&replicas);
+  for (const auto& r : t.replicas()) {
+    const TSInfoPB& ts_info = r.ts_info();
+    if (ts_info.rpc_addresses_size() == 0) {
+      return Status::IllegalState(Substitute(
+          "No RPC addresses found for tserver $0",
+          ts_info.permanent_uuid()));
+    }
+    HostPort hp;
+    RETURN_NOT_OK(HostPortFromPB(ts_info.rpc_addresses(0), &hp));
+    unique_ptr<KuduTabletServer> ts(new KuduTabletServer);
+    ts->data_ = new KuduTabletServer::Data(ts_info.permanent_uuid(), hp);
+
+    bool is_leader = r.role() == consensus::RaftPeerPB::LEADER;
+    unique_ptr<KuduReplica> replica(new KuduReplica);
+    replica->data_ = new KuduReplica::Data(is_leader, std::move(ts));
+
+    replicas.push_back(replica.release());
+  }
+
+  unique_ptr<KuduTablet> client_tablet(new KuduTablet);
+  client_tablet->data_ = new KuduTablet::Data(tablet_id, std::move(replicas));
+  replicas.clear();
+
+  *tablet = client_tablet.release();
+  return Status::OK();
 }
 
 bool KuduClient::IsMultiMaster() const {
@@ -463,8 +526,28 @@ KuduTableCreator& KuduTableCreator::set_range_partition_columns(
   return *this;
 }
 
+KuduTableCreator& KuduTableCreator::add_range_partition_split(KuduPartialRow* split_row) {
+  data_->range_partition_splits_.emplace_back(split_row);
+  return *this;
+}
+
 KuduTableCreator& KuduTableCreator::split_rows(const vector<const KuduPartialRow*>& rows) {
-  data_->split_rows_ = rows;
+  for (const KuduPartialRow* row : rows) {
+    data_->range_partition_splits_.emplace_back(const_cast<KuduPartialRow*>(row));
+  }
+  return *this;
+}
+
+KuduTableCreator& KuduTableCreator::add_range_partition(KuduPartialRow* lower_bound,
+                                                        KuduPartialRow* upper_bound,
+                                                        RangePartitionBound lower_bound_type,
+                                                        RangePartitionBound upper_bound_type) {
+  data_->range_partition_bounds_.push_back({
+      unique_ptr<KuduPartialRow>(lower_bound),
+      unique_ptr<KuduPartialRow>(upper_bound),
+      lower_bound_type,
+      upper_bound_type,
+  });
   return *this;
 }
 
@@ -490,6 +573,12 @@ Status KuduTableCreator::Create() {
   if (!data_->schema_) {
     return Status::InvalidArgument("Missing schema");
   }
+  if (!data_->partition_schema_.has_range_schema() &&
+      data_->partition_schema_.hash_bucket_schemas().empty()) {
+    return Status::InvalidArgument(
+        "Table partitioning must be specified using "
+        "add_hash_partitions or set_range_partition_columns");
+  }
 
   // Build request.
   CreateTableRequestPB req;
@@ -500,26 +589,50 @@ Status KuduTableCreator::Create() {
   RETURN_NOT_OK_PREPEND(SchemaToPB(*data_->schema_->schema_, req.mutable_schema()),
                         "Invalid schema");
 
-  RowOperationsPBEncoder encoder(req.mutable_split_rows());
+  RowOperationsPBEncoder encoder(req.mutable_split_rows_range_bounds());
 
-  for (const KuduPartialRow* row : data_->split_rows_) {
+  for (const auto& row : data_->range_partition_splits_) {
+    if (!row) {
+      return Status::InvalidArgument("range split row must not be null");
+    }
     encoder.Add(RowOperationsPB::SPLIT_ROW, *row);
   }
+
+  for (const auto& bound : data_->range_partition_bounds_) {
+    if (!bound.lower_bound || !bound.upper_bound) {
+      return Status::InvalidArgument("range bounds must not be null");
+    }
+
+    RowOperationsPB_Type lower_bound_type =
+      bound.lower_bound_type == KuduTableCreator::INCLUSIVE_BOUND ?
+      RowOperationsPB::RANGE_LOWER_BOUND :
+      RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND;
+
+    RowOperationsPB_Type upper_bound_type =
+      bound.upper_bound_type == KuduTableCreator::EXCLUSIVE_BOUND ?
+      RowOperationsPB::RANGE_UPPER_BOUND :
+      RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND;
+
+    encoder.Add(lower_bound_type, *bound.lower_bound);
+    encoder.Add(upper_bound_type, *bound.upper_bound);
+  }
+
   req.mutable_partition_schema()->CopyFrom(data_->partition_schema_);
 
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
+  MonoTime deadline = MonoTime::Now();
   if (data_->timeout_.Initialized()) {
-    deadline.AddDelta(data_->timeout_);
+    deadline += data_->timeout_;
   } else {
-    deadline.AddDelta(data_->client_->default_admin_operation_timeout());
+    deadline += data_->client_->default_admin_operation_timeout();
   }
 
   RETURN_NOT_OK_PREPEND(data_->client_->data_->CreateTable(data_->client_,
                                                            req,
                                                            *data_->schema_,
-                                                           deadline),
-                        strings::Substitute("Error creating table $0 on the master",
-                                            data_->table_name_));
+                                                           deadline,
+                                                           !data_->range_partition_bounds_.empty()),
+                        Substitute("Error creating table $0 on the master",
+                                   data_->table_name_));
 
   // Spin until the table is fully created, if requested.
   if (data_->wait_) {
@@ -537,10 +650,12 @@ Status KuduTableCreator::Create() {
 
 KuduTable::KuduTable(const shared_ptr<KuduClient>& client,
                      const string& name,
-                     const string& table_id,
+                     const string& id,
+                     int num_replicas,
                      const KuduSchema& schema,
                      const PartitionSchema& partition_schema)
-  : data_(new KuduTable::Data(client, name, table_id, schema, partition_schema)) {
+  : data_(new KuduTable::Data(client, name, id, num_replicas,
+                              schema, partition_schema)) {
 }
 
 KuduTable::~KuduTable() {
@@ -557,6 +672,10 @@ const string& KuduTable::id() const {
 
 const KuduSchema& KuduTable::schema() const {
   return data_->schema_;
+}
+
+int KuduTable::num_replicas() const {
+  return data_->num_replicas_;
 }
 
 KuduInsert* KuduTable::NewInsert() {
@@ -639,7 +758,7 @@ KuduError::~KuduError() {
 ////////////////////////////////////////////////////////////
 
 KuduSession::KuduSession(const shared_ptr<KuduClient>& client)
-  : data_(new KuduSession::Data(client)) {
+  : data_(new KuduSession::Data(client, client->data_->messenger_)) {
 }
 
 KuduSession::~KuduSession() {
@@ -652,110 +771,67 @@ Status KuduSession::Close() {
 }
 
 Status KuduSession::SetFlushMode(FlushMode m) {
-  if (m == AUTO_FLUSH_BACKGROUND) {
-    return Status::NotSupported("AUTO_FLUSH_BACKGROUND has not been implemented in the"
-        " c++ client (see KUDU-456).");
-  }
-  if (data_->batcher_->HasPendingOperations()) {
-    // TODO: there may be a more reasonable behavior here.
-    return Status::IllegalState("Cannot change flush mode when writes are buffered");
-  }
   if (!tight_enum_test<FlushMode>(m)) {
     // Be paranoid in client code.
     return Status::InvalidArgument("Bad flush mode");
   }
-
-  data_->flush_mode_ = m;
-  return Status::OK();
+  return data_->SetFlushMode(m, shared_from_this());
 }
 
 Status KuduSession::SetExternalConsistencyMode(ExternalConsistencyMode m) {
-  if (data_->batcher_->HasPendingOperations()) {
-    // TODO: there may be a more reasonable behavior here.
-    return Status::IllegalState("Cannot change external consistency mode when writes are "
-        "buffered");
-  }
   if (!tight_enum_test<ExternalConsistencyMode>(m)) {
     // Be paranoid in client code.
     return Status::InvalidArgument("Bad external consistency mode");
   }
-
-  data_->external_consistency_mode_ = m;
-  return Status::OK();
+  return data_->SetExternalConsistencyMode(m);
 }
 
-void KuduSession::SetTimeoutMillis(int millis) {
-  CHECK_GE(millis, 0);
-  data_->timeout_ms_ = millis;
-  data_->batcher_->SetTimeoutMillis(millis);
+Status KuduSession::SetMutationBufferSpace(size_t size) {
+  return data_->SetBufferBytesLimit(size);
+}
+
+Status KuduSession::SetMutationBufferFlushWatermark(double watermark_pct) {
+  return data_->SetBufferFlushWatermark(
+      static_cast<int32_t>(100.0 * watermark_pct));
+}
+
+Status KuduSession::SetMutationBufferFlushInterval(unsigned int millis) {
+  return data_->SetBufferFlushInterval(millis);
+}
+
+Status KuduSession::SetMutationBufferMaxNum(unsigned int max_num) {
+  return data_->SetMaxBatchersNum(max_num);
+}
+
+void KuduSession::SetTimeoutMillis(int timeout_ms) {
+  data_->SetTimeoutMillis(timeout_ms);
 }
 
 Status KuduSession::Flush() {
-  Synchronizer s;
-  KuduStatusMemberCallback<Synchronizer> ksmcb(&s, &Synchronizer::StatusCB);
-  FlushAsync(&ksmcb);
-  return s.Wait();
+  return data_->Flush();
 }
 
 void KuduSession::FlushAsync(KuduStatusCallback* user_callback) {
-  CHECK_NE(data_->flush_mode_, AUTO_FLUSH_BACKGROUND) <<
-      "AUTO_FLUSH_BACKGROUND has not been implemented";
-
-  // Swap in a new batcher to start building the next batch.
-  // Save off the old batcher.
-  scoped_refptr<Batcher> old_batcher;
-  {
-    lock_guard<simple_spinlock> l(&data_->lock_);
-    data_->NewBatcher(shared_from_this(), &old_batcher);
-    InsertOrDie(&data_->flushed_batchers_, old_batcher.get());
-  }
-
-  // Send off any buffered data. Important to do this outside of the lock
-  // since the callback may itself try to take the lock, in the case that
-  // the batch fails "inline" on the same thread.
-  old_batcher->FlushAsync(user_callback);
+  data_->FlushAsync(user_callback);
 }
 
 bool KuduSession::HasPendingOperations() const {
-  lock_guard<simple_spinlock> l(&data_->lock_);
-  if (data_->batcher_->HasPendingOperations()) {
-    return true;
-  }
-  for (Batcher* b : data_->flushed_batchers_) {
-    if (b->HasPendingOperations()) {
-      return true;
-    }
-  }
-  return false;
+  return data_->HasPendingOperations();
 }
 
 Status KuduSession::Apply(KuduWriteOperation* write_op) {
-  if (!write_op->row().IsKeySet()) {
-    Status status = Status::IllegalState("Key not specified", write_op->ToString());
-    data_->error_collector_->AddError(gscoped_ptr<KuduError>(
-        new KuduError(write_op, status)));
-    return status;
-  }
-
-  Status s = data_->batcher_->Add(write_op);
-  if (!PREDICT_FALSE(s.ok())) {
-    data_->error_collector_->AddError(gscoped_ptr<KuduError>(
-        new KuduError(write_op, s)));
-    return s;
-  }
-
+  RETURN_NOT_OK(data_->ApplyWriteOp(shared_from_this(), write_op));
+  // Thread-safety note: this method should not be called concurrently
+  // with other methods which modify the KuduSession::Data members, so it
+  // should be safe to read KuduSession::Data members without protection.
   if (data_->flush_mode_ == AUTO_FLUSH_SYNC) {
-    return Flush();
+    RETURN_NOT_OK(data_->Flush());
   }
-
   return Status::OK();
 }
 
 int KuduSession::CountBufferedOperations() const {
-  lock_guard<simple_spinlock> l(&data_->lock_);
-  CHECK_EQ(data_->flush_mode_, MANUAL_FLUSH);
-
-  return data_->batcher_->CountBufferedOperations();
+  return data_->CountBufferedOperations();
 }
 
 int KuduSession::CountPendingErrors() const {
@@ -787,23 +863,80 @@ KuduTableAlterer* KuduTableAlterer::RenameTo(const string& new_name) {
 }
 
 KuduColumnSpec* KuduTableAlterer::AddColumn(const string& name) {
-  Data::Step s = {AlterTableRequestPB::ADD_COLUMN,
-                  new KuduColumnSpec(name)};
-  data_->steps_.push_back(s);
+  Data::Step s = { AlterTableRequestPB::ADD_COLUMN,
+                   new KuduColumnSpec(name), nullptr, nullptr };
+  data_->steps_.emplace_back(std::move(s));
   return s.spec;
 }
 
 KuduColumnSpec* KuduTableAlterer::AlterColumn(const string& name) {
-  Data::Step s = {AlterTableRequestPB::ALTER_COLUMN,
-                  new KuduColumnSpec(name)};
-  data_->steps_.push_back(s);
+  Data::Step s = { AlterTableRequestPB::ALTER_COLUMN,
+                   new KuduColumnSpec(name), nullptr, nullptr };
+  data_->steps_.emplace_back(std::move(s));
   return s.spec;
 }
 
 KuduTableAlterer* KuduTableAlterer::DropColumn(const string& name) {
-  Data::Step s = {AlterTableRequestPB::DROP_COLUMN,
-                  new KuduColumnSpec(name)};
-  data_->steps_.push_back(s);
+  Data::Step s = { AlterTableRequestPB::DROP_COLUMN,
+                   new KuduColumnSpec(name), nullptr, nullptr };
+  data_->steps_.emplace_back(std::move(s));
+  return this;
+}
+
+KuduTableAlterer* KuduTableAlterer::AddRangePartition(
+    KuduPartialRow* lower_bound,
+    KuduPartialRow* upper_bound,
+    KuduTableCreator::RangePartitionBound lower_bound_type,
+    KuduTableCreator::RangePartitionBound upper_bound_type) {
+
+  if (lower_bound == nullptr || upper_bound == nullptr) {
+    data_->status_ = Status::InvalidArgument("range partition bounds may not be null");
+  }
+  if (!lower_bound->schema()->Equals(*upper_bound->schema())) {
+    data_->status_ = Status::InvalidArgument("range partition bounds must have matching schemas");
+  }
+  if (data_->schema_ == nullptr) {
+    data_->schema_ = lower_bound->schema();
+  } else if (!lower_bound->schema()->Equals(*data_->schema_)) {
+    data_->status_ = Status::InvalidArgument("range partition bounds must have matching schemas");
+  }
+
+  Data::Step s { AlterTableRequestPB::ADD_RANGE_PARTITION,
+                 nullptr,
+                 unique_ptr<KuduPartialRow>(lower_bound),
+                 unique_ptr<KuduPartialRow>(upper_bound),
+                 lower_bound_type,
+                 upper_bound_type };
+  data_->steps_.emplace_back(std::move(s));
+  data_->has_alter_partitioning_steps = true;
+  return this;
+}
+
+KuduTableAlterer* KuduTableAlterer::DropRangePartition(
+    KuduPartialRow* lower_bound,
+    KuduPartialRow* upper_bound,
+    KuduTableCreator::RangePartitionBound lower_bound_type,
+    KuduTableCreator::RangePartitionBound upper_bound_type) {
+  if (lower_bound == nullptr || upper_bound == nullptr) {
+    data_->status_ = Status::InvalidArgument("range partition bounds may not be null");
+  }
+  if (!lower_bound->schema()->Equals(*upper_bound->schema())) {
+    data_->status_ = Status::InvalidArgument("range partition bounds must have matching schemas");
+  }
+  if (data_->schema_ == nullptr) {
+    data_->schema_ = lower_bound->schema();
+  } else if (!lower_bound->schema()->Equals(*data_->schema_)) {
+    data_->status_ = Status::InvalidArgument("range partition bounds must have matching schemas");
+  }
+
+  Data::Step s { AlterTableRequestPB::DROP_RANGE_PARTITION,
+                 nullptr,
+                 unique_ptr<KuduPartialRow>(lower_bound),
+                 unique_ptr<KuduPartialRow>(upper_bound),
+                 lower_bound_type,
+                 upper_bound_type };
+  data_->steps_.emplace_back(std::move(s));
+  data_->has_alter_partitioning_steps = true;
   return this;
 }
 
@@ -824,9 +957,30 @@ Status KuduTableAlterer::Alter() {
   MonoDelta timeout = data_->timeout_.Initialized() ?
     data_->timeout_ :
     data_->client_->default_admin_operation_timeout();
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(timeout);
-  RETURN_NOT_OK(data_->client_->data_->AlterTable(data_->client_, req, deadline));
+  MonoTime deadline = MonoTime::Now() + timeout;
+  RETURN_NOT_OK(data_->client_->data_->AlterTable(data_->client_, req, deadline,
+                                                  data_->has_alter_partitioning_steps));
+
+  if (data_->has_alter_partitioning_steps) {
+    // If the table partitions change, clear the local meta cache so that the
+    // new tablets can immediately be written to and scanned, and the old
+    // tablets won't be seen again. This also prevents rows being batched for
+    // the wrong tablet when a partition is dropped and added in the same alter
+    // table transaction. We could clear the meta cache for just the table being
+    // altered or just the partition key ranges being changed, but that would
+    // require opening the table in order to get the ID, schema, and partition
+    // schema.
+    //
+    // It is not necessary to wait for the alteration to be completed before
+    // clearing the cache (i.e. the tablets to be created), because the master
+    // has its soft state updated as part of handling the alter table RPC. When
+    // the meta cache looks up the new tablet locations during a subsequent
+    // write or scan, the master will return a ServiceUnavailable response if
+    // the new tablets are not yet running. The meta cache will automatically
+    // retry after a delay when it encounters this error.
+    data_->client_->data_->meta_cache_->ClearCache();
+  }
+
   if (data_->wait_) {
     string alter_name = data_->rename_to_.get_value_or(data_->table_name_);
     RETURN_NOT_OK(data_->client_->data_->WaitForAlterTableToFinish(
@@ -973,6 +1127,10 @@ KuduSchema KuduScanner::GetProjectionSchema() const {
   return KuduSchema(*data_->configuration().projection());
 }
 
+const ResourceMetrics& KuduScanner::GetResourceMetrics() const {
+  return data_->resource_metrics_;
+}
+
 namespace {
 // Callback for the RPC sent by Close().
 // We can't use the KuduScanner response and RPC controller members for this
@@ -993,11 +1151,11 @@ struct CloseCallback {
 } // anonymous namespace
 
 string KuduScanner::ToString() const {
-  return strings::Substitute("$0: $1",
-                             data_->table_->name(),
-                             data_->configuration()
-                                   .spec()
-                                   .ToString(*data_->table_->schema().schema_));
+  return Substitute("$0: $1",
+                    data_->table_->name(),
+                    data_->configuration()
+                    .spec()
+                    .ToString(*data_->table_->schema().schema_));
 }
 
 Status KuduScanner::Open() {
@@ -1018,8 +1176,7 @@ Status KuduScanner::Open() {
 
   VLOG(1) << "Beginning scan " << ToString();
 
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(data_->configuration().timeout());
+  MonoTime deadline = MonoTime::Now() + data_->configuration().timeout();
   set<string> blacklist;
 
   RETURN_NOT_OK(data_->OpenNextTablet(deadline, &blacklist));
@@ -1098,8 +1255,7 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
     // More data is available in this tablet.
     VLOG(1) << "Continuing scan " << ToString();
 
-    MonoTime batch_deadline = MonoTime::Now(MonoTime::FINE);
-    batch_deadline.AddDelta(data_->configuration().timeout());
+    MonoTime batch_deadline = MonoTime::Now() + data_->configuration().timeout();
     data_->PrepareRequest(KuduScanner::Data::CONTINUE);
 
     while (true) {
@@ -1146,8 +1302,7 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
     // server closed it for us.
     VLOG(1) << "Scanning next tablet " << ToString();
     data_->last_primary_key_.clear();
-    MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-    deadline.AddDelta(data_->configuration().timeout());
+    MonoTime deadline = MonoTime::Now() + data_->configuration().timeout();
     set<string> blacklist;
 
     RETURN_NOT_OK(data_->OpenNextTablet(deadline, &blacklist));
@@ -1166,12 +1321,13 @@ Status KuduScanner::GetCurrentServer(KuduTabletServer** server) {
   vector<HostPort> host_ports;
   rts->GetHostPorts(&host_ports);
   if (host_ports.empty()) {
-    return Status::IllegalState(strings::Substitute("No HostPort found for RemoteTabletServer $0",
-                                                    rts->ToString()));
+    return Status::IllegalState(Substitute("No HostPort found for RemoteTabletServer $0",
+                                           rts->ToString()));
   }
-  *server = new KuduTabletServer();
-  (*server)->data_ = new KuduTabletServer::Data(rts->permanent_uuid(),
-                                                host_ports[0].host());
+  unique_ptr<KuduTabletServer> client_server(new KuduTabletServer);
+  client_server->data_ = new KuduTabletServer::Data(rts->permanent_uuid(),
+                                                    host_ports[0]);
+  *server = client_server.release();
   return Status::OK();
 }
 
@@ -1179,8 +1335,8 @@ Status KuduScanner::GetCurrentServer(KuduTabletServer** server) {
 // KuduScanToken
 ////////////////////////////////////////////////////////////
 
-KuduScanToken::KuduScanToken(KuduScanToken::Data* data)
-    : data_(data) {
+KuduScanToken::KuduScanToken()
+    : data_(nullptr) {
 }
 
 KuduScanToken::~KuduScanToken() {
@@ -1191,8 +1347,8 @@ Status KuduScanToken::IntoKuduScanner(KuduScanner** scanner) const {
   return data_->IntoKuduScanner(scanner);
 }
 
-const vector<KuduTabletServer*>& KuduScanToken::TabletServers() const {
-  return data_->TabletServers();
+const KuduTablet& KuduScanToken::tablet() const {
+  return data_->tablet();
 }
 
 Status KuduScanToken::Serialize(string* buf) const {
@@ -1200,9 +1356,10 @@ Status KuduScanToken::Serialize(string* buf) const {
 }
 
 Status KuduScanToken::DeserializeIntoScanner(KuduClient* client,
-                                         const string& serialized_token,
-                                         KuduScanner** scanner) {
-  return KuduScanToken::Data::DeserializeIntoScanner(client, serialized_token, scanner);
+                                             const string& serialized_token,
+                                             KuduScanner** scanner) {
+  return KuduScanToken::Data::DeserializeIntoScanner(
+      client, serialized_token, scanner);
 }
 
 ////////////////////////////////////////////////////////////
@@ -1280,6 +1437,46 @@ Status KuduScanTokenBuilder::Build(vector<KuduScanToken*>* tokens) {
 }
 
 ////////////////////////////////////////////////////////////
+// KuduReplica
+////////////////////////////////////////////////////////////
+
+KuduReplica::KuduReplica()
+  : data_(nullptr) {
+}
+
+KuduReplica::~KuduReplica() {
+  delete data_;
+}
+
+bool KuduReplica::is_leader() const {
+  return data_->is_leader_;
+}
+
+const KuduTabletServer& KuduReplica::ts() const {
+  return *data_->ts_;
+}
+
+////////////////////////////////////////////////////////////
+// KuduTablet
+////////////////////////////////////////////////////////////
+
+KuduTablet::KuduTablet()
+  : data_(nullptr) {
+}
+
+KuduTablet::~KuduTablet() {
+  delete data_;
+}
+
+const string& KuduTablet::id() const {
+  return data_->id_;
+}
+
+const vector<const KuduReplica*>& KuduTablet::replicas() const {
+  return data_->replicas_;
+}
+
+////////////////////////////////////////////////////////////
 // KuduTabletServer
 ////////////////////////////////////////////////////////////
 
@@ -1296,7 +1493,11 @@ const string& KuduTabletServer::uuid() const {
 }
 
 const string& KuduTabletServer::hostname() const {
-  return data_->hostname_;
+  return data_->hp_.host();
+}
+
+uint16_t KuduTabletServer::port() const {
+  return data_->hp_.port();
 }
 
 } // namespace client

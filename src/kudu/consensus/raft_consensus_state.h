@@ -18,6 +18,8 @@
 #define KUDU_CONSENSUS_RAFT_CONSENSUS_UTIL_H_
 
 #include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <utility>
@@ -86,7 +88,7 @@ class ReplicaState {
     kShutDown
   };
 
-  typedef unique_lock<simple_spinlock> UniqueLock;
+  typedef std::unique_lock<simple_spinlock> UniqueLock;
 
   typedef std::map<int64_t, scoped_refptr<ConsensusRound> > IndexToRoundMap;
 
@@ -95,7 +97,7 @@ class ReplicaState {
   typedef IndexToRoundMap::value_type IndexToRoundEntry;
 
   ReplicaState(ConsensusOptions options, std::string peer_uuid,
-               gscoped_ptr<ConsensusMetadata> cmeta,
+               std::unique_ptr<ConsensusMetadata> cmeta,
                ReplicaTransactionFactory* txn_factory);
 
   Status StartUnlocked(const OpId& last_in_wal);
@@ -135,12 +137,6 @@ class ReplicaState {
 
   // Obtains the lock for a state read, does not check state.
   Status LockForRead(UniqueLock* lock) const WARN_UNUSED_RESULT;
-
-  // Obtains the lock so that we can advance the majority replicated
-  // index and possibly the committed index.
-  // Requires that this peer is leader.
-  Status LockForMajorityReplicatedIndexUpdate(
-      UniqueLock* lock) const WARN_UNUSED_RESULT;
 
   // Ensure the local peer is the active leader.
   // Returns OK if leader, IllegalState otherwise.
@@ -236,7 +232,7 @@ class ReplicaState {
   // Aborts pending operations after, but not including 'index'. The OpId with 'index'
   // will become our new last received id. If there are pending operations with indexes
   // higher than 'index' those operations are aborted.
-  Status AbortOpsAfterUnlocked(int64_t index);
+  void AbortOpsAfterUnlocked(int64_t index);
 
   // Returns the the ConsensusRound with the provided index, if there is any, or NULL
   // if there isn't.
@@ -245,32 +241,29 @@ class ReplicaState {
   // Add 'round' to the set of rounds waiting to be committed.
   Status AddPendingOperation(const scoped_refptr<ConsensusRound>& round);
 
-  // Marks ReplicaTransactions up to 'id' as majority replicated, meaning the
-  // transaction may Apply() (immediately if Prepare() has completed or when Prepare()
-  // completes, if not).
-  //
-  // If this advanced the committed index, sets *committed_index_changed to true.
-  Status UpdateMajorityReplicatedUnlocked(const OpId& majority_replicated,
-                                          OpId* committed_index,
-                                          bool* committed_index_changed);
-
   // Advances the committed index.
   // This is a no-op if the committed index has not changed.
-  // Returns in '*committed_index_changed' whether the operation actually advanced
-  // the index.
-  Status AdvanceCommittedIndexUnlocked(const OpId& committed_index,
-                                       bool* committed_index_changed);
+  Status AdvanceCommittedIndexUnlocked(int64_t committed_index);
+
+  // Set the committed op during startup. This should be done after
+  // appending any of the pending transactions, and will take care
+  // of triggering any that are now considered committed.
+  Status SetInitialCommittedOpIdUnlocked(const OpId& committed_op);
 
   // Returns the watermark below which all operations are known to
   // be committed according to consensus.
   //
   // This must be called under a lock.
-  const OpId& GetCommittedOpIdUnlocked() const;
+  int64_t GetCommittedIndexUnlocked() const;
+  int64_t GetTermWithLastCommittedOpUnlocked() const;
 
   // Returns OK iff an op from the current term has been committed.
   Status CheckHasCommittedOpInCurrentTermUnlocked() const;
 
-  // Updates the last received operation.
+  // Updates the last received operation, if 'op_id''s index is higher than
+  // the previous last received. Also updates 'last_received_from_current_leader_'
+  // regardless of whether it is higher or lower than the prior value.
+  //
   // This must be called under a lock.
   void UpdateLastReceivedOpIdUnlocked(const OpId& op_id);
 
@@ -342,7 +335,7 @@ class ReplicaState {
   mutable simple_spinlock update_lock_;
 
   // Consensus metadata persistence object.
-  gscoped_ptr<ConsensusMetadata> cmeta_;
+  std::unique_ptr<ConsensusMetadata> cmeta_;
 
   // Used by the LEADER. This is the index of the next operation generated
   // by this LEADER.
@@ -373,9 +366,12 @@ class ReplicaState {
   // involved in resetting this every time a new node becomes leader.
   OpId last_received_op_id_current_leader_;
 
-  // The id of the Apply that was last triggered when the last message from the leader
+  // The OpId of the Apply that was last triggered when the last message from the leader
   // was received. Initialized to MinimumOpId().
-  OpId last_committed_index_;
+  //
+  // TODO: are there cases where this doesn't track the actual commit index,
+  // if there are no-ops?
+  OpId last_committed_op_id_;
 
   State state_;
 };

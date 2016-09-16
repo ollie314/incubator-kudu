@@ -69,7 +69,6 @@ DEPS_FOR_ALL = \
      # TODO: declare these dependencies per-test.
      "build/latest/bin/kudu-tserver",
      "build/latest/bin/kudu-master",
-     "build/latest/bin/kudu-ts-cli",
 
      # parser-test requires these data files.
      # TODO: again, we should do this with some per-test metadata file.
@@ -77,9 +76,21 @@ DEPS_FOR_ALL = \
      #".../example-deletes.txt",
      #".../example-tweets.txt",
 
-     # Tests that require tooling require these.
-     "build/latest/bin/kudu-admin",
+     # Tests that require tooling require this.
+     "build/latest/bin/kudu",
      ]
+
+# The number of shards to split tests into. This is set on a per-test basis
+# since it's only worth doing when a test has lots of separate cases and
+# more than one of them runs relatively long.
+NUM_SHARDS_BY_TEST = {
+  'cfile-test': 4,
+  'client-test': 8,
+  'delete_table-test': 8,
+  'flex_partitioning-itest': 8,
+  'mt-tablet-test': 4,
+  'raft_consensus-itest': 8
+}
 
 
 class StagingDir(object):
@@ -139,7 +150,7 @@ def get_test_commandlines():
 def is_lib_blacklisted(lib):
   # These particular system libraries, we should ship to the remote nodes.
   # No need to ship things like libc, libstdcxx, etc.
-  if "boost" in lib or "oauth" in lib:
+  if "oauth" in lib:
     return False
   if lib.startswith("/lib") or lib.startswith("/usr"):
     return True
@@ -181,7 +192,10 @@ def ldd_deps(exe):
   If the provided 'exe' is not a binary executable, returns
   an empty list.
   """
-  if exe.endswith(".sh"):
+  if (exe.endswith(".pl") or
+      exe.endswith(".py") or
+      exe.endswith(".sh") or
+      exe.endswith(".txt")):
     return []
   p = subprocess.Popen(["ldd", exe], stdout=subprocess.PIPE)
   out, err = p.communicate()
@@ -205,16 +219,6 @@ def ldd_deps(exe):
       path = os.path.join(os.path.dirname(path), os.readlink(path))
       ret.append(path)
   return ret
-
-
-def num_shards_for_test(test_name):
-  if 'raft_consensus-itest' in test_name:
-    return 8
-  if 'cfile-test' in test_name:
-    return 4
-  if 'mt-tablet-test' in test_name:
-    return 4
-  return 1
 
 
 def create_archive_input(staging, argv,
@@ -242,7 +246,13 @@ def create_archive_input(staging, argv,
     if os.path.isdir(d):
       d += "/"
     deps.append(d)
-  for d in deps:
+    # DEPS_FOR_ALL may include binaries whose dependencies are not dependencies
+    # of the test executable. We must include those dependencies in the archive
+    # for the binaries to be usable.
+    deps.extend(ldd_deps(d))
+
+  # Deduplicate dependencies included via DEPS_FOR_ALL.
+  for d in set(deps):
     # System libraries will end up being relative paths out
     # of the build tree. We need to copy those into the build
     # tree somewhere.
@@ -253,7 +263,7 @@ def create_archive_input(staging, argv,
   if disable_sharding:
     num_shards = 1
   else:
-    num_shards = num_shards_for_test(test_name)
+    num_shards = NUM_SHARDS_BY_TEST.get(test_name, 1)
   for shard in xrange(0, num_shards):
     out_archive = os.path.join(staging.dir, '%s.%d.gen.json' % (test_name, shard))
     out_isolate = os.path.join(staging.dir, '%s.%d.isolate' % (test_name, shard))
@@ -350,7 +360,7 @@ def submit_tasks(staging, options):
         "Set the DIST_TEST_HOME environment variable to the path to the dist_test directory. " \
         % DIST_TEST_HOME,
     raise OSError("Cannot find path to dist_test tools")
-  client_py_path = os.path.join(DIST_TEST_HOME, "client.py")
+  client_py_path = os.path.join(DIST_TEST_HOME, "bin", "client")
   try:
     cmd = [client_py_path, "submit"]
     if options.no_wait:

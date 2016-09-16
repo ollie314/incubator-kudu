@@ -22,6 +22,7 @@
 #include <memory>
 #include <rapidjson/document.h>
 #include <string>
+#include <unordered_set>
 
 #include "kudu/client/client.h"
 #include "kudu/common/wire_protocol.h"
@@ -48,13 +49,18 @@
 #include "kudu/util/test_util.h"
 
 using kudu::master::GetLeaderMasterRpc;
+using kudu::master::ListTablesRequestPB;
+using kudu::master::ListTablesResponsePB;
 using kudu::master::MasterServiceProxy;
+using kudu::rpc::RpcController;
 using kudu::server::ServerStatusPB;
 using kudu::tserver::ListTabletsRequestPB;
 using kudu::tserver::ListTabletsResponsePB;
 using kudu::tserver::TabletServerServiceProxy;
 using rapidjson::Value;
 using std::string;
+using std::unique_ptr;
+using std::unordered_set;
 using strings::Substitute;
 
 typedef ListTabletsResponsePB::StatusAndSchemaPB StatusAndSchemaPB;
@@ -65,6 +71,7 @@ static const char* const kMasterBinaryName = "kudu-master";
 static const char* const kTabletServerBinaryName = "kudu-tserver";
 static double kProcessStartTimeoutSeconds = 30.0;
 static double kTabletServerRegistrationTimeoutSeconds = 15.0;
+static double kMasterCatalogManagerTimeoutSeconds = 30.0;
 
 #if defined(__APPLE__)
 static bool kBindToUniqueLoopbackAddress = false;
@@ -80,7 +87,6 @@ ExternalMiniClusterOptions::ExternalMiniClusterOptions()
 
 ExternalMiniClusterOptions::~ExternalMiniClusterOptions() {
 }
-
 
 ExternalMiniCluster::ExternalMiniCluster(const ExternalMiniClusterOptions& opts)
   : opts_(opts) {
@@ -149,17 +155,19 @@ Status ExternalMiniCluster::Start() {
   return Status::OK();
 }
 
-void ExternalMiniCluster::Shutdown(NodeSelectionMode mode) {
-  if (mode == ALL) {
+
+void ExternalMiniCluster::ShutdownNodes(ClusterNodes nodes) {
+  if (nodes == ClusterNodes::ALL || nodes == ClusterNodes::TS_ONLY) {
+    for (const scoped_refptr<ExternalTabletServer>& ts : tablet_servers_) {
+      ts->Shutdown();
+    }
+  }
+  if (nodes == ClusterNodes::ALL || nodes == ClusterNodes::MASTERS_ONLY) {
     for (const scoped_refptr<ExternalMaster>& master : masters_) {
       if (master) {
         master->Shutdown();
       }
     }
-  }
-
-  for (const scoped_refptr<ExternalTabletServer>& ts : tablet_servers_) {
-    ts->Shutdown();
   }
 }
 
@@ -211,7 +219,7 @@ vector<string> SubstituteInFlags(const vector<string>& orig_flags,
 Status ExternalMiniCluster::StartSingleMaster() {
   string exe = GetBinaryPath(kMasterBinaryName);
   scoped_refptr<ExternalMaster> master =
-    new ExternalMaster(messenger_, exe, GetDataPath("master"),
+    new ExternalMaster(messenger_, exe, GetDataPath("master-0"),
                        SubstituteInFlags(opts_.extra_master_flags, 0));
   RETURN_NOT_OK(master->Start());
   masters_.push_back(master);
@@ -231,10 +239,8 @@ Status ExternalMiniCluster::StartDistributedMasters() {
     string addr = Substitute("127.0.0.1:$0", opts_.master_rpc_ports[i]);
     peer_addrs.push_back(addr);
   }
-  string peer_addrs_str = JoinStrings(peer_addrs, ",");
   vector<string> flags = opts_.extra_master_flags;
-  flags.push_back("--master_addresses=" + peer_addrs_str);
-  flags.push_back("--enable_leader_failure_detection=true");
+  flags.push_back("--master_addresses=" + JoinStrings(peer_addrs, ","));
   string exe = GetBinaryPath(kMasterBinaryName);
 
   // Start the masters.
@@ -286,21 +292,28 @@ Status ExternalMiniCluster::AddTabletServer() {
 }
 
 Status ExternalMiniCluster::WaitForTabletServerCount(int count, const MonoDelta& timeout) {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(timeout);
+  MonoTime deadline = MonoTime::Now() + timeout;
+
+  unordered_set<int> masters_to_search;
+  for (int i = 0; i < masters_.size(); i++) {
+    if (!masters_[i]->IsShutdown()) {
+      masters_to_search.insert(i);
+    }
+  }
 
   while (true) {
-    MonoDelta remaining = deadline.GetDeltaSince(MonoTime::Now(MonoTime::FINE));
+    MonoDelta remaining = deadline - MonoTime::Now();
     if (remaining.ToSeconds() < 0) {
-      return Status::TimedOut(Substitute("$0 TS(s) never registered with master", count));
+      return Status::TimedOut(Substitute(
+          "Timed out waiting for $0 TS(s) to register with all masters", count));
     }
 
-    for (int i = 0; i < masters_.size(); i++) {
+    for (auto iter = masters_to_search.begin(); iter != masters_to_search.end();) {
       master::ListTabletServersRequestPB req;
       master::ListTabletServersResponsePB resp;
       rpc::RpcController rpc;
       rpc.set_timeout(remaining);
-      RETURN_NOT_OK_PREPEND(master_proxy(i)->ListTabletServers(req, &resp, &rpc),
+      RETURN_NOT_OK_PREPEND(master_proxy(*iter)->ListTabletServers(req, &resp, &rpc),
                             "ListTabletServers RPC failed");
       // ListTabletServers() may return servers that are no longer online.
       // Do a second step of verification to verify that the descs that we got
@@ -316,9 +329,17 @@ Status ExternalMiniCluster::WaitForTabletServerCount(int count, const MonoDelta&
         }
       }
       if (match_count == count) {
-        LOG(INFO) << count << " TS(s) registered with Master";
-        return Status::OK();
+        // This master has returned the correct set of tservers.
+        iter = masters_to_search.erase(iter);
+      } else {
+        iter++;
       }
+    }
+
+    if (masters_to_search.empty()) {
+      // All masters have returned the correct set of tservers.
+      LOG(INFO) << count << " TS(s) registered with all masters";
+      return Status::OK();
     }
     SleepFor(MonoDelta::FromMilliseconds(1));
   }
@@ -326,21 +347,26 @@ Status ExternalMiniCluster::WaitForTabletServerCount(int count, const MonoDelta&
 
 void ExternalMiniCluster::AssertNoCrashes() {
   vector<ExternalDaemon*> daemons = this->daemons();
+  int num_crashes = 0;
   for (ExternalDaemon* d : daemons) {
     if (d->IsShutdown()) continue;
-    EXPECT_TRUE(d->IsProcessAlive()) << "At least one process crashed";
+    if (!d->IsProcessAlive()) {
+      LOG(ERROR) << "Process with UUID " << d->uuid() << " has crashed";
+      num_crashes++;
+    }
   }
+  ASSERT_EQ(0, num_crashes) << "At least one process crashed";
 }
 
 Status ExternalMiniCluster::WaitForTabletsRunning(ExternalTabletServer* ts,
+                                                  int min_tablet_count,
                                                   const MonoDelta& timeout) {
   TabletServerServiceProxy proxy(messenger_, ts->bound_rpc_addr());
   ListTabletsRequestPB req;
   ListTabletsResponsePB resp;
 
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(timeout);
-  while (MonoTime::Now(MonoTime::FINE).ComesBefore(deadline)) {
+  MonoTime deadline = MonoTime::Now() + timeout;
+  while (MonoTime::Now() < deadline) {
     rpc::RpcController rpc;
     rpc.set_timeout(MonoDelta::FromSeconds(10));
     RETURN_NOT_OK(proxy.ListTablets(req, &resp, &rpc));
@@ -348,14 +374,17 @@ Status ExternalMiniCluster::WaitForTabletsRunning(ExternalTabletServer* ts,
       return StatusFromPB(resp.error().status());
     }
 
-    int num_not_running = 0;
+    bool all_running = true;
     for (const StatusAndSchemaPB& status : resp.status_and_schema()) {
       if (status.tablet_status().state() != tablet::RUNNING) {
-        num_not_running++;
+        all_running = false;
       }
     }
 
-    if (num_not_running == 0) {
+    // We're done if:
+    // 1. All the tablets are running, and
+    // 2. We've observed as many tablets as we had expected or more.
+    if (all_running && resp.status_and_schema_size() >= min_tablet_count) {
       return Status::OK();
     }
 
@@ -382,8 +411,7 @@ Status ExternalMiniCluster::GetLeaderMasterIndex(int* idx) {
   Synchronizer sync;
   vector<Sockaddr> addrs;
   HostPort leader_master_hp;
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(MonoDelta::FromSeconds(5));
+  MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(5);
 
   for (const scoped_refptr<ExternalMaster>& master : masters_) {
     addrs.push_back(master->bound_rpc_addr());
@@ -391,8 +419,9 @@ Status ExternalMiniCluster::GetLeaderMasterIndex(int* idx) {
   rpc.reset(new GetLeaderMasterRpc(Bind(&LeaderMasterCallback,
                                         &leader_master_hp,
                                         &sync),
-                                   addrs,
+                                   std::move(addrs),
                                    deadline,
+                                   MonoDelta::FromSeconds(5),
                                    messenger_));
   rpc->SendRpc();
   RETURN_NOT_OK(sync.Wait());
@@ -405,7 +434,7 @@ Status ExternalMiniCluster::GetLeaderMasterIndex(int* idx) {
     }
   }
   if (!found) {
-    // There is never a situation where shis should happen, so it's
+    // There is never a situation where this should happen, so it's
     // better to exit with a FATAL log message right away vs. return a
     // Status::IllegalState().
     LOG(FATAL) << "Leader master is not in masters_";
@@ -457,14 +486,19 @@ std::shared_ptr<MasterServiceProxy> ExternalMiniCluster::master_proxy(int idx) {
       new MasterServiceProxy(messenger_, CHECK_NOTNULL(master(idx))->bound_rpc_addr()));
 }
 
-Status ExternalMiniCluster::CreateClient(client::KuduClientBuilder& builder,
-                                         client::sp::shared_ptr<client::KuduClient>* client) {
-  CHECK(!masters_.empty());
-  builder.clear_master_server_addrs();
-  for (const scoped_refptr<ExternalMaster>& master : masters_) {
-    builder.add_master_server_addr(master->bound_rpc_hostport().ToString());
+Status ExternalMiniCluster::CreateClient(client::KuduClientBuilder* builder,
+                                         client::sp::shared_ptr<client::KuduClient>* client) const {
+  client::KuduClientBuilder defaults;
+  if (builder == nullptr) {
+    builder = &defaults;
   }
-  return builder.Build(client);
+
+  CHECK(!masters_.empty());
+  builder->clear_master_server_addrs();
+  for (const scoped_refptr<ExternalMaster>& master : masters_) {
+    builder->add_master_server_addr(master->bound_rpc_hostport().ToString());
+  }
+  return builder->Build(client);
 }
 
 Status ExternalMiniCluster::SetFlag(ExternalDaemon* daemon,
@@ -542,6 +576,11 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   argv.push_back("--logtostderr");
   argv.push_back("--logbuflevel=-1");
 
+  // Allow unsafe and experimental flags from tests, since we often use
+  // fault injection, etc.
+  argv.push_back("--unlock_experimental_flags");
+  argv.push_back("--unlock_unsafe_flags");
+
   gscoped_ptr<Subprocess> p(new Subprocess(exe_, argv));
   p->ShareParentStdout(false);
   LOG(INFO) << "Running " << exe_ << "\n" << JoinStrings(argv, "\n");
@@ -616,11 +655,10 @@ bool ExternalDaemon::IsProcessAlive() const {
 }
 
 Status ExternalDaemon::WaitForCrash(const MonoDelta& timeout) const {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(timeout);
+  MonoTime deadline = MonoTime::Now() + timeout;
 
   int i = 1;
-  while (MonoTime::Now(MonoTime::FINE).ComesBefore(deadline)) {
+  while (MonoTime::Now() < deadline) {
     if (!IsProcessAlive()) return Status::OK();
     int sleep_ms = std::min(i++ * 10, 200);
     SleepFor(MonoDelta::FromMilliseconds(sleep_ms));
@@ -826,6 +864,48 @@ Status ExternalMaster::Restart() {
   flags.push_back("--webserver_interface=localhost");
   flags.push_back(Substitute("--webserver_port=$0", bound_http_.port()));
   RETURN_NOT_OK(StartProcess(flags));
+  return Status::OK();
+}
+
+Status ExternalMaster::WaitForCatalogManager() {
+  unique_ptr<MasterServiceProxy> proxy(
+      new MasterServiceProxy(messenger_, bound_rpc_addr()));
+  Stopwatch sw;
+  sw.start();
+  while (sw.elapsed().wall_seconds() < kMasterCatalogManagerTimeoutSeconds) {
+    ListTablesRequestPB req;
+    ListTablesResponsePB resp;
+    RpcController rpc;
+    Status s = proxy->ListTables(req, &resp, &rpc);
+    if (s.ok()) {
+      if (!resp.has_error()) {
+        // This master is the leader and is up and running.
+        break;
+      } else {
+        s = StatusFromPB(resp.error().status());
+        if (s.IsIllegalState()) {
+          // This master is not the leader but is otherwise up and running.
+          break;
+        } else if (!s.IsServiceUnavailable()) {
+          // Unexpected error from master.
+          return s;
+        }
+      }
+    } else if (!s.IsNetworkError()) {
+      // Unexpected error from proxy.
+      return s;
+    }
+
+    // There was some kind of transient network error or the master isn't yet
+    // ready. Sleep and retry.
+    SleepFor(MonoDelta::FromMilliseconds(50));
+  }
+  if (sw.elapsed().wall_seconds() > kMasterCatalogManagerTimeoutSeconds) {
+    return Status::TimedOut(
+        Substitute("Timed out after $0s waiting for master ($1) startup",
+                   kMasterCatalogManagerTimeoutSeconds,
+                   bound_rpc_addr().ToString()));
+  }
   return Status::OK();
 }
 

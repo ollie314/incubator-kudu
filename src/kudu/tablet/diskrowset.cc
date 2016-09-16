@@ -16,8 +16,8 @@
 // under the License.
 
 #include <algorithm>
-#include <boost/thread/locks.hpp>
 #include <glog/logging.h>
+#include <mutex>
 #include <vector>
 
 #include "kudu/common/generic_iterators.h"
@@ -507,7 +507,7 @@ Status DiskRowSet::MinorCompactDeltaStores() {
   return delta_tracker_->Compact();
 }
 
-Status DiskRowSet::MajorCompactDeltaStores() {
+Status DiskRowSet::MajorCompactDeltaStores(HistoryGcOpts history_gc_opts) {
   vector<ColumnId> col_ids;
   delta_tracker_->GetColumnIdsWithUpdates(&col_ids);
 
@@ -515,16 +515,17 @@ Status DiskRowSet::MajorCompactDeltaStores() {
     return Status::OK();
   }
 
-  return MajorCompactDeltaStoresWithColumnIds(col_ids);
+  return MajorCompactDeltaStoresWithColumnIds(col_ids, std::move(history_gc_opts));
 }
 
-Status DiskRowSet::MajorCompactDeltaStoresWithColumnIds(const vector<ColumnId>& col_ids) {
+Status DiskRowSet::MajorCompactDeltaStoresWithColumnIds(const vector<ColumnId>& col_ids,
+                                                        HistoryGcOpts history_gc_opts) {
   TRACE_EVENT0("tablet", "DiskRowSet::MajorCompactDeltaStores");
-  boost::lock_guard<Mutex> l(*delta_tracker()->compact_flush_lock());
+  std::lock_guard<Mutex> l(*delta_tracker()->compact_flush_lock());
 
   // TODO: do we need to lock schema or anything here?
   gscoped_ptr<MajorDeltaCompaction> compaction;
-  RETURN_NOT_OK(NewMajorDeltaCompaction(col_ids, &compaction));
+  RETURN_NOT_OK(NewMajorDeltaCompaction(col_ids, std::move(history_gc_opts), &compaction));
 
   RETURN_NOT_OK(compaction->Compact());
 
@@ -539,7 +540,7 @@ Status DiskRowSet::MajorCompactDeltaStoresWithColumnIds(const vector<ColumnId>& 
   gscoped_ptr<CFileSet> new_base(new CFileSet(rowset_metadata_));
   RETURN_NOT_OK(new_base->Open());
   {
-    boost::lock_guard<percpu_rwlock> lock(component_lock_);
+    std::lock_guard<percpu_rwlock> lock(component_lock_);
     RETURN_NOT_OK(compaction->UpdateDeltaTracker(delta_tracker_.get()));
     base_data_.reset(new_base.release());
   }
@@ -547,9 +548,10 @@ Status DiskRowSet::MajorCompactDeltaStoresWithColumnIds(const vector<ColumnId>& 
 }
 
 Status DiskRowSet::NewMajorDeltaCompaction(const vector<ColumnId>& col_ids,
+                                           HistoryGcOpts history_gc_opts,
                                            gscoped_ptr<MajorDeltaCompaction>* out) const {
   DCHECK(open_);
-  boost::shared_lock<rw_spinlock> lock(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_.get_lock());
 
   const Schema* schema = &rowset_metadata_->tablet_schema();
 
@@ -566,8 +568,9 @@ Status DiskRowSet::NewMajorDeltaCompaction(const vector<ColumnId>& col_ids,
                                       *schema,
                                       base_data_.get(),
                                       std::move(delta_iter),
-                                      included_stores,
-                                      col_ids));
+                                      std::move(included_stores),
+                                      col_ids,
+                                      std::move(history_gc_opts)));
   return Status::OK();
 }
 
@@ -575,7 +578,7 @@ Status DiskRowSet::NewRowIterator(const Schema *projection,
                                   const MvccSnapshot &mvcc_snap,
                                   gscoped_ptr<RowwiseIterator>* out) const {
   DCHECK(open_);
-  boost::shared_lock<rw_spinlock> lock(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_.get_lock());
 
   shared_ptr<CFileSet::Iterator> base_iter(base_data_->NewIterator(projection));
   gscoped_ptr<ColumnwiseIterator> col_iter;
@@ -599,7 +602,7 @@ Status DiskRowSet::MutateRow(Timestamp timestamp,
                              ProbeStats* stats,
                              OperationResultPB* result) {
   DCHECK(open_);
-  boost::shared_lock<rw_spinlock> lock(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_.get_lock());
 
   rowid_t row_idx;
   RETURN_NOT_OK(base_data_->FindRow(probe, &row_idx, stats));
@@ -621,7 +624,7 @@ Status DiskRowSet::CheckRowPresent(const RowSetKeyProbe &probe,
                                    bool* present,
                                    ProbeStats* stats) const {
   DCHECK(open_);
-  boost::shared_lock<rw_spinlock> lock(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_.get_lock());
 
   rowid_t row_idx;
   RETURN_NOT_OK(base_data_->CheckRowPresent(probe, present, &row_idx, stats));
@@ -639,7 +642,7 @@ Status DiskRowSet::CheckRowPresent(const RowSetKeyProbe &probe,
 
 Status DiskRowSet::CountRows(rowid_t *count) const {
   DCHECK(open_);
-  boost::shared_lock<rw_spinlock> lock(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_.get_lock());
 
   return base_data_->CountRows(count);
 }
@@ -647,25 +650,25 @@ Status DiskRowSet::CountRows(rowid_t *count) const {
 Status DiskRowSet::GetBounds(std::string* min_encoded_key,
                              std::string* max_encoded_key) const {
   DCHECK(open_);
-  boost::shared_lock<rw_spinlock> lock(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_.get_lock());
   return base_data_->GetBounds(min_encoded_key, max_encoded_key);
 }
 
 uint64_t DiskRowSet::EstimateBaseDataDiskSize() const {
   DCHECK(open_);
-  boost::shared_lock<rw_spinlock> lock(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_.get_lock());
   return base_data_->EstimateOnDiskSize();
 }
 
 uint64_t DiskRowSet::EstimateDeltaDiskSize() const {
   DCHECK(open_);
-  boost::shared_lock<rw_spinlock> lock(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_.get_lock());
   return delta_tracker_->EstimateOnDiskSize();
 }
 
 uint64_t DiskRowSet::EstimateOnDiskSize() const {
   DCHECK(open_);
-  boost::shared_lock<rw_spinlock> lock(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_.get_lock());
   return base_data_->EstimateOnDiskSize() + delta_tracker_->EstimateOnDiskSize();
 }
 

@@ -50,15 +50,7 @@ class PredicateTest : public KuduTest {
     // Set up the mini cluster
     cluster_.reset(new MiniCluster(env_.get(), MiniClusterOptions()));
     ASSERT_OK(cluster_->Start());
-    KuduClientBuilder client_builder;
-    ASSERT_OK(cluster_->CreateClient(&client_builder, &client_));
-  }
-
-  void TearDown() override {
-    if (cluster_) {
-      cluster_->Shutdown();
-      cluster_.reset();
-    }
+    ASSERT_OK(cluster_->CreateClient(nullptr, &client_));
   }
 
   // Creates a key/value table schema with an int64 key and value of the
@@ -74,6 +66,7 @@ class PredicateTest : public KuduTest {
     unique_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
     CHECK_OK(table_creator->table_name("table")
         .schema(&schema)
+        .set_range_partition_columns({ "key" })
         .num_replicas(1)
         .Create());
 
@@ -247,6 +240,26 @@ class PredicateTest : public KuduTest {
         }));
       }
 
+      { // value > v
+        int count = count_if(values.begin(), values.end(),
+                             [&] (T value) { return value > v; });
+        ASSERT_EQ(count, CountRows(table, {
+              table->NewComparisonPredicate("value",
+                                            KuduPredicate::GREATER,
+                                            KuduValue::FromInt(v)),
+        }));
+      }
+
+      { // value < v
+        int count = count_if(values.begin(), values.end(),
+                             [&] (T value) { return value < v; });
+        ASSERT_EQ(count, CountRows(table, {
+              table->NewComparisonPredicate("value",
+                                            KuduPredicate::LESS,
+                                            KuduValue::FromInt(v)),
+        }));
+      }
+
       { // value >= 0
         // value <= v
         int count = count_if(values.begin(), values.end(),
@@ -318,6 +331,26 @@ class PredicateTest : public KuduTest {
         ASSERT_EQ(count, CountRows(table, {
               table->NewComparisonPredicate("value",
                                             KuduPredicate::LESS_EQUAL,
+                                            KuduValue::CopyString(v)),
+        }));
+      }
+
+      { // value > v
+        int count = count_if(values.begin(), values.end(),
+                             [&] (const string& value) { return value > v; });
+        ASSERT_EQ(count, CountRows(table, {
+              table->NewComparisonPredicate("value",
+                                            KuduPredicate::GREATER,
+                                            KuduValue::CopyString(v)),
+        }));
+      }
+
+      { // value < v
+        int count = count_if(values.begin(), values.end(),
+                             [&] (const string& value) { return value < v; });
+        ASSERT_EQ(count, CountRows(table, {
+              table->NewComparisonPredicate("value",
+                                            KuduPredicate::LESS,
                                             KuduValue::CopyString(v)),
         }));
       }
@@ -417,6 +450,34 @@ TEST_F(PredicateTest, TestBoolPredicates) {
                                                         KuduValue::FromBool(true));
     ASSERT_EQ(2, CountRows(table, { pred }));
   }
+
+  { // value > true
+    KuduPredicate* pred = table->NewComparisonPredicate("value",
+                                                        KuduPredicate::GREATER,
+                                                        KuduValue::FromBool(true));
+    ASSERT_EQ(0, CountRows(table, { pred }));
+  }
+
+  { // value > false
+    KuduPredicate* pred = table->NewComparisonPredicate("value",
+                                                        KuduPredicate::GREATER,
+                                                        KuduValue::FromBool(false));
+    ASSERT_EQ(1, CountRows(table, { pred }));
+  }
+
+  { // value < false
+    KuduPredicate* pred = table->NewComparisonPredicate("value",
+                                                        KuduPredicate::LESS,
+                                                        KuduValue::FromBool(false));
+    ASSERT_EQ(0, CountRows(table, { pred }));
+  }
+
+  { // value < true
+    KuduPredicate* pred = table->NewComparisonPredicate("value",
+                                                        KuduPredicate::LESS,
+                                                        KuduValue::FromBool(true));
+    ASSERT_EQ(1, CountRows(table, { pred }));
+  }
 }
 
 TEST_F(PredicateTest, TestInt8Predicates) {
@@ -500,14 +561,14 @@ TEST_F(PredicateTest, TestInt64Predicates) {
 }
 
 TEST_F(PredicateTest, TestTimestampPredicates) {
-  shared_ptr<KuduTable> table = CreateAndOpenTable(KuduColumnSchema::TIMESTAMP);
+  shared_ptr<KuduTable> table = CreateAndOpenTable(KuduColumnSchema::UNIXTIME_MICROS);
   shared_ptr<KuduSession> session = CreateSession();
 
   int i = 0;
   for (int64_t value : CreateIntValues<int64_t>()) {
       unique_ptr<KuduInsert> insert(table->NewInsert());
       ASSERT_OK(insert->mutable_row()->SetInt64("key", i++));
-      ASSERT_OK(insert->mutable_row()->SetTimestamp("value", value));
+      ASSERT_OK(insert->mutable_row()->SetUnixTimeMicros("value", value));
       ASSERT_OK(session->Apply(insert.release()));
   }
   unique_ptr<KuduInsert> null_insert(table->NewInsert());
@@ -568,6 +629,26 @@ TEST_F(PredicateTest, TestFloatPredicates) {
       ASSERT_EQ(count, CountRows(table, {
             table->NewComparisonPredicate("value",
                                           KuduPredicate::LESS_EQUAL,
+                                          KuduValue::FromFloat(v)),
+      }));
+    }
+
+    { // value > v
+      int count = count_if(values.begin(), values.end(),
+                           [&] (float value) { return value > v; });
+      ASSERT_EQ(count, CountRows(table, {
+            table->NewComparisonPredicate("value",
+                                          KuduPredicate::GREATER,
+                                          KuduValue::FromFloat(v)),
+      }));
+    }
+
+    { // value < v
+      int count = count_if(values.begin(), values.end(),
+                           [&] (float value) { return value < v; });
+      ASSERT_EQ(count, CountRows(table, {
+            table->NewComparisonPredicate("value",
+                                          KuduPredicate::LESS,
                                           KuduValue::FromFloat(v)),
       }));
     }
@@ -655,6 +736,26 @@ TEST_F(PredicateTest, TestDoublePredicates) {
       }));
     }
 
+    { // value > v
+      int count = count_if(values.begin(), values.end(),
+                           [&] (double value) { return value > v; });
+      ASSERT_EQ(count, CountRows(table, {
+            table->NewComparisonPredicate("value",
+                                          KuduPredicate::GREATER,
+                                          KuduValue::FromDouble(v)),
+      }));
+    }
+
+    { // value < v
+      int count = count_if(values.begin(), values.end(),
+                           [&] (double value) { return value < v; });
+      ASSERT_EQ(count, CountRows(table, {
+            table->NewComparisonPredicate("value",
+                                          KuduPredicate::LESS,
+                                          KuduValue::FromDouble(v)),
+      }));
+    }
+
     { // value >= 0.0
       // value <= v
       int count = count_if(values.begin(), values.end(),
@@ -694,7 +795,7 @@ TEST_F(PredicateTest, TestStringPredicates) {
   for (const string& value : values) {
       unique_ptr<KuduInsert> insert(table->NewInsert());
       ASSERT_OK(insert->mutable_row()->SetInt64("key", i++));
-      ASSERT_OK(insert->mutable_row()->SetString("value", value));
+      ASSERT_OK(insert->mutable_row()->SetStringNoCopy("value", value));
       ASSERT_OK(session->Apply(insert.release()));
   }
   unique_ptr<KuduInsert> null_insert(table->NewInsert());
@@ -715,7 +816,7 @@ TEST_F(PredicateTest, TestBinaryPredicates) {
   for (const string& value : values) {
       unique_ptr<KuduInsert> insert(table->NewInsert());
       ASSERT_OK(insert->mutable_row()->SetInt64("key", i++));
-      ASSERT_OK(insert->mutable_row()->SetBinary("value", value));
+      ASSERT_OK(insert->mutable_row()->SetBinaryNoCopy("value", value));
       ASSERT_OK(session->Apply(insert.release()));
   }
   unique_ptr<KuduInsert> null_insert(table->NewInsert());

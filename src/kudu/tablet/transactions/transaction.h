@@ -19,6 +19,8 @@
 #define KUDU_TABLET_TRANSACTION_H_
 
 #include <string>
+#include <mutex>
+#include <kudu/rpc/result_tracker.h>
 
 #include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol.h"
@@ -29,6 +31,10 @@
 #include "kudu/util/memory/arena.h"
 
 namespace kudu {
+
+namespace rpc {
+class ResultTracker;
+} // namespace rpc
 
 namespace tablet {
 class TabletPeer;
@@ -134,7 +140,18 @@ class TransactionState {
 
   // Returns the response PB associated with this transaction, or NULL.
   // This will only return a non-null object for leader-side transactions.
-  virtual google::protobuf::Message* response() { return NULL; }
+  virtual google::protobuf::Message* response() const { return NULL; }
+
+  // Returns whether the results of the transaction are being tracked.
+  bool are_results_tracked() const {
+    return result_tracker_.get() != nullptr && has_request_id();
+  }
+
+  rpc::ResultTracker* result_tracker() const { return result_tracker_.get(); }
+
+  void SetResultTracker(const scoped_refptr<rpc::ResultTracker> result_tracker) {
+    result_tracker_ = result_tracker;
+  }
 
   // Sets the ConsensusRound for this transaction, if this transaction is
   // being executed through the consensus system.
@@ -195,19 +212,19 @@ class TransactionState {
   // Sets the timestamp for the transaction
   virtual void set_timestamp(const Timestamp& timestamp) {
     // make sure we set the timestamp only once
-    lock_guard<simple_spinlock> l(&txn_state_lock_);
+    std::lock_guard<simple_spinlock> l(txn_state_lock_);
     DCHECK_EQ(timestamp_, Timestamp::kInvalidTimestamp);
     timestamp_ = timestamp;
   }
 
   Timestamp timestamp() const {
-    lock_guard<simple_spinlock> l(&txn_state_lock_);
+    std::lock_guard<simple_spinlock> l(txn_state_lock_);
     DCHECK(timestamp_ != Timestamp::kInvalidTimestamp);
     return timestamp_;
   }
 
   bool has_timestamp() const {
-    lock_guard<simple_spinlock> l(&txn_state_lock_);
+    std::lock_guard<simple_spinlock> l(txn_state_lock_);
     return timestamp_ != Timestamp::kInvalidTimestamp;
   }
 
@@ -223,6 +240,19 @@ class TransactionState {
     return external_consistency_mode_;
   }
 
+  // Returns where the transaction associated with this TransactionState had an
+  // associated transaction id.
+  bool has_request_id() const {
+    return request_id_.has_client_id();
+  }
+
+  // Returns the request id for the transaction associated with this TransactionState.
+  // Not all transactions will have a request id so users of this method should call
+  // 'has_request_id()' first to make sure it is set.
+  const rpc::RequestIdPB& request_id() const {
+    return request_id_;
+  }
+
  protected:
   explicit TransactionState(TabletPeer* tablet_peer);
   virtual ~TransactionState();
@@ -231,6 +261,9 @@ class TransactionState {
 
   // The tablet peer that is coordinating this transaction.
   TabletPeer* const tablet_peer_;
+
+  // The result tracker that will cache the result of this transaction.
+  scoped_refptr<rpc::ResultTracker> result_tracker_;
 
   // Optional callback to be called once the transaction completes.
   gscoped_ptr<TransactionCompletionCallback> completion_clbk_;
@@ -247,6 +280,9 @@ class TransactionState {
 
   // This OpId stores the canonical "anchor" OpId for this transaction.
   consensus::OpId op_id_;
+
+  // The client's id for this transaction, if there is one.
+  rpc::RequestIdPB request_id_;
 
   scoped_refptr<consensus::ConsensusRound> consensus_round_;
 

@@ -16,7 +16,7 @@
 // under the License.
 
 [[quickstart]]
-= Apache Kudu (incubating) Quickstart
+= Apache Kudu Quickstart
 :author: Kudu Team
 :imagesdir: ./images
 :icons: font
@@ -146,6 +146,7 @@ SELECT count(*) FROM passenger_data_raw;
 [source,sql]
 ----
 CREATE TABLE passenger_data
+DISTRIBUTE BY HASH (id) INTO 16 BUCKETS
 TBLPROPERTIES(
 'storage_handler' = 'com.cloudera.kudu.hive.KuduStorageHandler',
 'kudu.table_name' = 'passenger_data',

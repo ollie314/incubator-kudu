@@ -37,7 +37,6 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/mini_cluster.h"
 #include "kudu/master/mini_master.h"
-#include "kudu/tablet/maintenance_manager.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/tablet/tablet_peer.h"
@@ -47,6 +46,7 @@
 #include "kudu/util/async_util.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/errno.h"
+#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -134,16 +134,10 @@ class FullStackInsertScanTest : public KuduTest {
     gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
     ASSERT_OK(table_creator->table_name(kTableName)
              .schema(&schema_)
+             .set_range_partition_columns({ "key" })
              .num_replicas(1)
              .Create());
     ASSERT_OK(client_->OpenTable(kTableName, &reader_table_));
-  }
-
-  virtual void TearDown() OVERRIDE {
-    if (cluster_) {
-      cluster_->Shutdown();
-    }
-    KuduTest::TearDown();
   }
 
   void DoConcurrentClientInserts();

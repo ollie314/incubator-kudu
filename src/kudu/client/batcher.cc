@@ -18,14 +18,16 @@
 #include "kudu/client/batcher.h"
 
 #include <algorithm>
-#include <boost/bind.hpp>
-#include <glog/logging.h>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <boost/bind.hpp>
+#include <glog/logging.h>
 
 #include "kudu/client/callbacks.h"
 #include "kudu/client/client.h"
@@ -44,6 +46,7 @@
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/rpc/request_tracker.h"
 #include "kudu/rpc/retriable_rpc.h"
 #include "kudu/rpc/rpc.h"
 #include "kudu/tserver/tserver_service.proxy.h"
@@ -61,6 +64,7 @@ namespace kudu {
 
 using rpc::ErrorStatusPB;
 using rpc::Messenger;
+using rpc::RequestTracker;
 using rpc::ResponseCallback;
 using rpc::RetriableRpc;
 using rpc::RetriableRpcStatus;
@@ -163,8 +167,6 @@ struct InFlightOp {
   // The actual operation.
   gscoped_ptr<KuduWriteOperation> write_op;
 
-  string partition_key;
-
   // The tablet the operation is destined for.
   // This is only filled in after passing through the kLookingUpTablet state.
   scoped_refptr<RemoteTablet> tablet;
@@ -188,6 +190,7 @@ class WriteRpc : public RetriableRpc<RemoteTabletServer, WriteRequestPB, WriteRe
  public:
   WriteRpc(const scoped_refptr<Batcher>& batcher,
            const scoped_refptr<MetaCacheServerPicker>& replica_picker,
+           const scoped_refptr<RequestTracker>& request_tracker,
            vector<InFlightOp*> ops,
            const MonoTime& deadline,
            const shared_ptr<Messenger>& messenger,
@@ -224,11 +227,12 @@ class WriteRpc : public RetriableRpc<RemoteTabletServer, WriteRequestPB, WriteRe
 
 WriteRpc::WriteRpc(const scoped_refptr<Batcher>& batcher,
                    const scoped_refptr<MetaCacheServerPicker>& replica_picker,
+                   const scoped_refptr<RequestTracker>& request_tracker,
                    vector<InFlightOp*> ops,
                    const MonoTime& deadline,
                    const shared_ptr<Messenger>& messenger,
                    const string& tablet_id)
-    : RetriableRpc(replica_picker, deadline, messenger),
+    : RetriableRpc(replica_picker, request_tracker, deadline, messenger),
       batcher_(batcher),
       ops_(std::move(ops)),
       tablet_id_(tablet_id) {
@@ -257,16 +261,15 @@ WriteRpc::WriteRpc(const scoped_refptr<Batcher>& batcher,
   int ctr = 0;
   RowOperationsPBEncoder enc(requested);
   for (InFlightOp* op : ops_) {
+#ifndef NDEBUG
     const Partition& partition = op->tablet->partition();
     const PartitionSchema& partition_schema = table()->partition_schema();
     const KuduPartialRow& row = op->write_op->row();
-
-#ifndef NDEBUG
     bool partition_contains_row;
     CHECK(partition_schema.PartitionContainsRow(partition, row, &partition_contains_row).ok());
     CHECK(partition_contains_row)
         << "Row " << partition_schema.RowDebugString(row)
-        << "not in partition " << partition_schema.PartitionDebugString(partition, *schema);
+        << " not in partition " << partition_schema.PartitionDebugString(partition, *schema);
 #endif
 
     enc.Add(ToInternalWriteType(op->write_op->type()), op->write_op->row());
@@ -294,8 +297,7 @@ string WriteRpc::ToString() const {
 }
 
 void WriteRpc::Try(RemoteTabletServer* replica, const ResponseCallback& callback) {
-  VLOG(2) << "Tablet " << tablet_id_ << ": Writing batch to replica "
-      << replica->ToString();
+  VLOG(2) << "Tablet " << tablet_id_ << ": Writing batch to replica " << replica->ToString();
   replica->proxy()->WriteAsync(req_, &resp_,
                                mutable_retrier()->mutable_controller(),
                                callback);
@@ -376,29 +378,28 @@ RetriableRpcStatus WriteRpc::AnalyzeResponse(const Status& rpc_cb_status) {
 }
 
 Batcher::Batcher(KuduClient* client,
-                 ErrorCollector* error_collector,
-                 const sp::shared_ptr<KuduSession>& session,
+                 scoped_refptr<ErrorCollector> error_collector,
+                 sp::weak_ptr<KuduSession> session,
                  kudu::client::KuduSession::ExternalConsistencyMode consistency_mode)
   : state_(kGatheringOps),
     client_(client),
-    weak_session_(session),
+    weak_session_(std::move(session)),
     consistency_mode_(consistency_mode),
-    error_collector_(error_collector),
+    error_collector_(std::move(error_collector)),
     had_errors_(false),
-    flush_callback_(NULL),
+    flush_callback_(nullptr),
     next_op_sequence_number_(0),
     outstanding_lookups_(0),
-    max_buffer_size_(7 * 1024 * 1024),
     buffer_bytes_used_(0) {
 }
 
 void Batcher::Abort() {
-  unique_lock<simple_spinlock> l(&lock_);
+  std::unique_lock<simple_spinlock> l(lock_);
   state_ = kAborted;
 
   vector<InFlightOp*> to_abort;
   for (InFlightOp* op : ops_) {
-    lock_guard<simple_spinlock> l(&op->lock_);
+    std::lock_guard<simple_spinlock> l(op->lock_);
     if (op->state == InFlightOp::kBufferedToTabletServer) {
       to_abort.push_back(op);
     }
@@ -428,18 +429,18 @@ Batcher::~Batcher() {
 
 void Batcher::SetTimeoutMillis(int millis) {
   CHECK_GE(millis, 0);
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   timeout_ = MonoDelta::FromMilliseconds(millis);
 }
 
 
 bool Batcher::HasPendingOperations() const {
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   return !ops_.empty();
 }
 
 int Batcher::CountBufferedOperations() const {
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   if (state_ == kGatheringOps) {
     return ops_.size();
   } else {
@@ -452,7 +453,7 @@ int Batcher::CountBufferedOperations() const {
 void Batcher::CheckForFinishedFlush() {
   sp::shared_ptr<KuduSession> session;
   {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     if (state_ != kFlushing || !ops_.empty()) {
       return;
     }
@@ -466,15 +467,14 @@ void Batcher::CheckForFinishedFlush() {
     // a lock inversion deadlock -- the session lock should always
     // come before the batcher lock.
     session->data_->FlushFinished(this);
-  }
 
-  Status s;
-  if (had_errors_) {
+  }
+  if (flush_callback_) {
     // User is responsible for fetching errors from the error collector.
-    s = Status::IOError("Some errors occurred");
+    Status s = had_errors_ ? Status::IOError("Some errors occurred")
+                           : Status::OK();
+    flush_callback_->Run(s);
   }
-
-  flush_callback_->Run(s);
 }
 
 MonoTime Batcher::ComputeDeadlineUnlocked() const {
@@ -484,14 +484,12 @@ MonoTime Batcher::ComputeDeadlineUnlocked() const {
                                 << GetStackTrace();
     timeout = MonoDelta::FromSeconds(60);
   }
-  MonoTime ret = MonoTime::Now(MonoTime::FINE);
-  ret.AddDelta(timeout);
-  return ret;
+  return MonoTime::Now() + timeout;
 }
 
 void Batcher::FlushAsync(KuduStatusCallback* cb) {
   {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     CHECK_EQ(state_, kGatheringOps);
     state_ = kFlushing;
     flush_callback_ = cb;
@@ -513,30 +511,16 @@ void Batcher::FlushAsync(KuduStatusCallback* cb) {
 }
 
 Status Batcher::Add(KuduWriteOperation* write_op) {
-  int64_t required_size = write_op->SizeInBuffer();
-  int64_t size_after_adding = buffer_bytes_used_.IncrementBy(required_size);
-  if (PREDICT_FALSE(size_after_adding > max_buffer_size_)) {
-    buffer_bytes_used_.IncrementBy(-required_size);
-    int64_t size_before_adding = size_after_adding - required_size;
-    return Status::Incomplete(Substitute(
-        "not enough space remaining in buffer for op (required $0, "
-        "$1 already used",
-        HumanReadableNumBytes::ToString(required_size),
-        HumanReadableNumBytes::ToString(size_before_adding)));
-  }
-
-
   // As soon as we get the op, start looking up where it belongs,
   // so that when the user calls Flush, we are ready to go.
   gscoped_ptr<InFlightOp> op(new InFlightOp());
-  RETURN_NOT_OK(write_op->table_->partition_schema()
-                .EncodeKey(write_op->row(), &op->partition_key));
+  string partition_key;
+  RETURN_NOT_OK(write_op->table_->partition_schema().EncodeKey(write_op->row(), &partition_key));
   op->write_op.reset(write_op);
   op->state = InFlightOp::kLookingUpTablet;
 
   AddInFlightOp(op.get());
   VLOG(3) << "Looking up tablet for " << op->write_op->ToString();
-
   // Increment our reference count for the outstanding callback.
   //
   // deadline_ is set in FlushAsync(), after all Add() calls are done, so
@@ -545,21 +529,29 @@ Status Batcher::Add(KuduWriteOperation* write_op) {
   base::RefCountInc(&outstanding_lookups_);
   client_->data_->meta_cache_->LookupTabletByKey(
       op->write_op->table(),
-      op->partition_key,
+      std::move(partition_key),
       deadline,
       &op->tablet,
       Bind(&Batcher::TabletLookupFinished, this, op.get()));
   IgnoreResult(op.release());
+
+  buffer_bytes_used_.IncrementBy(write_op->SizeInBuffer());
+
   return Status::OK();
 }
 
 void Batcher::AddInFlightOp(InFlightOp* op) {
   DCHECK_EQ(op->state, InFlightOp::kLookingUpTablet);
 
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   CHECK_EQ(state_, kGatheringOps);
   InsertOrDie(&ops_, op);
   op->sequence_number_ = next_op_sequence_number_++;
+
+  // Set the time of the first operation in the batch, if not set yet.
+  if (PREDICT_FALSE(!first_op_time_.Initialized())) {
+    first_op_time_ = MonoTime::Now();
+  }
 }
 
 bool Batcher::IsAbortedUnlocked() const {
@@ -567,12 +559,12 @@ bool Batcher::IsAbortedUnlocked() const {
 }
 
 void Batcher::MarkHadErrors() {
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   had_errors_ = true;
 }
 
 void Batcher::MarkInFlightOpFailed(InFlightOp* op, const Status& s) {
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   MarkInFlightOpFailedUnlocked(op, s);
 }
 
@@ -591,7 +583,7 @@ void Batcher::TabletLookupFinished(InFlightOp* op, const Status& s) {
   // Acquire the batcher lock early to atomically:
   // 1. Test if the batcher was aborted, and
   // 2. Change the op state.
-  unique_lock<simple_spinlock> l(&lock_);
+  std::unique_lock<simple_spinlock> l(lock_);
 
   if (IsAbortedUnlocked()) {
     VLOG(1) << "Aborted batch: TabletLookupFinished for " << op->write_op->ToString();
@@ -621,7 +613,7 @@ void Batcher::TabletLookupFinished(InFlightOp* op, const Status& s) {
   }
 
   {
-    lock_guard<simple_spinlock> l2(&op->lock_);
+    std::lock_guard<simple_spinlock> l2(op->lock_);
     CHECK_EQ(op->state, InFlightOp::kLookingUpTablet);
     CHECK(op->tablet != NULL);
 
@@ -662,7 +654,7 @@ void Batcher::FlushBuffersIfReady() {
   // 2. All outstanding ops have finished lookup. Why? To avoid a situation
   //    where ops are flushed one by one as they finish lookup.
   {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     if (state_ != kFlushing) {
       VLOG(3) << "FlushBuffersIfReady: batcher not yet in flushing state";
       return;
@@ -705,6 +697,7 @@ void Batcher::FlushBuffer(RemoteTablet* tablet, const vector<InFlightOp*>& ops) 
                                 tablet));
   WriteRpc* rpc = new WriteRpc(this,
                                server_picker,
+                               client_->data_->request_tracker_,
                                ops,
                                deadline_,
                                client_->data_->messenger_,
@@ -734,10 +727,9 @@ void Batcher::ProcessWriteResponse(const WriteRpc& rpc,
     MarkHadErrors();
   }
 
-
   // Remove all the ops from the "in-flight" list.
   {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     for (InFlightOp* op : rpc.ops()) {
       CHECK_EQ(1, ops_.erase(op))
             << "Could not remove op " << op->ToString()

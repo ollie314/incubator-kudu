@@ -122,6 +122,7 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
 class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
  public:
   ConsensusServiceImpl(const scoped_refptr<MetricEntity>& metric_entity,
+                       const scoped_refptr<rpc::ResultTracker>& result_tracker,
                        TabletPeerLookupIf* tablet_manager_);
 
   virtual ~ConsensusServiceImpl();
@@ -158,8 +159,8 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
                                  consensus::GetConsensusStateResponsePB *resp,
                                  rpc::RpcContext *context) OVERRIDE;
 
-  virtual void StartRemoteBootstrap(const consensus::StartRemoteBootstrapRequestPB* req,
-                                    consensus::StartRemoteBootstrapResponsePB* resp,
+  virtual void StartTabletCopy(const consensus::StartTabletCopyRequestPB* req,
+                                    consensus::StartTabletCopyResponsePB* resp,
                                     rpc::RpcContext* context) OVERRIDE;
 
  private:

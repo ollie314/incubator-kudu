@@ -35,15 +35,18 @@ class TestClient(KuduTestBase, unittest.TestCase):
 
     def test_table_column(self):
         table = self.client.table(self.ex_table)
-        col = table['key']
+        cols = [(table['key'], 'key', 'int32'),
+                (table[1], 'int_val', 'int32'),
+                (table[-1], 'string_val', 'string')]
 
-        assert col.name == b'key'
-        assert col.parent is table
+        for col, name, type in cols:
+            assert col.name == bytes(name)
+            assert col.parent is table
 
-        result_repr = repr(col)
-        expected_repr = ('Column(key, parent={0}, type=int32)'
-                         .format(self.ex_table))
-        assert result_repr == expected_repr
+            result_repr = repr(col)
+            expected_repr = ('Column({0}, parent={1}, type={2})'
+                             .format(name, self.ex_table, type))
+            assert result_repr == expected_repr
 
     def test_table_schema_retains_reference(self):
         import gc
@@ -61,10 +64,11 @@ class TestClient(KuduTestBase, unittest.TestCase):
 
     def test_list_tables(self):
         schema = self.example_schema()
+        partitioning = self.example_partitioning()
 
         to_create = ['foo1', 'foo2', 'foo3']
         for name in to_create:
-            self.client.create_table(name, schema)
+            self.client.create_table(name, schema, partitioning)
 
         result = self.client.list_tables()
         expected = [self.ex_table] + to_create
@@ -81,7 +85,7 @@ class TestClient(KuduTestBase, unittest.TestCase):
 
     def test_delete_table(self):
         name = "peekaboo"
-        self.client.create_table(name, self.schema)
+        self.client.create_table(name, self.schema, self.partitioning)
         self.client.delete_table(name)
         assert not self.client.table_exists(name)
 
@@ -92,6 +96,26 @@ class TestClient(KuduTestBase, unittest.TestCase):
     def test_table_nonexistent(self):
         self.assertRaises(kudu.KuduNotFound, self.client.table,
                           '__donotexist__')
+
+    def test_create_table_with_different_replication_factors(self):
+        name = "different_replica_table"
+
+        # Test setting the number of replicas for 1, 3 and 5 provided that the
+        # number does not exceed the number of tservers
+        for n_replicas in [n for n in [1, 3, 5] if n <= self.NUM_TABLET_SERVERS]:
+            try:
+                self.client.create_table(
+                    name, self.schema,
+                    partitioning=Partitioning().add_hash_partitions(['key'], 2),
+                    n_replicas=n_replicas)
+
+                assert n_replicas == self.client.table(name).num_replicas
+
+            finally:
+                try:
+                    self.client.delete_table(name)
+                except:
+                    pass
 
     def test_create_partitioned_table(self):
         name = 'partitioned_table'
@@ -182,15 +206,11 @@ class TestClient(KuduTestBase, unittest.TestCase):
     def test_session_flush_modes(self):
         self.client.new_session(flush_mode=kudu.FLUSH_MANUAL)
         self.client.new_session(flush_mode=kudu.FLUSH_AUTO_SYNC)
+        self.client.new_session(flush_mode=kudu.FLUSH_AUTO_BACKGROUND)
 
         self.client.new_session(flush_mode='manual')
         self.client.new_session(flush_mode='sync')
-
-        with self.assertRaises(kudu.KuduNotSupported):
-            self.client.new_session(flush_mode=kudu.FLUSH_AUTO_BACKGROUND)
-
-        with self.assertRaises(kudu.KuduNotSupported):
-            self.client.new_session(flush_mode='background')
+        self.client.new_session(flush_mode='background')
 
         with self.assertRaises(ValueError):
             self.client.new_session(flush_mode='foo')
@@ -204,6 +224,17 @@ class TestClient(KuduTestBase, unittest.TestCase):
     def test_capture_kudu_error(self):
         pass
 
+    def test_list_tablet_server(self):
+        # Not confirming the number of tablet servers in this test because
+        # that is confirmed in the beginning of testing. This test confirms
+        # that all of the KuduTabletServer methods returned results and that
+        # a result is returned from the list_tablet_servers method.
+        tservers = self.client.list_tablet_servers()
+        self.assertTrue(tservers)
+        for tserver in tservers:
+            assert tserver.uuid() is not None
+            assert tserver.hostname() is not None
+            assert tserver.port() is not None
 
 class TestMonoDelta(unittest.TestCase):
 

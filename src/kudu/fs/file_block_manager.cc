@@ -477,7 +477,7 @@ Status FileBlockManager::SyncMetadata(const internal::FileBlockLocation& locatio
   // Figure out what directories to sync.
   vector<string> to_sync;
   {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     for (const string& parent_dir : parent_dirs) {
       if (dirty_dirs_.erase(parent_dir)) {
         to_sync.push_back(parent_dir);
@@ -510,6 +510,7 @@ FileBlockManager::FileBlockManager(Env* env, const BlockManagerOptions& opts)
     read_only_(opts.read_only),
     root_paths_(opts.root_paths),
     rand_(GetRandomSeed32()),
+    next_block_id_(rand_.Next64()),
     mem_tracker_(MemTracker::CreateTracker(-1,
                                            "file_block_manager",
                                            opts.parent_mem_tracker)) {
@@ -521,7 +522,6 @@ FileBlockManager::FileBlockManager(Env* env, const BlockManagerOptions& opts)
 
 FileBlockManager::~FileBlockManager() {
   STLDeleteValues(&root_paths_by_idx_);
-  mem_tracker_->UnregisterFromParent();
 }
 
 Status FileBlockManager::Create() {
@@ -649,7 +649,7 @@ Status FileBlockManager::CreateBlock(const CreateBlockOptions& opts,
   uint16_t root_path_idx;
   string root_path;
   {
-    lock_guard<simple_spinlock> l(&lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     root_path_idx = next_root_path_->first;
     root_path = next_root_path_->second->path();
     next_root_path_++;
@@ -664,15 +664,22 @@ Status FileBlockManager::CreateBlock(const CreateBlockOptions& opts,
   internal::FileBlockLocation location;
   shared_ptr<WritableFile> writer;
 
+  int attempt_num = 0;
   // Repeat in case of block id collisions (unlikely).
   do {
     created_dirs.clear();
+
+    // If we failed to generate a unique ID, start trying again from a random
+    // part of the key space.
+    if (attempt_num++ > 0) {
+      next_block_id_.Store(rand_.Next64());
+    }
 
     // Make sure we don't accidentally create a location using the magic
     // invalid ID value.
     BlockId id;
     do {
-      id.SetId(rand_.Next64());
+      id.SetId(next_block_id_.Increment());
     } while (id.IsNull());
 
     location = internal::FileBlockLocation::FromParts(
@@ -689,7 +696,7 @@ Status FileBlockManager::CreateBlock(const CreateBlockOptions& opts,
       // Update dirty_dirs_ with those provided as well as the block's
       // directory, which may not have been created but is definitely dirty
       // (because we added a file to it).
-      lock_guard<simple_spinlock> l(&lock_);
+      std::lock_guard<simple_spinlock> l(lock_);
       for (const string& created : created_dirs) {
         dirty_dirs_.insert(created);
       }

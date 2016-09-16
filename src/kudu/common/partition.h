@@ -17,8 +17,8 @@
 #ifndef KUDU_COMMON_PARTITION_H
 #define KUDU_COMMON_PARTITION_H
 
-#include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kudu/common/common.pb.h"
@@ -65,6 +65,9 @@ class Partition {
   const std::string& partition_key_end() const {
     return partition_key_end_;
   }
+
+  // Returns true if the other partition is equivalent to this one.
+  bool Equals(const Partition& other) const;
 
   // Serializes a partition into a protobuf message.
   void ToPB(PartitionPB* pb) const;
@@ -142,12 +145,17 @@ class PartitionSchema {
   Status EncodeKey(const ConstContiguousRow& row, std::string* buf) const WARN_UNUSED_RESULT;
 
   // Creates the set of table partitions for a partition schema and collection
-  // of split rows.
+  // of split rows and split bounds.
   //
-  // The number of resulting partitions is the product of the number of hash
-  // buckets for each hash bucket component, multiplied by
-  // (split_rows.size() + 1).
+  // Split bounds define disjoint ranges for which tablets will be created. If
+  // empty, then Kudu assumes a single unbounded range. Each split key must fall
+  // into one of the ranges, and results in the range being split.  The number
+  // of resulting partitions is the product of the number of hash buckets for
+  // each hash bucket component, multiplied by
+  // (split_rows.size() + max(1, range_bounds.size())).
   Status CreatePartitions(const std::vector<KuduPartialRow>& split_rows,
+                          const std::vector<std::pair<KuduPartialRow,
+                                                      KuduPartialRow>>& range_bounds,
                           const Schema& schema,
                           std::vector<Partition>* partitions) const WARN_UNUSED_RESULT;
 
@@ -173,6 +181,20 @@ class PartitionSchema {
   // Returns a text description of the encoded partition key suitable for debug printing.
   std::string PartitionKeyDebugString(const std::string& key, const Schema& schema) const;
 
+  // Returns a text description of the range partition with the provided
+  // inclusive lower bound and exclusive upper bound.
+  std::string RangePartitionDebugString(const KuduPartialRow& lower_bound,
+                                        const KuduPartialRow& upper_bound) const;
+
+  // Returns a text description of the range partition with the provided
+  // inclusive lower bound and exclusive upper bound.
+  std::string RangePartitionDebugString(const std::string& lower_bound,
+                                        const std::string& upper_bound,
+                                        const Schema& schema) const;
+
+  // Returns a text description of the encoded range key suitable for debug printing.
+  std::string RangeKeyDebugString(const std::string& range_key, const Schema& schema) const;
+
   // Returns a text description of this partition schema suitable for debug printing.
   std::string DebugString(const Schema& schema) const;
 
@@ -183,8 +205,18 @@ class PartitionSchema {
   // Returns true if the other partition schema is equivalent to this one.
   bool Equals(const PartitionSchema& other) const;
 
+  // Transforms an exclusive lower bound range partition key into an inclusive
+  // lower bound range partition key.
+  Status MakeLowerBoundRangePartitionKeyInclusive(KuduPartialRow* row) const;
+
+  // Transforms an inclusive upper bound range partition key into an exclusive
+  // upper bound range partition key.
+  Status MakeUpperBoundRangePartitionKeyExclusive(KuduPartialRow* row) const;
+
  private:
   friend class PartitionPruner;
+  FRIEND_TEST(PartitionTest, TestIncrementRangePartitionBounds);
+  FRIEND_TEST(PartitionTest, TestIncrementRangePartitionStringBounds);
 
   struct RangeSchema {
     std::vector<ColumnId> column_ids;
@@ -229,14 +261,9 @@ class PartitionSchema {
   template<typename Row>
   Status EncodeKeyImpl(const Row& row, string* buf) const;
 
-  // Appends the stringified range partition components of a partial row to a
-  // vector.
-  //
-  // If any columns of the range partition do not exist in the partial row,
-  // processing stops and the provided default string piece is appended to the vector.
-  void AppendRangeDebugStringComponentsOrString(const KuduPartialRow& row,
-                                                StringPiece default_string,
-                                                std::vector<std::string>* components) const;
+  // Returns true if all of the columns in the range partition key are unset in
+  // the row.
+  bool IsRangePartitionKeyEmpty(const KuduPartialRow& row) const;
 
   // Appends the stringified range partition components of a partial row to a
   // vector.
@@ -245,6 +272,14 @@ class PartitionSchema {
   // logical minimum value for that column will be used instead.
   void AppendRangeDebugStringComponentsOrMin(const KuduPartialRow& row,
                                              std::vector<std::string>* components) const;
+
+  // Encode the provided row into a range key. The row must not include values
+  // for any columns not in the range key. Missing range values will be filled
+  // with the logical minimum value for the column. A row without any values
+  // will encode to an empty string.
+  //
+  // This method is useful used for encoding splits and bounds.
+  Status EncodeRangeKey(const KuduPartialRow& row, const Schema& schema, std::string* key) const;
 
   // Decodes a range partition key into a partial row, with variable-length
   // fields stored in the arena.
@@ -264,6 +299,33 @@ class PartitionSchema {
   // Validates that this partition schema is valid. Returns OK, or an
   // appropriate error code for an invalid partition schema.
   Status Validate(const Schema& schema) const;
+
+  // Validates the split rows, converts them to partition key form, and inserts
+  // them into splits in sorted order.
+  Status EncodeRangeSplits(const std::vector<KuduPartialRow>& split_rows,
+                           const Schema& schema,
+                           std::vector<std::string>* splits) const;
+
+  // Validates the range bounds, converts them to partition key form, and
+  // inserts them into encoded_range_partitions in sorted order.
+  Status EncodeRangeBounds(const std::vector<std::pair<KuduPartialRow,
+                                                       KuduPartialRow>>& range_bounds,
+                           const Schema& schema,
+                           std::vector<std::pair<std::string,
+                                                 std::string>>* encoded_range_bounds) const;
+
+  // Splits the encoded range bounds by the split points. The splits and bounds
+  // must be sorted. If `bounds` is empty, then a single unbounded range is
+  // assumed. If any of the splits falls outside of the bounds then an
+  // InvalidArgument status is returned.
+  Status SplitRangeBounds(const Schema& schema,
+                          std::vector<std::string> splits,
+                          std::vector<std::pair<std::string, std::string>>* bounds) const;
+
+  // Increments a range partition key, setting 'increment' to true if the
+  // increment succeeds, or false if all range partition columns are already the
+  // maximum value. Unset columns will be incremented to increment(min_value).
+  Status IncrementRangePartitionKey(KuduPartialRow* row, bool* increment) const;
 
   std::vector<HashBucketSchema> hash_bucket_schemas_;
   RangeSchema range_schema_;

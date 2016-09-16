@@ -36,6 +36,7 @@
 #include "kudu/util/faststring.h"
 #include "kudu/util/test_util.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/version_info.h"
 
 DECLARE_int32(heartbeat_interval_ms);
 
@@ -81,6 +82,29 @@ class RegistrationTest : public KuduTest {
     string expected_uuid =
       cluster_->mini_tablet_server(0)->server()->instance_pb().permanent_uuid();
     ASSERT_STR_CONTAINS(buf.ToString(), expected_uuid);
+
+    // Should check that the TS software version is included on the page.
+    // tserver version should be the same as returned by GetShortVersionString()
+    ASSERT_STR_CONTAINS(buf.ToString(), VersionInfo::GetShortVersionString());
+  }
+
+
+  Status WaitForReplicaCount(const string& tablet_id, int expected_count,
+                             TabletLocationsPB* locations) {
+    while (true) {
+      master::CatalogManager* catalog = cluster_->mini_master()->master()->catalog_manager();
+      Status s;
+      {
+        master::CatalogManager::ScopedLeaderSharedLock l(catalog);
+        RETURN_NOT_OK(l.first_failed_status());
+        s = catalog->GetTabletLocations(tablet_id, locations);
+      }
+      if (s.ok() && locations->replicas_size() == expected_count) {
+        return Status::OK();
+      }
+
+      SleepFor(MonoDelta::FromMilliseconds(1));
+    }
   }
 
  protected:
@@ -91,11 +115,12 @@ class RegistrationTest : public KuduTest {
 TEST_F(RegistrationTest, TestTSRegisters) {
   // Wait for the TS to register.
   vector<shared_ptr<TSDescriptor> > descs;
-  ASSERT_OK(cluster_->WaitForTabletServerCount(1, &descs));
+  ASSERT_OK(cluster_->WaitForTabletServerCount(
+      1, MiniCluster::MatchMode::MATCH_TSERVERS, &descs));
   ASSERT_EQ(1, descs.size());
 
   // Verify that the registration is sane.
-  master::TSRegistrationPB reg;
+  ServerRegistrationPB reg;
   descs[0]->GetRegistration(&reg);
   {
     SCOPED_TRACE(reg.ShortDebugString());
@@ -116,9 +141,20 @@ TEST_F(RegistrationTest, TestTSRegisters) {
   // number.
 }
 
+TEST_F(RegistrationTest, TestMasterSoftwareVersion) {
+  // Verify that the master's software version exists.
+  ServerRegistrationPB reg;
+  cluster_->mini_master()->master()->GetMasterRegistration(&reg);
+  {
+    SCOPED_TRACE(reg.ShortDebugString());
+    ASSERT_TRUE(reg.has_software_version());
+    ASSERT_STR_CONTAINS(reg.software_version(),
+                        VersionInfo::GetShortVersionString());
+  }
+}
+
 // Test starting multiple tablet servers and ensuring they both register with the master.
 TEST_F(RegistrationTest, TestMultipleTS) {
-  ASSERT_OK(cluster_->WaitForTabletServerCount(1));
   ASSERT_OK(cluster_->AddTabletServer());
   ASSERT_OK(cluster_->WaitForTabletServerCount(2));
 }
@@ -130,8 +166,6 @@ TEST_F(RegistrationTest, TestTabletReports) {
   string tablet_id_1;
   string tablet_id_2;
 
-  ASSERT_OK(cluster_->WaitForTabletServerCount(1));
-
   MiniTabletServer* ts = cluster_->mini_tablet_server(0);
   string ts_root = cluster_->GetTabletServerFsRoot(0);
 
@@ -139,13 +173,13 @@ TEST_F(RegistrationTest, TestTabletReports) {
   CreateTabletForTesting(cluster_->mini_master(), "fake-table", schema_, &tablet_id_1);
 
   TabletLocationsPB locs;
-  ASSERT_OK(cluster_->WaitForReplicaCount(tablet_id_1, 1, &locs));
+  ASSERT_OK(WaitForReplicaCount(tablet_id_1, 1, &locs));
   ASSERT_EQ(1, locs.replicas_size());
   LOG(INFO) << "Tablet successfully reported on " << locs.replicas(0).ts_info().permanent_uuid();
 
   // Add another tablet, make sure it is reported via incremental.
   CreateTabletForTesting(cluster_->mini_master(), "fake-table2", schema_, &tablet_id_2);
-  ASSERT_OK(cluster_->WaitForReplicaCount(tablet_id_2, 1, &locs));
+  ASSERT_OK(WaitForReplicaCount(tablet_id_2, 1, &locs));
 
   // Shut down the whole system, bring it back up, and make sure the tablets
   // are reported.
@@ -153,8 +187,8 @@ TEST_F(RegistrationTest, TestTabletReports) {
   ASSERT_OK(cluster_->mini_master()->Restart());
   ASSERT_OK(ts->Start());
 
-  ASSERT_OK(cluster_->WaitForReplicaCount(tablet_id_1, 1, &locs));
-  ASSERT_OK(cluster_->WaitForReplicaCount(tablet_id_2, 1, &locs));
+  ASSERT_OK(WaitForReplicaCount(tablet_id_1, 1, &locs));
+  ASSERT_OK(WaitForReplicaCount(tablet_id_2, 1, &locs));
 
   // TODO: KUDU-870: once the master supports detecting failed/lost replicas,
   // we should add a test case here which removes or corrupts metadata, restarts

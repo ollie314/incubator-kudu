@@ -44,10 +44,10 @@ using std::vector;
 namespace kudu {
 
 void CheckPrunedPartitions(const Schema& schema,
-                            const PartitionSchema& partition_schema,
-                            const vector<Partition> partitions,
-                            const ScanSpec& spec,
-                            size_t remaining_tablets) {
+                           const PartitionSchema& partition_schema,
+                           const vector<Partition> partitions,
+                           const ScanSpec& spec,
+                           size_t remaining_tablets) {
 
   PartitionPruner pruner;
   pruner.Init(schema, partition_schema, spec);
@@ -60,7 +60,7 @@ void CheckPrunedPartitions(const Schema& schema,
 
   int pruned_partitions = count_if(partitions.begin(), partitions.end(),
                                     [&] (const Partition& partition) {
-                                      return pruner.ShouldPruneForTests(partition);
+                                      return pruner.ShouldPrune(partition);
                                     });
   ASSERT_EQ(remaining_tablets, partitions.size() - pruned_partitions);
 }
@@ -90,7 +90,7 @@ TEST(TestPartitionPruner, TestPrimaryKeyRangePruning) {
   ASSERT_OK(split2.SetInt8("c", 10));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({ split1, split2 }, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions({ split1, split2 }, {}, schema, &partitions));
 
   // Creates a scan with optional lower and upper bounds, and checks that the
   // expected number of tablets are pruned.
@@ -203,7 +203,7 @@ TEST(TestPartitionPruner, TestPartialPrimaryKeyRangePruning) {
   ASSERT_OK(split2.SetStringCopy("b", "r"));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({ split1, split2 }, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions({ split1, split2 }, {}, schema, &partitions));
 
   // Applies the specified lower and upper bound primary keys against the
   // schema, and checks that the expected number of partitions are pruned.
@@ -308,7 +308,7 @@ TEST(TestPartitionPruner, TestRangePruning) {
   ASSERT_OK(split2.SetStringCopy("b", "r"));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({ split1, split2 }, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions({ split1, split2 }, {}, schema, &partitions));
 
   // Applies the specified predicates to a scan and checks that the expected
   // number of partitions are pruned.
@@ -364,10 +364,6 @@ TEST(TestPartitionPruner, TestRangePruning) {
 
   // c >= 100
   Check({ ColumnPredicate::Range(schema.column(2), &hundred, nullptr) }, 1);
-
-  // c >= -10
-  // c < 0
-  Check({ ColumnPredicate::Range(schema.column(2), &neg_ten, &zero) }, 1);
 
   // c >= -10
   // c < 0
@@ -441,7 +437,7 @@ TEST(TestPartitionPruner, TestRangePruning) {
 
 TEST(TestPartitionPruner, TestHashPruning) {
   // CREATE TABLE t
-  // (a INT8, b STRING, c INT8)
+  // (a INT8, b INT8, c INT8)
   // PRIMARY KEY (a, b, c)
   // DISTRIBUTE BY HASH(a) INTO 2 BUCKETS,
   //               HASH(b, c) INTO 2 BUCKETS;
@@ -465,7 +461,7 @@ TEST(TestPartitionPruner, TestHashPruning) {
     ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema));
 
     vector<Partition> partitions;
-    ASSERT_OK(partition_schema.CreatePartitions(vector<KuduPartialRow>(), schema, &partitions));
+    ASSERT_OK(partition_schema.CreatePartitions(vector<KuduPartialRow>(), {}, schema, &partitions));
 
 
   // Applies the specified predicates to a scan and checks that the expected
@@ -521,13 +517,13 @@ TEST(TestPartitionPruner, TestHashPruning) {
 
 TEST(TestPartitionPruner, TestPruning) {
   // CREATE TABLE timeseries
-  // (host STRING, metric STRING, time TIMESTAMP, value DOUBLE)
+  // (host STRING, metric STRING, time UNIXTIME_MICROS, value DOUBLE)
   // PRIMARY KEY (host, metric, time)
-  // DISTRIBUTE BY RANGE(time) SPLIT ROWS [(5), (10)],
+  // DISTRIBUTE BY RANGE(time) SPLIT ROWS [(10)],
   //               HASH(host, metric) INTO 2 BUCKETS;
   Schema schema({ ColumnSchema("host", STRING),
                   ColumnSchema("metric", STRING),
-                  ColumnSchema("time", TIMESTAMP),
+                  ColumnSchema("time", UNIXTIME_MICROS),
                   ColumnSchema("value", DOUBLE) },
                 { ColumnId(0), ColumnId(1), ColumnId(2), ColumnId(3) },
                 3);
@@ -544,11 +540,11 @@ TEST(TestPartitionPruner, TestPruning) {
   ASSERT_OK(PartitionSchema::FromPB(pb, schema, &partition_schema));
 
   KuduPartialRow split(&schema);
-  ASSERT_OK(split.SetTimestamp("time", 10));
+  ASSERT_OK(split.SetUnixTimeMicros("time", 10));
 
   vector<Partition> partitions;
   ASSERT_OK(partition_schema.CreatePartitions(vector<KuduPartialRow>{ move(split) },
-                                              schema, &partitions));
+                                              {}, schema, &partitions));
   ASSERT_EQ(4, partitions.size());
 
   // Applies the specified predicates to a scan and checks that the expected
@@ -604,10 +600,10 @@ TEST(TestPartitionPruner, TestPruning) {
 
   // host = "a"
   // metric = "a"
-  // timestamp = 10;
+  // timestamp >= 10;
   Check({ ColumnPredicate::Equality(schema.column(0), &a),
           ColumnPredicate::Equality(schema.column(1), &a),
-          ColumnPredicate::Equality(schema.column(2), &ten) },
+          ColumnPredicate::Range(schema.column(2), &ten, nullptr) },
         "", "",
         1);
 
@@ -626,12 +622,12 @@ TEST(TestPartitionPruner, TestPruning) {
   // partition key >= (hash=1)
   Check({}, string("\0\0\0\1", 4), "", 2);
 
-  // a = 10
+  // timestamp = 10
   // partition key < (hash=1)
   Check({ ColumnPredicate::Equality(schema.column(2), &ten) },
         "", string("\0\0\0\1", 4), 1);
 
-  // a = 10
+  // timestamp = 10
   // partition key >= (hash=1)
   Check({ ColumnPredicate::Equality(schema.column(2), &ten) },
         string("\0\0\0\1", 4), "", 1);

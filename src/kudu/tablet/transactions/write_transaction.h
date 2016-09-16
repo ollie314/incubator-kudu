@@ -18,6 +18,7 @@
 #ifndef KUDU_TABLET_WRITE_TRANSACTION_H_
 #define KUDU_TABLET_WRITE_TRANSACTION_H_
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -71,8 +72,9 @@ struct TabletComponents;
 // NOTE: this class isn't thread safe.
 class WriteTransactionState : public TransactionState {
  public:
-  WriteTransactionState(TabletPeer* tablet_peer = NULL,
-                        const tserver::WriteRequestPB *request = NULL,
+  WriteTransactionState(TabletPeer* tablet_peer,
+                        const tserver::WriteRequestPB *request,
+                        const rpc::RequestIdPB* request_id,
                         tserver::WriteResponsePB *response = NULL);
   virtual ~WriteTransactionState();
 
@@ -93,7 +95,7 @@ class WriteTransactionState : public TransactionState {
 
   // Returns the prepared response to the client that will be sent when this
   // transaction is completed, if this transaction was started by a client.
-  tserver::WriteResponsePB *response() OVERRIDE {
+  tserver::WriteResponsePB *response() const OVERRIDE {
     return response_;
   }
 
@@ -120,12 +122,12 @@ class WriteTransactionState : public TransactionState {
 
 
   void set_schema_at_decode_time(const Schema* schema) {
-    lock_guard<simple_spinlock> l(&txn_state_lock_);
+    std::lock_guard<simple_spinlock> l(txn_state_lock_);
     schema_at_decode_time_ = schema;
   }
 
   const Schema* schema_at_decode_time() const {
-    lock_guard<simple_spinlock> l(&txn_state_lock_);
+    std::lock_guard<simple_spinlock> l(txn_state_lock_);
     return schema_at_decode_time_;
   }
 
@@ -163,7 +165,7 @@ class WriteTransactionState : public TransactionState {
   }
 
   void swap_row_ops(std::vector<RowOp*>* new_ops) {
-    lock_guard<simple_spinlock> l(&txn_state_lock_);
+    std::lock_guard<simple_spinlock> l(txn_state_lock_);
     row_ops_.swap(*new_ops);
   }
 
@@ -184,9 +186,13 @@ class WriteTransactionState : public TransactionState {
   // from the request).
   void ResetRpcFields();
 
-  // pointers to the rpc context, request and response, lifecyle
-  // is managed by the rpc subsystem. These pointers maybe NULL if the
-  // transaction was not initiated by an RPC call.
+  // An owned version of the response, for follower transactions.
+  tserver::WriteResponsePB owned_response_;
+
+  // The lifecycle of these pointers request and response, is not managed by this class.
+  // These pointers are never null: 'request_' is always set on construction and 'response_' is
+  // either set to the response passed on the ctor, if there is one, or to point to
+  // 'owned_response_' if there isn't.
   const tserver::WriteRequestPB* request_;
   tserver::WriteResponsePB* response_;
 

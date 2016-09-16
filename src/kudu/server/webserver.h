@@ -17,14 +17,14 @@
 #ifndef KUDU_UTIL_WEBSERVER_H
 #define KUDU_UTIL_WEBSERVER_H
 
+#include <iosfwd>
 #include <map>
 #include <string>
 #include <vector>
-#include <boost/function.hpp>
-#include <boost/thread/shared_mutex.hpp>
 
 #include "kudu/server/webserver_options.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/rw_mutex.h"
 #include "kudu/util/status.h"
 #include "kudu/util/web_callback_registry.h"
 
@@ -102,11 +102,11 @@ class Webserver : public WebCallbackRegistry {
   Status BuildListenSpec(std::string* spec) const;
 
   // Renders a common Bootstrap-styled header
-  void BootstrapPageHeader(std::stringstream* output);
+  void BootstrapPageHeader(std::ostringstream* output);
 
   // Renders a common Bootstrap-styled footer. Must be used in conjunction with
   // BootstrapPageHeader.
-  void BootstrapPageFooter(std::stringstream* output);
+  void BootstrapPageFooter(std::ostringstream* output);
 
   // Dispatch point for all incoming requests.
   // Static so that it can act as a function pointer, and then call the next method
@@ -123,7 +123,7 @@ class Webserver : public WebCallbackRegistry {
                                       const char* message);
 
   // Registered to handle "/", and prints a list of available URIs
-  void RootHandler(const WebRequest& args, std::stringstream* output);
+  void RootHandler(const WebRequest& args, std::ostringstream* output);
 
   // Builds a map of argument name to argument value from a typical URL argument
   // string (that is, "key1=value1&key2=value2.."). If no value is given for a
@@ -133,7 +133,7 @@ class Webserver : public WebCallbackRegistry {
   const WebserverOptions opts_;
 
   // Lock guarding the path_handlers_ map and footer_html.
-  boost::shared_mutex lock_;
+  RWMutex lock_;
 
   // Map of path to a PathHandler containing a list of handlers for that
   // path. More than one handler may register itself with a path so that many

@@ -63,6 +63,9 @@ class TabletVisitor {
 //   as a "normal table", instead we have Master APIs to query the table.
 class SysCatalogTable {
  public:
+  // Magic ID of the system tablet.
+  static const char* const kSysCatalogTabletId;
+
   typedef Callback<Status()> ElectedLeaderCallback;
 
   enum CatalogEntryType {
@@ -134,15 +137,8 @@ class SysCatalogTable {
 
   // Use the master options to generate a new consensus configuration.
   // In addition, resolve all UUIDs of this consensus configuration.
-  //
-  // Note: The current node adds itself to the peers whether leader or
-  // follower, depending on whether the Master options leader flag is
-  // set. Even if the local node should be a follower, it should not be listed
-  // in the Master options followers list, as it will add itself automatically.
-  //
-  // TODO: Revisit this whole thing when integrating leader election.
-  Status SetupDistributedConfig(const MasterOptions& options,
-                                consensus::RaftConfigPB* committed_config);
+  Status CreateDistributedConfig(const MasterOptions& options,
+                                 consensus::RaftConfigPB* committed_config);
 
   const scoped_refptr<tablet::TabletPeer>& tablet_peer() const {
     return tablet_peer_;
@@ -193,7 +189,7 @@ class SysCatalogTable {
   // Special string injected into SyncWrite() random failures (if enabled).
   //
   // Only useful for tests.
-  static const char* kInjectedFailureStatusMsg;
+  static const char* const kInjectedFailureStatusMsg;
 
   // Table schema, without IDs, used to send messages to the TabletPeer
   Schema schema_;
@@ -208,7 +204,6 @@ class SysCatalogTable {
   Master* master_;
 
   ElectedLeaderCallback leader_cb_;
-  consensus::RaftPeerPB::Role old_role_;
 
   consensus::RaftPeerPB local_peer_pb_;
 };

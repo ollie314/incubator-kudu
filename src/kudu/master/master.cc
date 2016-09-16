@@ -36,13 +36,15 @@
 #include "kudu/rpc/service_if.h"
 #include "kudu/rpc/service_pool.h"
 #include "kudu/server/rpc_server.h"
-#include "kudu/tablet/maintenance_manager.h"
+#include "kudu/tserver/tablet_copy_service.h"
 #include "kudu/tserver/tablet_service.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/status.h"
 #include "kudu/util/threadpool.h"
+#include "kudu/util/version_info.h"
 
 DEFINE_int32(master_registration_rpc_timeout_ms, 1500,
              "Timeout for retrieving master registration over RPC.");
@@ -55,6 +57,7 @@ using std::vector;
 using kudu::consensus::RaftPeerPB;
 using kudu::rpc::ServiceIf;
 using kudu::tserver::ConsensusServiceImpl;
+using kudu::tserver::TabletCopyServiceImpl;
 using strings::Substitute;
 
 namespace kudu {
@@ -110,11 +113,14 @@ Status Master::StartAsync() {
   RETURN_NOT_OK(maintenance_manager_->Init());
 
   gscoped_ptr<ServiceIf> impl(new MasterServiceImpl(this));
-  gscoped_ptr<ServiceIf> consensus_service(new ConsensusServiceImpl(metric_entity(),
-                                                                    catalog_manager_.get()));
+  gscoped_ptr<ServiceIf> consensus_service(new ConsensusServiceImpl(
+      metric_entity(), result_tracker(), catalog_manager_.get()));
+  gscoped_ptr<ServiceIf> tablet_copy_service(new TabletCopyServiceImpl(
+      fs_manager_.get(), catalog_manager_.get(), metric_entity(), result_tracker()));
 
   RETURN_NOT_OK(ServerBase::RegisterService(std::move(impl)));
   RETURN_NOT_OK(ServerBase::RegisterService(std::move(consensus_service)));
+  RETURN_NOT_OK(ServerBase::RegisterService(std::move(tablet_copy_service)));
   RETURN_NOT_OK(ServerBase::Start());
 
   // Now that we've bound, construct our ServerRegistrationPB.
@@ -154,17 +160,19 @@ Status Master::WaitForCatalogManagerInit() {
 
 Status Master::WaitUntilCatalogManagerIsLeaderAndReadyForTests(const MonoDelta& timeout) {
   Status s;
-  MonoTime start = MonoTime::Now(MonoTime::FINE);
+  MonoTime start = MonoTime::Now();
   int backoff_ms = 1;
   const int kMaxBackoffMs = 256;
   do {
-    s = catalog_manager_->CheckIsLeaderAndReady();
-    if (s.ok()) {
-      return Status::OK();
+    {
+      CatalogManager::ScopedLeaderSharedLock l(catalog_manager_.get());
+      if (l.first_failed_status().ok()) {
+        return Status::OK();
+      }
     }
     SleepFor(MonoDelta::FromMilliseconds(backoff_ms));
     backoff_ms = min(backoff_ms << 1, kMaxBackoffMs);
-  } while (MonoTime::Now(MonoTime::FINE).GetDeltaSince(start).LessThan(timeout));
+  } while (MonoTime::Now() < (start + timeout));
   return Status::TimedOut("Maximum time exceeded waiting for master leadership",
                           s.ToString());
 }
@@ -200,6 +208,7 @@ Status Master::InitMasterRegistration() {
   vector<Sockaddr> http_addrs;
   web_server()->GetBoundAddresses(&http_addrs);
   RETURN_NOT_OK(AddHostPortPBs(http_addrs, reg.mutable_http_addresses()));
+  reg.set_software_version(VersionInfo::GetShortVersionString());
 
   registration_.Swap(&reg);
   registration_initialized_.store(true);

@@ -226,8 +226,11 @@ if ("${COMPILER_FAMILY}" STREQUAL "clang")
   #
   # This test is imperfect because 'cmake' and 'make' can be run independently
   # (with different terminal options), and we're testing during the former.
+  #
+  # We also provide a manual override as -DKUDU_FORCE_COLOR_DIAGNOSTICS=1.
   execute_process(COMMAND test -t 2 RESULT_VARIABLE KUDU_IS_TTY)
-  if ((${KUDU_IS_TTY} EQUAL 0) AND (NOT ("$ENV{TERM}" STREQUAL "dumb")))
+  if ((NOT "${KUDU_FORCE_COLOR_DIAGNOSTICS}" STREQUAL "") OR
+      ((${KUDU_IS_TTY} EQUAL 0) AND (NOT ("$ENV{TERM}" STREQUAL "dumb"))))
     message("Running in a controlling terminal")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcolor-diagnostics")
   else()
@@ -450,6 +453,15 @@ include_directories(src)
 # For generate_export_header() and add_compiler_export_flags().
 include(GenerateExportHeader)
 
+# Honor visibility properties for all target types. See
+# "cmake --help-policy CMP0063" for details.
+#
+# This policy was only added to cmake in version 3.3, so until the cmake in
+# thirdparty is updated, we must check if the policy exists before setting it.
+if(POLICY CMP0063)
+  cmake_policy(SET CMP0063 NEW)
+endif()
+
 # add_library() wrapper that adds a second variant of the library for use in the
 # exported Kudu C++ client. This variant is suffixed with "_exported" and is
 # compiled with special visibility flags to hide all symbols except those that
@@ -525,7 +537,16 @@ function(ADD_EXPORTABLE_LIBRARY LIB_NAME)
   # - default for classes annotated with KUDU_EXPORT.
   # - hidden for classes annotated with KUDU_NO_EXPORT.
   # - hidden for everything else.
+if(POLICY CMP0063)
+  set_target_properties(${EXPORTED_LIB_NAME}
+    PROPERTIES C_VISIBILITY_PRESET hidden)
+  set_target_properties(${EXPORTED_LIB_NAME}
+    PROPERTIES CXX_VISIBILITY_PRESET hidden)
+  set_target_properties(${EXPORTED_LIB_NAME}
+    PROPERTIES VISIBILITY_INLINES_HIDDEN 1)
+else()
   add_compiler_export_flags(EXPORTED_FLAGS)
+endif()
 
   # Exported variants are either static archives that will be linked to a shared
   # object, or shared objects. Either way, -fPIC is needed.
@@ -854,58 +875,39 @@ if (NOT APPLE)
   endif()
   ADD_THIRDPARTY_LIB(rt
     SHARED_LIB "${RT_LIB_PATH}")
+
+  find_library(DL_LIB_PATH dl)
+  if(NOT DL_LIB_PATH)
+    message(FATAL_ERROR "Could not find libdl on the system path")
+  endif()
+  ADD_THIRDPARTY_LIB(dl
+    SHARED_LIB "${DL_LIB_PATH}")
 endif()
 
 ## Boost
-# It's important that Boost come last in the list of packages, because it's the only
-# dependency that we don't currently bundle in thirdparty/. If we put this earlier
-# in list, then we might end up with /usr/local/include taking precedence over
-# thirdparty/installed/include and pulling in the wrong version of other dependencies
-# that might be installed in the system.
 
-### Workaround for http://stackoverflow.com/questions/9948375/cmake-find-package-succeeds-but-returns-wrong-path
+# The boost-cmake project hasn't been maintained for years. Let's make sure we
+# don't accidentally use it if it can be found.
 set(Boost_NO_BOOST_CMAKE ON)
 
-# Find Boost static libraries.
-set(Boost_USE_STATIC_LIBS ON)
-find_package(Boost COMPONENTS system thread REQUIRED)
-set(BOOST_STATIC_LIBS ${Boost_LIBRARIES})
-list(LENGTH BOOST_STATIC_LIBS BOOST_STATIC_LIBS_LEN)
-list(SORT BOOST_STATIC_LIBS)
+# Look for Boost in thirdparty only.
+set(BOOST_ROOT ${THIRDPARTY_PREFIX})
 
-# Find Boost shared libraries.
-set(Boost_USE_STATIC_LIBS OFF)
-find_package(Boost COMPONENTS system thread REQUIRED)
-set(BOOST_SHARED_LIBS ${Boost_LIBRARIES})
-list(LENGTH BOOST_SHARED_LIBS BOOST_SHARED_LIBS_LEN)
-list(SORT BOOST_SHARED_LIBS)
-
-# We should have found the same number of libraries both times.
-if(NOT ${BOOST_SHARED_LIBS_LEN} EQUAL ${BOOST_STATIC_LIBS_LEN})
-  set(ERROR_MSG "Boost static and shared libraries are inconsistent.")
-  set(ERROR_MSG "${ERROR_MSG} Static libraries: ${BOOST_STATIC_LIBS}.")
-  set(ERROR_MSG "${ERROR_MSG} Shared libraries: ${BOOST_SHARED_LIBS}.")
-  message(FATAL_ERROR "${ERROR_MSG}")
+# As of cmake 3.5, there's still no way to force FindBoost.cmake to omit system
+# paths from its search. No combination of Boost_NO_SYSTEM_PATHS, BOOST_ROOT, or
+# BOOST_INCLUDEDIR does the trick; the best they can do is ensure the system
+# paths are searched last.
+#
+# To prevent system boost installations from being picked up, we'll work around
+# this ourselves by checking the prefix of Boost_INCLUDE_DIR.
+find_package(Boost REQUIRED)
+string(FIND ${Boost_INCLUDE_DIR} ${BOOST_ROOT} BOOST_ROOT_IDX_FOUND)
+if(${BOOST_ROOT_IDX_FOUND} EQUAL 0)
+  message(STATUS "Boost location: ${Boost_INCLUDE_DIR}")
+else()
+  message(FATAL_ERROR "Error: chose Boost outside ${BOOST_ROOT}: ${Boost_INCLUDE_DIR}")
 endif()
-
-# Add each pair of static/shared libraries.
-math(EXPR LAST_IDX "${BOOST_STATIC_LIBS_LEN} - 1")
-foreach(IDX RANGE ${LAST_IDX})
-  list(GET BOOST_STATIC_LIBS ${IDX} BOOST_STATIC_LIB)
-  list(GET BOOST_SHARED_LIBS ${IDX} BOOST_SHARED_LIB)
-
-  # Remove the prefix/suffix from the library name.
-  #
-  # e.g. libboost_system-mt --> boost_system
-  get_filename_component(LIB_NAME ${BOOST_STATIC_LIB} NAME_WE)
-  string(REGEX REPLACE "lib([^-]*)(-mt)?" "\\1" LIB_NAME_NO_PREFIX_SUFFIX ${LIB_NAME})
-  ADD_THIRDPARTY_LIB(${LIB_NAME_NO_PREFIX_SUFFIX}
-    STATIC_LIB "${BOOST_STATIC_LIB}"
-    SHARED_LIB "${BOOST_SHARED_LIB}")
-  list(APPEND KUDU_BASE_LIBS ${LIB_NAME_NO_PREFIX_SUFFIX})
-endforeach()
 include_directories(SYSTEM ${Boost_INCLUDE_DIR})
-
 
 ############################################################
 # Linker setup
@@ -969,11 +971,56 @@ if (UNIX)
 endif (UNIX)
 
 ############################################################
-# "make site" target
+# "make doxygen" target
+# Needs the doxygen system package to work.
 ############################################################
 if (UNIX)
-  add_custom_target(site
-    ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh)
+  find_package(Doxygen)
+  if (NOT (DOXYGEN_FOUND AND DOXYGEN_DOT_FOUND))
+    message(WARNING "Doxygen with Dot support (graphviz) not found: 'doxygen' target is not available")
+  else ()
+    set(DOXY_SUBDIR ${CMAKE_CURRENT_BINARY_DIR}/docs/doxygen)
+    set(DOXY_CLIENT_DESTDIR ${DOXY_SUBDIR}/tmp.client)
+    set(DOXY_CLIENT_API_CFG ${DOXY_SUBDIR}/client_api.doxy)
+    set(DOXY_CLIENT_API_FOOTER ${DOXY_SUBDIR}/client_api.footer)
+    set(DOXY_CLIENT_API_OUTDIR ${DOXY_SUBDIR}/client_api)
+    list(APPEND DOXY_CLIENT_API_EXCLUDE
+      "share/doc/kuduClient/samples/sample.cc")
+    # NOTE: DOXY_CLIENT_API_OUTDIR and DOXY_CLIENT_API_FOOTER are used
+    #       in client_api.doxy.in template file
+    configure_file(docs/support/doxygen/client_api.doxy.in ${DOXY_CLIENT_API_CFG} @ONLY)
+    configure_file(docs/support/doxygen/client_api.footer.in ${DOXY_CLIENT_API_FOOTER} @ONLY)
+    add_custom_target(doxy_install_client_alt_destdir
+      COMMAND ${CMAKE_COMMAND} -E remove_directory ${DOXY_CLIENT_DESTDIR}
+      COMMAND DESTDIR=${DOXY_CLIENT_DESTDIR} ${CMAKE_MAKE_PROGRAM} install
+      COMMENT "Installing Kudu client files into temporary destroot"
+    )
+    add_custom_target(doxygen
+      COMMAND ${DOXYGEN_EXECUTABLE} ${DOXY_CLIENT_API_CFG}
+      WORKING_DIRECTORY ${DOXY_CLIENT_DESTDIR}/${CMAKE_INSTALL_PREFIX}
+      COMMENT "Generating Kudu C++ client API documentation"
+    )
+    add_dependencies(doxy_install_client_alt_destdir kudu_client_exported)
+    add_dependencies(doxygen doxy_install_client_alt_destdir)
+    # If doxygen is present, generate doxygen documentation along with 'docs'.
+    add_dependencies(docs doxygen)
+  endif ()
+endif (UNIX)
+
+############################################################
+# "make site" target
+#
+# NOTE: It's supposed find_package(Doxygen) has already
+# been run at this point.
+############################################################
+if (UNIX)
+  if (NOT DOXYGEN_FOUND)
+    add_custom_target(site
+      ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh)
+  else ()
+    add_custom_target(site
+      ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh doxygen)
+  endif ()
 endif (UNIX)
 
 ############################################################

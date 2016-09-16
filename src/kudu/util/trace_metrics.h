@@ -17,10 +17,12 @@
 #pragma once
 
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/map-util.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/locks.h"
 
 #include <map>
+#include <mutex>
 #include <string>
 
 namespace kudu {
@@ -64,6 +66,12 @@ class TraceMetrics {
     tcmalloc_contention_cycles_.IncrementBy(cycles);
   }
 
+  // Return metric's current value.
+  //
+  // NOTE: the 'name' MUST be the same const char* which is used for
+  // insertion. This is because we do pointer-wise comparison internally.
+  int64_t GetMetric(const char* name) const;
+
  private:
   mutable simple_spinlock lock_;
   std::map<const char*, int64_t> counters_;
@@ -73,12 +81,12 @@ class TraceMetrics {
 };
 
 inline void TraceMetrics::Increment(const char* name, int64_t amount) {
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   counters_[name] += amount;
 }
 
 inline std::map<const char*, int64_t> TraceMetrics::Get() const {
-  unique_lock<simple_spinlock> l(&lock_);
+  std::unique_lock<simple_spinlock> l(lock_);
   auto m = counters_;
   l.unlock();
 
@@ -87,6 +95,11 @@ inline std::map<const char*, int64_t> TraceMetrics::Get() const {
     m["tcmalloc_contention_cycles"] = v;
   }
   return m;
+}
+
+inline int64_t TraceMetrics::GetMetric(const char* name) const {
+  std::lock_guard<simple_spinlock> l(lock_);
+  return FindWithDefault(counters_, name, 0);
 }
 
 } // namespace kudu

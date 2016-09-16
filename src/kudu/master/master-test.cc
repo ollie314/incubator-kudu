@@ -19,10 +19,13 @@
 
 #include <algorithm>
 #include <memory>
+#include <utility>
+#include <thread>
 #include <vector>
 
 #include "kudu/common/partial_row.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/generated/version_defines.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.proxy.h"
@@ -39,8 +42,10 @@
 using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
 using kudu::rpc::RpcController;
+using std::pair;
 using std::shared_ptr;
 using std::string;
+using std::thread;
 using strings::Substitute;
 
 DECLARE_bool(catalog_manager_check_ts_count_for_create_table);
@@ -81,7 +86,8 @@ class MasterTest : public KuduTest {
                      const Schema& schema);
   Status CreateTable(const string& table_name,
                      const Schema& schema,
-                     const vector<KuduPartialRow>& split_rows);
+                     const vector<KuduPartialRow>& split_rows,
+                     const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds);
 
   shared_ptr<Messenger> client_messenger_;
   gscoped_ptr<MiniMaster> mini_master_;
@@ -125,8 +131,10 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     req.mutable_common()->CopyFrom(common);
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
 
+    ASSERT_TRUE(resp.leader_master());
     ASSERT_TRUE(resp.needs_reregister());
     ASSERT_TRUE(resp.needs_full_tablet_report());
+    ASSERT_FALSE(resp.has_tablet_report());
   }
 
   vector<shared_ptr<TSDescriptor> > descs;
@@ -137,7 +145,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
   ASSERT_FALSE(master_->ts_manager()->LookupTSByUUID(kTsUUID, &ts_desc));
 
   // Register the fake TS, without sending any tablet report.
-  TSRegistrationPB fake_reg;
+  ServerRegistrationPB fake_reg;
   MakeHostPortPB("localhost", 1000, fake_reg.add_rpc_addresses());
   MakeHostPortPB("localhost", 2000, fake_reg.add_http_addresses());
 
@@ -149,14 +157,15 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     req.mutable_registration()->CopyFrom(fake_reg);
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
 
+    ASSERT_TRUE(resp.leader_master());
     ASSERT_FALSE(resp.needs_reregister());
-    ASSERT_TRUE(resp.needs_full_tablet_report());
+    ASSERT_FALSE(resp.needs_full_tablet_report());
+    ASSERT_FALSE(resp.has_tablet_report());
   }
 
-  descs.clear();
   master_->ts_manager()->GetAllDescriptors(&descs);
   ASSERT_EQ(1, descs.size()) << "Should have registered the TS";
-  TSRegistrationPB reg;
+  ServerRegistrationPB reg;
   descs[0]->GetRegistration(&reg);
   ASSERT_EQ(fake_reg.DebugString(), reg.DebugString()) << "Master got different registration";
 
@@ -174,11 +183,50 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     req.mutable_registration()->CopyFrom(fake_reg);
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
 
+    ASSERT_TRUE(resp.leader_master());
     ASSERT_FALSE(resp.needs_reregister());
-    ASSERT_TRUE(resp.needs_full_tablet_report());
+    ASSERT_FALSE(resp.needs_full_tablet_report());
+    ASSERT_FALSE(resp.has_tablet_report());
   }
 
-  // Now send a tablet report
+  // If we send the registration RPC while the master isn't the leader, it
+  // shouldn't ask for a full tablet report.
+  {
+    CatalogManager::ScopedLeaderDisablerForTests o(master_->catalog_manager());
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    req.mutable_common()->CopyFrom(common);
+    req.mutable_registration()->CopyFrom(fake_reg);
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+
+    ASSERT_FALSE(resp.leader_master());
+    ASSERT_FALSE(resp.needs_reregister());
+    ASSERT_FALSE(resp.needs_full_tablet_report());
+    ASSERT_FALSE(resp.has_tablet_report());
+  }
+
+  // Send a full tablet report, but with the master as a follower. The
+  // report will be ignored.
+  {
+    CatalogManager::ScopedLeaderDisablerForTests o(master_->catalog_manager());
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    req.mutable_common()->CopyFrom(common);
+    TabletReportPB* tr = req.mutable_tablet_report();
+    tr->set_is_incremental(false);
+    tr->set_sequence_number(0);
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+
+    ASSERT_FALSE(resp.leader_master());
+    ASSERT_FALSE(resp.needs_reregister());
+    ASSERT_FALSE(resp.needs_full_tablet_report());
+    ASSERT_FALSE(resp.has_tablet_report());
+  }
+
+  // Now send a full report with the master as leader. The master will process
+  // it; this is reflected in the response.
   {
     TSHeartbeatRequestPB req;
     TSHeartbeatResponsePB resp;
@@ -189,11 +237,29 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     tr->set_sequence_number(0);
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
 
+    ASSERT_TRUE(resp.leader_master());
     ASSERT_FALSE(resp.needs_reregister());
     ASSERT_FALSE(resp.needs_full_tablet_report());
+    ASSERT_TRUE(resp.has_tablet_report());
   }
 
-  descs.clear();
+  // Having sent a full report, an incremental report will also be processed.
+  {
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    req.mutable_common()->CopyFrom(common);
+    TabletReportPB* tr = req.mutable_tablet_report();
+    tr->set_is_incremental(true);
+    tr->set_sequence_number(0);
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+
+    ASSERT_TRUE(resp.leader_master());
+    ASSERT_FALSE(resp.needs_reregister());
+    ASSERT_FALSE(resp.needs_full_tablet_report());
+    ASSERT_TRUE(resp.has_tablet_report());
+  }
+
   master_->ts_manager()->GetAllDescriptors(&descs);
   ASSERT_EQ(1, descs.size()) << "Should still only have one TS registered";
 
@@ -210,6 +276,20 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     ASSERT_EQ(1, resp.servers_size());
     ASSERT_EQ("my-ts-uuid", resp.servers(0).instance_id().permanent_uuid());
     ASSERT_EQ(1, resp.servers(0).instance_id().instance_seqno());
+  }
+
+  // Ensure that trying to re-register with a different version is OK.
+  {
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    req.mutable_common()->CopyFrom(common);
+    req.mutable_registration()->CopyFrom(fake_reg);
+    // This string should never match the actual VersionInfo string, although
+    // the numeric portion will match.
+    req.mutable_registration()->set_software_version(Substitute("kudu $0 (rev SOME_NON_GIT_HASH)",
+                                                                KUDU_VERSION_STRING));
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
   }
 
   // Ensure that trying to re-register with a different port fails.
@@ -236,12 +316,13 @@ Status MasterTest::CreateTable(const string& table_name,
   KuduPartialRow split2(&schema);
   RETURN_NOT_OK(split2.SetInt32("key", 20));
 
-  return CreateTable(table_name, schema, { split1, split2 });
+  return CreateTable(table_name, schema, { split1, split2 }, {});
 }
 
 Status MasterTest::CreateTable(const string& table_name,
                                const Schema& schema,
-                               const vector<KuduPartialRow>& split_rows) {
+                               const vector<KuduPartialRow>& split_rows,
+                               const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds) {
 
   CreateTableRequestPB req;
   CreateTableResponsePB resp;
@@ -249,9 +330,17 @@ Status MasterTest::CreateTable(const string& table_name,
 
   req.set_name(table_name);
   RETURN_NOT_OK(SchemaToPB(schema, req.mutable_schema()));
-  RowOperationsPBEncoder encoder(req.mutable_split_rows());
+  RowOperationsPBEncoder encoder(req.mutable_split_rows_range_bounds());
   for (const KuduPartialRow& row : split_rows) {
     encoder.Add(RowOperationsPB::SPLIT_ROW, row);
+  }
+  for (const pair<KuduPartialRow, KuduPartialRow>& bound : bounds) {
+    encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, bound.first);
+    encoder.Add(RowOperationsPB::RANGE_UPPER_BOUND, bound.second);
+  }
+
+  if (!bounds.empty()) {
+    controller.RequireServerFeature(MasterFeatures::RANGE_PARTITION_BOUNDS);
   }
 
   RETURN_NOT_OK(proxy_->CreateTable(req, &resp, &controller));
@@ -356,43 +445,136 @@ TEST_F(MasterTest, TestCatalog) {
   }
 }
 
-TEST_F(MasterTest, TestCreateTableCheckSplitRows) {
+TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
   const char *kTableName = "testtb";
   const Schema kTableSchema({ ColumnSchema("key", INT32), ColumnSchema("val", INT32) }, 1);
 
   // No duplicate split rows.
   {
-    KuduPartialRow split1 = KuduPartialRow(&kTableSchema);
+    KuduPartialRow split1(&kTableSchema);
     ASSERT_OK(split1.SetInt32("key", 1));
     KuduPartialRow split2(&kTableSchema);
     ASSERT_OK(split2.SetInt32("key", 2));
-    Status s = CreateTable(kTableName, kTableSchema, { split1, split1, split2 });
+    Status s = CreateTable(kTableName, kTableSchema, { split1, split1, split2 }, {});
     ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
-    ASSERT_STR_CONTAINS(s.ToString(), "Duplicate split row");
+    ASSERT_STR_CONTAINS(s.ToString(), "duplicate split row");
   }
 
   // No empty split rows.
   {
-    KuduPartialRow split1 = KuduPartialRow(&kTableSchema);
+    KuduPartialRow split1(&kTableSchema);
     ASSERT_OK(split1.SetInt32("key", 1));
     KuduPartialRow split2(&kTableSchema);
-    Status s = CreateTable(kTableName, kTableSchema, { split1, split2 });
+    Status s = CreateTable(kTableName, kTableSchema, { split1, split2 }, {});
     ASSERT_TRUE(s.IsInvalidArgument());
     ASSERT_STR_CONTAINS(s.ToString(),
-                        "Invalid argument: Split rows must contain a value for at "
+                        "Invalid argument: split rows must contain a value for at "
                         "least one range partition column");
   }
 
-  // No non-range columns
+  // No non-range columns.
   {
-    KuduPartialRow split = KuduPartialRow(&kTableSchema);
+    KuduPartialRow split(&kTableSchema);
     ASSERT_OK(split.SetInt32("key", 1));
     ASSERT_OK(split.SetInt32("val", 1));
-    Status s = CreateTable(kTableName, kTableSchema, { split });
+    Status s = CreateTable(kTableName, kTableSchema, { split }, {});
     ASSERT_TRUE(s.IsInvalidArgument());
     ASSERT_STR_CONTAINS(s.ToString(),
-                        "Invalid argument: Split rows may only contain values "
+                        "Invalid argument: split rows may only contain values "
                         "for range partitioned columns: val")
+  }
+
+  { // Overlapping bounds.
+    KuduPartialRow a_lower(&kTableSchema);
+    KuduPartialRow a_upper(&kTableSchema);
+    KuduPartialRow b_lower(&kTableSchema);
+    KuduPartialRow b_upper(&kTableSchema);
+    ASSERT_OK(a_lower.SetInt32("key", 0));
+    ASSERT_OK(a_upper.SetInt32("key", 100));
+    ASSERT_OK(b_lower.SetInt32("key", 50));
+    ASSERT_OK(b_upper.SetInt32("key", 150));
+    Status s = CreateTable(kTableName, kTableSchema, { }, { { a_lower, a_upper },
+                                                            { b_lower, b_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_STR_CONTAINS(s.ToString(), "Invalid argument: overlapping range partition");
+  }
+  { // Split row out of bounds (above).
+    KuduPartialRow bound_lower(&kTableSchema);
+    KuduPartialRow bound_upper(&kTableSchema);
+    ASSERT_OK(bound_lower.SetInt32("key", 0));
+    ASSERT_OK(bound_upper.SetInt32("key", 150));
+
+    KuduPartialRow split(&kTableSchema);
+    ASSERT_OK(split.SetInt32("key", 200));
+
+    Status s = CreateTable(kTableName, kTableSchema, { split },
+                           { { bound_lower, bound_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_STR_CONTAINS(s.ToString(), "Invalid argument: split out of bounds");
+  }
+  { // Split row out of bounds (below).
+    KuduPartialRow bound_lower(&kTableSchema);
+    KuduPartialRow bound_upper(&kTableSchema);
+    ASSERT_OK(bound_lower.SetInt32("key", 0));
+    ASSERT_OK(bound_upper.SetInt32("key", 150));
+
+    KuduPartialRow split(&kTableSchema);
+    ASSERT_OK(split.SetInt32("key", -120));
+
+    Status s = CreateTable(kTableName, kTableSchema, { split },
+                           { { bound_lower, bound_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_STR_CONTAINS(s.ToString(), "Invalid argument: split out of bounds");
+  }
+  { // Lower bound greater than upper bound.
+    KuduPartialRow bound_lower(&kTableSchema);
+    KuduPartialRow bound_upper(&kTableSchema);
+    ASSERT_OK(bound_lower.SetInt32("key", 150));
+    ASSERT_OK(bound_upper.SetInt32("key", 0));
+
+    Status s = CreateTable(kTableName, kTableSchema, { }, { { bound_lower, bound_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "Invalid argument: range partition lower bound must be "
+                        "less than or equal to the upper bound");
+  }
+  { // Lower bound equals upper bound.
+    KuduPartialRow bound_lower(&kTableSchema);
+    KuduPartialRow bound_upper(&kTableSchema);
+    ASSERT_OK(bound_lower.SetInt32("key", 0));
+    ASSERT_OK(bound_upper.SetInt32("key", 0));
+
+    Status s = CreateTable(kTableName, kTableSchema, { }, { { bound_lower, bound_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "Invalid argument: range partition lower bound must be "
+                        "less than or equal to the upper bound");
+  }
+  { // Split equals lower bound
+    KuduPartialRow bound_lower(&kTableSchema);
+    KuduPartialRow bound_upper(&kTableSchema);
+    ASSERT_OK(bound_lower.SetInt32("key", 0));
+    ASSERT_OK(bound_upper.SetInt32("key", 10));
+
+    KuduPartialRow split(&kTableSchema);
+    ASSERT_OK(split.SetInt32("key", 0));
+
+    Status s = CreateTable(kTableName, kTableSchema, { split }, { { bound_lower, bound_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_STR_CONTAINS(s.ToString(), "Invalid argument: split matches lower or upper bound");
+  }
+  { // Split equals upper bound
+    KuduPartialRow bound_lower(&kTableSchema);
+    KuduPartialRow bound_upper(&kTableSchema);
+    ASSERT_OK(bound_lower.SetInt32("key", 0));
+    ASSERT_OK(bound_upper.SetInt32("key", 10));
+
+    KuduPartialRow split(&kTableSchema);
+    ASSERT_OK(split.SetInt32("key", 10));
+
+    Status s = CreateTable(kTableName, kTableSchema, { split }, { { bound_lower, bound_upper } });
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_STR_CONTAINS(s.ToString(), "Invalid argument: split matches lower or upper bound");
   }
 }
 
@@ -401,7 +583,7 @@ TEST_F(MasterTest, TestCreateTableInvalidKeyType) {
 
   {
     const Schema kTableSchema({ ColumnSchema("key", BOOL) }, 1);
-    Status s = CreateTable(kTableName, kTableSchema, vector<KuduPartialRow>());
+    Status s = CreateTable(kTableName, kTableSchema, vector<KuduPartialRow>(), {});
     ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
         "Key column may not have type of BOOL, FLOAT, or DOUBLE");
@@ -409,7 +591,7 @@ TEST_F(MasterTest, TestCreateTableInvalidKeyType) {
 
   {
     const Schema kTableSchema({ ColumnSchema("key", FLOAT) }, 1);
-    Status s = CreateTable(kTableName, kTableSchema, vector<KuduPartialRow>());
+    Status s = CreateTable(kTableName, kTableSchema, vector<KuduPartialRow>(), {});
     ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
         "Key column may not have type of BOOL, FLOAT, or DOUBLE");
@@ -417,7 +599,7 @@ TEST_F(MasterTest, TestCreateTableInvalidKeyType) {
 
   {
     const Schema kTableSchema({ ColumnSchema("key", DOUBLE) }, 1);
-    Status s = CreateTable(kTableName, kTableSchema, vector<KuduPartialRow>());
+    Status s = CreateTable(kTableName, kTableSchema, vector<KuduPartialRow>(), {});
     ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
         "Key column may not have type of BOOL, FLOAT, or DOUBLE");
@@ -478,40 +660,36 @@ TEST_F(MasterTest, TestShutdownDuringTableVisit) {
   // CatalogManager::VisitTablesAndTabletsTask.
 }
 
-static void GetTableSchema(const char* kTableName,
-                           const Schema* kSchema,
-                           MasterServiceProxy* proxy,
-                           CountDownLatch* started,
-                           AtomicBool* done) {
-  GetTableSchemaRequestPB req;
-  GetTableSchemaResponsePB resp;
-  req.mutable_table()->set_table_name(kTableName);
+// Tests that the catalog manager handles spurious calls to ElectedAsLeaderCb()
+// (i.e. those without a term change) correctly by ignoring them. If they
+// aren't ignored, a concurrent GetTableLocations() call may trigger a
+// use-after-free.
+TEST_F(MasterTest, TestGetTableLocationsDuringRepeatedTableVisit) {
+  const char* kTableName = "test";
+  Schema schema({ ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, schema));
 
-  started->CountDown();
-  while (!done->Load()) {
-    RpcController controller;
+  AtomicBool done(false);
 
-    CHECK_OK(proxy->GetTableSchema(req, &resp, &controller));
-    SCOPED_TRACE(resp.DebugString());
+  // Hammers the master with GetTableLocations() calls.
+  thread t([&]() {
+    GetTableLocationsRequestPB req;
+    GetTableLocationsResponsePB resp;
+    req.mutable_table()->set_table_name(kTableName);
 
-    // There are two possible outcomes:
-    //
-    // 1. GetTableSchema() happened before CreateTable(): we expect to see a
-    //    TABLE_NOT_FOUND error.
-    // 2. GetTableSchema() happened after CreateTable(): we expect to see the
-    //    full table schema.
-    //
-    // Any other outcome is an error.
-    if (resp.has_error()) {
-      CHECK_EQ(MasterErrorPB::TABLE_NOT_FOUND, resp.error().code());
-    } else {
-      Schema receivedSchema;
-      CHECK_OK(SchemaFromPB(resp.schema(), &receivedSchema));
-      CHECK(kSchema->Equals(receivedSchema)) <<
-          strings::Substitute("$0 not equal to $1",
-                              kSchema->ToString(), receivedSchema.ToString());
+    while (!done.Load()) {
+      RpcController controller;
+      CHECK_OK(proxy_->GetTableLocations(req, &resp, &controller));
     }
+  });
+
+  // Call ElectedAsLeaderCb() repeatedly. If these spurious calls aren't
+  // ignored, the concurrent GetTableLocations() calls may crash the master.
+  for (int i = 0; i < 100; i++) {
+    master_->catalog_manager()->ElectedAsLeaderCb();
   }
+  done.Store(true);
+  t.join();
 }
 
 // The catalog manager had a bug wherein GetTableSchema() interleaved with
@@ -527,18 +705,47 @@ TEST_F(MasterTest, TestGetTableSchemaIsAtomicWithCreateTable) {
   CountDownLatch started(1);
   AtomicBool done(false);
 
-  // Kick off a thread that calls GetTableSchema() in a loop.
-  scoped_refptr<Thread> t;
-  ASSERT_OK(Thread::Create("test", "test",
-                           &GetTableSchema, kTableName, &kTableSchema,
-                           proxy_.get(), &started, &done, &t));
+  // Kick off a thread that hammers the master with GetTableSchema() calls,
+  // checking that the results make sense.
+  thread t([&]() {
+    GetTableSchemaRequestPB req;
+    GetTableSchemaResponsePB resp;
+    req.mutable_table()->set_table_name(kTableName);
+
+    started.CountDown();
+    while (!done.Load()) {
+      RpcController controller;
+
+      CHECK_OK(proxy_->GetTableSchema(req, &resp, &controller));
+      SCOPED_TRACE(resp.DebugString());
+
+      // There are two possible outcomes:
+      //
+      // 1. GetTableSchema() happened before CreateTable(): we expect to see a
+      //    TABLE_NOT_FOUND error.
+      // 2. GetTableSchema() happened after CreateTable(): we expect to see the
+      //    full table schema.
+      //
+      // Any other outcome is an error.
+      if (resp.has_error()) {
+        CHECK_EQ(MasterErrorPB::TABLE_NOT_FOUND, resp.error().code());
+      } else {
+        Schema receivedSchema;
+        CHECK_OK(SchemaFromPB(resp.schema(), &receivedSchema));
+        CHECK(kTableSchema.Equals(receivedSchema)) <<
+            strings::Substitute("$0 not equal to $1",
+                                kTableSchema.ToString(), receivedSchema.ToString());
+        CHECK_EQ(kTableName, resp.table_name());
+      }
+    }
+  });
 
   // Only create the table after the thread has started.
   started.Wait();
   EXPECT_OK(CreateTable(kTableName, kTableSchema));
 
   done.Store(true);
-  t->Join();
+  t.join();
 }
 
 // Verifies that on-disk master metadata is self-consistent and matches a set
@@ -728,9 +935,8 @@ TEST_F(MasterTest, TestMasterMetadataConsistentDespiteFailures) {
 
   // Spend some time hammering the master with create/alter/delete operations.
   MonoDelta time_to_run = MonoDelta::FromSeconds(AllowSlowTests() ? 10 : 1);
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(time_to_run);
-  while (MonoTime::Now(MonoTime::FINE).ComesBefore(deadline)) {
+  MonoTime deadline = MonoTime::Now() + time_to_run;
+  while (MonoTime::Now() < deadline) {
     int next_action = r.Uniform(3);
     switch (next_action) {
       case 0:
@@ -744,7 +950,7 @@ TEST_F(MasterTest, TestMasterMetadataConsistentDespiteFailures) {
 
         req.set_name(Substitute("table-$0", r.Uniform(kUniformBound)));
         ASSERT_OK(SchemaToPB(kTableSchema, req.mutable_schema()));
-        RowOperationsPBEncoder encoder(req.mutable_split_rows());
+        RowOperationsPBEncoder encoder(req.mutable_split_rows_range_bounds());
         KuduPartialRow row(&kTableSchema);
         ASSERT_OK(row.SetInt32("key", 10));
         encoder.Add(RowOperationsPB::SPLIT_ROW, row);
@@ -846,42 +1052,6 @@ TEST_F(MasterTest, TestMasterMetadataConsistentDespiteFailures) {
   ASSERT_OK(verifier.Verify());
 }
 
-static void CreateTableOrFail(const char* kTableName,
-                              const Schema* kSchema,
-                              MasterServiceProxy* proxy) {
-  CreateTableRequestPB req;
-  CreateTableResponsePB resp;
-  RpcController controller;
-
-  req.set_name(kTableName);
-  CHECK_OK(SchemaToPB(*kSchema, req.mutable_schema()));
-  CHECK_OK(proxy->CreateTable(req, &resp, &controller));
-  SCOPED_TRACE(resp.DebugString());
-
-  // There are three expected outcomes:
-  //
-  // 1. This thread won the CreateTable() race: no error.
-  // 2. This thread lost the CreateTable() race: TABLE_NOT_FOUND error
-  //    with ServiceUnavailable status.
-  // 3. This thread arrived after the CreateTable() race was already over:
-  //    TABLE_ALREADY_PRESENT error with AlreadyPresent status.
-  if (resp.has_error()) {
-    Status s = StatusFromPB(resp.error().status());
-    string failure_msg = Substitute("Unexpected response: $0",
-                                    resp.DebugString());
-    switch (resp.error().code()) {
-      case MasterErrorPB::TABLE_NOT_FOUND:
-        CHECK(s.IsServiceUnavailable()) << failure_msg;
-        break;
-      case MasterErrorPB::TABLE_ALREADY_PRESENT:
-        CHECK(s.IsAlreadyPresent()) << failure_msg;
-        break;
-      default:
-        FAIL() << failure_msg;
-    }
-  }
-}
-
 TEST_F(MasterTest, TestConcurrentCreateOfSameTable) {
   const char* kTableName = "testtb";
   const Schema kTableSchema({ ColumnSchema("key", INT32),
@@ -890,18 +1060,211 @@ TEST_F(MasterTest, TestConcurrentCreateOfSameTable) {
                             1);
 
   // Kick off a bunch of threads all trying to create the same table.
-  vector<scoped_refptr<Thread>> threads;
+  vector<thread> threads;
   for (int i = 0; i < 10; i++) {
-    scoped_refptr<Thread> t;
-    EXPECT_OK(Thread::Create("test", "test",
-                             &CreateTableOrFail, kTableName, &kTableSchema,
-                             proxy_.get(), &t));
-    threads.emplace_back(std::move(t));
+    threads.emplace_back([&]() {
+      CreateTableRequestPB req;
+      CreateTableResponsePB resp;
+      RpcController controller;
+
+      req.set_name(kTableName);
+      CHECK_OK(SchemaToPB(kTableSchema, req.mutable_schema()));
+      CHECK_OK(proxy_->CreateTable(req, &resp, &controller));
+      SCOPED_TRACE(resp.DebugString());
+
+      // There are three expected outcomes:
+      //
+      // 1. This thread won the CreateTable() race: no error.
+      // 2. This thread lost the CreateTable() race: TABLE_NOT_FOUND error
+      //    with ServiceUnavailable status.
+      // 3. This thread arrived after the CreateTable() race was already over:
+      //    TABLE_ALREADY_PRESENT error with AlreadyPresent status.
+      if (resp.has_error()) {
+        Status s = StatusFromPB(resp.error().status());
+        string failure_msg = Substitute("Unexpected response: $0",
+                                        resp.DebugString());
+        switch (resp.error().code()) {
+          case MasterErrorPB::TABLE_NOT_FOUND:
+            CHECK(s.IsServiceUnavailable()) << failure_msg;
+            break;
+          case MasterErrorPB::TABLE_ALREADY_PRESENT:
+            CHECK(s.IsAlreadyPresent()) << failure_msg;
+            break;
+          default:
+            FAIL() << failure_msg;
+        }
+      }
+    });
   }
 
-  for (const auto& t : threads) {
-    t->Join();
+  for (auto& t : threads) {
+    t.join();
   }
+}
+
+TEST_F(MasterTest, TestConcurrentRenameOfSameTable) {
+  const char* kOldName = "testtb";
+  const char* kNewName = "testtb-new";
+  const Schema kTableSchema({ ColumnSchema("key", INT32),
+                              ColumnSchema("v1", UINT64),
+                              ColumnSchema("v2", STRING) },
+                            1);
+  ASSERT_OK(CreateTable(kOldName, kTableSchema));
+
+  // Kick off a bunch of threads all trying to rename the same table.
+  vector<thread> threads;
+  for (int i = 0; i < 10; i++) {
+    threads.emplace_back([&]() {
+      AlterTableRequestPB req;
+      AlterTableResponsePB resp;
+      RpcController controller;
+
+      req.mutable_table()->set_table_name(kOldName);
+      req.set_new_table_name(kNewName);
+      CHECK_OK(proxy_->AlterTable(req, &resp, &controller));
+      SCOPED_TRACE(resp.DebugString());
+
+      // There are two expected outcomes:
+      //
+      // 1. This thread won the AlterTable() race: no error.
+      // 2. This thread lost the AlterTable() race: TABLE_NOT_FOUND error
+      //    with NotFound status.
+      if (resp.has_error()) {
+        Status s = StatusFromPB(resp.error().status());
+        string failure_msg = Substitute("Unexpected response: $0",
+                                        resp.DebugString());
+        CHECK_EQ(MasterErrorPB::TABLE_NOT_FOUND, resp.error().code()) << failure_msg;
+        CHECK(s.IsNotFound()) << failure_msg;
+      }
+    });
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+}
+
+TEST_F(MasterTest, TestConcurrentCreateAndRenameOfSameTable) {
+  const char* kOldName = "testtb";
+  const char* kNewName = "testtb-new";
+  const Schema kTableSchema({ ColumnSchema("key", INT32),
+                              ColumnSchema("v1", UINT64),
+                              ColumnSchema("v2", STRING) },
+                            1);
+  ASSERT_OK(CreateTable(kOldName, kTableSchema));
+
+  AtomicBool create_success(false);
+  AtomicBool rename_success(false);
+  vector<thread> threads;
+  for (int i = 0; i < 10; i++) {
+    if (i % 2) {
+      threads.emplace_back([&]() {
+        CreateTableRequestPB req;
+        CreateTableResponsePB resp;
+        RpcController controller;
+
+        req.set_name(kNewName);
+        RowOperationsPBEncoder encoder(req.mutable_split_rows_range_bounds());
+
+        KuduPartialRow split1(&kTableSchema);
+        CHECK_OK(split1.SetInt32("key", 10));
+        encoder.Add(RowOperationsPB::SPLIT_ROW, split1);
+
+        KuduPartialRow split2(&kTableSchema);
+        CHECK_OK(split2.SetInt32("key", 20));
+        encoder.Add(RowOperationsPB::SPLIT_ROW, split2);
+
+        CHECK_OK(SchemaToPB(kTableSchema, req.mutable_schema()));
+        CHECK_OK(proxy_->CreateTable(req, &resp, &controller));
+        SCOPED_TRACE(resp.DebugString());
+
+        // There are three expected outcomes:
+        //
+        // 1. This thread finished well before the others: no error.
+        // 2. This thread raced with another thread: TABLE_NOT_FOUND error with
+        //    ServiceUnavailable status.
+        // 3. This thread finished well after the others: TABLE_ALREADY_PRESENT
+        //    error with AlreadyPresent status.
+        if (resp.has_error()) {
+          Status s = StatusFromPB(resp.error().status());
+          string failure_msg = Substitute("Unexpected response: $0",
+                                          resp.DebugString());
+          switch (resp.error().code()) {
+            case MasterErrorPB::TABLE_NOT_FOUND:
+              CHECK(s.IsServiceUnavailable()) << failure_msg;
+              break;
+            case MasterErrorPB::TABLE_ALREADY_PRESENT:
+              CHECK(s.IsAlreadyPresent()) << failure_msg;
+              break;
+            default:
+              FAIL() << failure_msg;
+          }
+        } else {
+          // Creating the table should only succeed once.
+          CHECK(!create_success.Exchange(true));
+        }
+      });
+    } else {
+      threads.emplace_back([&]() {
+        AlterTableRequestPB req;
+        AlterTableResponsePB resp;
+        RpcController controller;
+
+        req.mutable_table()->set_table_name(kOldName);
+        req.set_new_table_name(kNewName);
+        CHECK_OK(proxy_->AlterTable(req, &resp, &controller));
+        SCOPED_TRACE(resp.DebugString());
+
+        // There are three expected outcomes:
+        //
+        // 1. This thread finished well before the others: no error.
+        // 2. This thread raced with CreateTable(): TABLE_NOT_FOUND error with
+        //    ServiceUnavailable status (if raced during reservation stage)
+        //    or TABLE_ALREADY_PRESENT error with AlreadyPresent status (if
+        //    raced after reservation stage).
+        // 3. This thread raced with AlterTable() or finished well after the
+        //    others: TABLE_NOT_FOUND error with NotFound status.
+        if (resp.has_error()) {
+          Status s = StatusFromPB(resp.error().status());
+          string failure_msg = Substitute("Unexpected response: $0",
+                                          resp.DebugString());
+          switch (resp.error().code()) {
+            case MasterErrorPB::TABLE_NOT_FOUND:
+              CHECK(s.IsServiceUnavailable() || s.IsNotFound()) << failure_msg;
+              break;
+            case MasterErrorPB::TABLE_ALREADY_PRESENT:
+              CHECK(s.IsAlreadyPresent()) << failure_msg;
+              break;
+            default:
+              FAIL() << failure_msg;
+          }
+        } else {
+          // Renaming the table should only succeed once.
+          CHECK(!rename_success.Exchange(true));
+        }
+      });
+    }
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  // At least one of rename or create should have failed; if both succeeded
+  // there must be some sort of race.
+  CHECK(!rename_success.Load() || !create_success.Load());
+
+  unordered_set<string> live_tables;
+  live_tables.insert(kNewName);
+  if (create_success.Load()) {
+    live_tables.insert(kOldName);
+  }
+  MasterMetadataVerifier verifier(live_tables, {});
+  SysCatalogTable* sys_catalog =
+      mini_master_->master()->catalog_manager()->sys_catalog();
+  ASSERT_OK(sys_catalog->VisitTables(&verifier));
+  ASSERT_OK(sys_catalog->VisitTablets(&verifier));
+  ASSERT_OK(verifier.Verify());
 }
 
 } // namespace master

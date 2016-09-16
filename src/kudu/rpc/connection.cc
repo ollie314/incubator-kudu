@@ -64,7 +64,7 @@ Connection::Connection(ReactorThread *reactor_thread, Sockaddr remote,
       socket_(socket),
       remote_(std::move(remote)),
       direction_(direction),
-      last_activity_time_(MonoTime::Now(MonoTime::FINE)),
+      last_activity_time_(MonoTime::Now()),
       is_epoll_registered_(false),
       next_call_id_(1),
       sasl_client_(kSaslAppName, socket),
@@ -135,8 +135,8 @@ void Connection::Shutdown(const Status &status) {
   shutdown_status_ = status.CloneAndPrepend("RPC connection failed");
 
   if (inbound_ && inbound_->TransferStarted()) {
-    double secs_since_active = reactor_thread_->cur_time()
-        .GetDeltaSince(last_activity_time_).ToSeconds();
+    double secs_since_active =
+        (reactor_thread_->cur_time() - last_activity_time_).ToSeconds();
     LOG(WARNING) << "Shutting down connection " << ToString() << " with pending inbound data ("
                  << inbound_->StatusAsString() << ", last active "
                  << HumanReadableElapsedTime::ToShortString(secs_since_active)

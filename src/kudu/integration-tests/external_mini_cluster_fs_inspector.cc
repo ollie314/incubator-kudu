@@ -23,6 +23,7 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/strings/util.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/integration-tests/external_mini_cluster.h"
 #include "kudu/util/env.h"
@@ -63,14 +64,17 @@ Status ExternalMiniClusterFsInspector::ListFilesInDir(const string& path,
   return Status::OK();
 }
 
-int ExternalMiniClusterFsInspector::CountFilesInDir(const string& path) {
+int ExternalMiniClusterFsInspector::CountFilesInDir(const string& path,
+                                                    StringPiece pattern) {
   vector<string> entries;
   Status s = ListFilesInDir(path, &entries);
   if (!s.ok()) return 0;
-  return entries.size();
+  return std::count_if(entries.begin(), entries.end(), [&](const string& s) {
+      return pattern.empty() || MatchPattern(s, pattern);
+    });
 }
 
-int ExternalMiniClusterFsInspector::CountWALSegmentsOnTS(int index) {
+int ExternalMiniClusterFsInspector::CountWALFilesOnTS(int index) {
   string data_dir = cluster_->tablet_server(index)->data_dir();
   string ts_wal_dir = JoinPathSegments(data_dir, FsManager::kWalDirName);
   vector<string> tablets;
@@ -108,15 +112,17 @@ vector<string> ExternalMiniClusterFsInspector::ListTabletsWithDataOnTS(int index
   return tablets;
 }
 
-int ExternalMiniClusterFsInspector::CountWALSegmentsForTabletOnTS(int index,
-                                                                  const string& tablet_id) {
+int ExternalMiniClusterFsInspector::CountFilesInWALDirForTS(
+    int index,
+    const string& tablet_id,
+    StringPiece pattern) {
   string data_dir = cluster_->tablet_server(index)->data_dir();
   string wal_dir = JoinPathSegments(data_dir, FsManager::kWalDirName);
   string tablet_wal_dir = JoinPathSegments(wal_dir, tablet_id);
   if (!env_->FileExists(tablet_wal_dir)) {
     return 0;
   }
-  return CountFilesInDir(tablet_wal_dir);
+  return CountFilesInDir(tablet_wal_dir, pattern);
 }
 
 bool ExternalMiniClusterFsInspector::DoesConsensusMetaExistForTabletOnTS(int index,
@@ -144,7 +150,7 @@ Status ExternalMiniClusterFsInspector::CheckNoDataOnTS(int index) {
   if (CountFilesInDir(JoinPathSegments(data_dir, FsManager::kTabletMetadataDirName)) > 0) {
     return Status::IllegalState("tablet metadata blocks still exist", data_dir);
   }
-  if (CountWALSegmentsOnTS(index) > 0) {
+  if (CountWALFilesOnTS(index) > 0) {
     return Status::IllegalState("wals still exist", data_dir);
   }
   if (CountFilesInDir(JoinPathSegments(data_dir, FsManager::kConsensusMetadataDirName)) > 0) {
@@ -223,13 +229,12 @@ Status ExternalMiniClusterFsInspector::CheckTabletDataStateOnTS(
 }
 
 Status ExternalMiniClusterFsInspector::WaitForNoData(const MonoDelta& timeout) {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(timeout);
+  MonoTime deadline = MonoTime::Now() + timeout;
   Status s;
   while (true) {
     s = CheckNoData();
     if (s.ok()) return Status::OK();
-    if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) {
+    if (deadline < MonoTime::Now()) {
       break;
     }
     SleepFor(MonoDelta::FromMilliseconds(10));
@@ -238,13 +243,12 @@ Status ExternalMiniClusterFsInspector::WaitForNoData(const MonoDelta& timeout) {
 }
 
 Status ExternalMiniClusterFsInspector::WaitForNoDataOnTS(int index, const MonoDelta& timeout) {
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(timeout);
+  MonoTime deadline = MonoTime::Now() + timeout;
   Status s;
   while (true) {
     s = CheckNoDataOnTS(index);
     if (s.ok()) return Status::OK();
-    if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) {
+    if (deadline < MonoTime::Now()) {
       break;
     }
     SleepFor(MonoDelta::FromMilliseconds(10));
@@ -257,12 +261,11 @@ Status ExternalMiniClusterFsInspector::WaitForMinFilesInTabletWalDirOnTS(int ind
                                                                          int count,
                                                                          const MonoDelta& timeout) {
   int seen = 0;
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(timeout);
+  MonoTime deadline = MonoTime::Now() + timeout;
   while (true) {
-    seen = CountWALSegmentsForTabletOnTS(index, tablet_id);
+    seen = CountFilesInWALDirForTS(index, tablet_id);
     if (seen >= count) return Status::OK();
-    if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) {
+    if (deadline < MonoTime::Now()) {
       break;
     }
     SleepFor(MonoDelta::FromMilliseconds(10));
@@ -274,14 +277,13 @@ Status ExternalMiniClusterFsInspector::WaitForMinFilesInTabletWalDirOnTS(int ind
 
 Status ExternalMiniClusterFsInspector::WaitForReplicaCount(int expected, const MonoDelta& timeout) {
   Status s;
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(timeout);
+  MonoTime deadline = MonoTime::Now() + timeout;
   int found;
   while (true) {
     found = CountReplicasInMetadataDirs();
     if (found == expected) return Status::OK();
     if (CountReplicasInMetadataDirs() == expected) return Status::OK();
-    if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) {
+    if (MonoTime::Now() > deadline) {
       break;
     }
     SleepFor(MonoDelta::FromMilliseconds(10));
@@ -296,18 +298,17 @@ Status ExternalMiniClusterFsInspector::WaitForTabletDataStateOnTS(
     const string& tablet_id,
     const vector<TabletDataState>& expected_states,
     const MonoDelta& timeout) {
-  MonoTime start = MonoTime::Now(MonoTime::FINE);
-  MonoTime deadline = start;
-  deadline.AddDelta(timeout);
+  MonoTime start = MonoTime::Now();
+  MonoTime deadline = start + timeout;
   Status s;
   while (true) {
     s = CheckTabletDataStateOnTS(index, tablet_id, expected_states);
     if (s.ok()) return Status::OK();
-    if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) break;
+    if (MonoTime::Now() > deadline) break;
     SleepFor(MonoDelta::FromMilliseconds(5));
   }
   return Status::TimedOut(Substitute("Timed out after $0 waiting for correct tablet state: $1",
-                                     MonoTime::Now(MonoTime::FINE).GetDeltaSince(start).ToString(),
+                                     (MonoTime::Now() - start).ToString(),
                                      s.ToString()));
 }
 
@@ -317,8 +318,7 @@ Status ExternalMiniClusterFsInspector::WaitForFilePatternInTabletWalDirOnTs(
     const vector<string>& substrings_disallowed,
     const MonoDelta& timeout) {
   Status s;
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(timeout);
+  MonoTime deadline = MonoTime::Now() + timeout;
 
   string data_dir = cluster_->tablet_server(ts_index)->data_dir();
   string ts_wal_dir = JoinPathSegments(data_dir, FsManager::kWalDirName);
@@ -363,7 +363,7 @@ Status ExternalMiniClusterFsInspector::WaitForFilePatternInTabletWalDirOnTs(
     if (!any_missing_required && !any_present_disallowed) {
       return Status::OK();
     }
-    if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) {
+    if (MonoTime::Now() > deadline) {
       break;
     }
     SleepFor(MonoDelta::FromMilliseconds(10));

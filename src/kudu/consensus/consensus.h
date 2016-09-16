@@ -32,9 +32,11 @@
 #include "kudu/util/status_callback.h"
 
 namespace kudu {
+class MonoDelta;
 
 namespace log {
 class Log;
+struct RetentionIndexes;
 }
 
 namespace master {
@@ -128,6 +130,10 @@ class Consensus : public RefCountedThreadSafe<Consensus> {
     ELECT_EVEN_IF_LEADER_IS_ALIVE
   };
   virtual Status StartElection(ElectionMode mode) = 0;
+
+  // Wait until the node has LEADER role.
+  // Returns Status::TimedOut if the role is not LEADER within 'timeout'.
+  virtual Status WaitUntilLeaderForTests(const MonoDelta& timeout) = 0;
 
   // Implement a LeaderStepDown() request.
   virtual Status StepDown(LeaderStepDownResponsePB* resp) {
@@ -254,6 +260,15 @@ class Consensus : public RefCountedThreadSafe<Consensus> {
   virtual Status GetLastOpId(OpIdType type, OpId* id) {
     return Status::NotFound("Not implemented.");
   }
+
+
+  // Return the log indexes which the consensus implementation would like to retain.
+  //
+  // The returned 'for_durability' index ensures that no logs are GCed before
+  // the operation is fully committed. The returned 'for_peers' index indicates
+  // the index of the farthest-behind peer so that the log will try to avoid
+  // GCing these before the peer has caught up.
+  virtual log::RetentionIndexes GetRetentionIndexes() = 0;
 
  protected:
   friend class RefCountedThreadSafe<Consensus>;

@@ -27,6 +27,7 @@
 #include <initializer_list>
 #include <memory>
 #include <ostream>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -113,6 +114,8 @@ static const int kPBContainerV1HeaderLen =
     kPBContainerMagicLen + sizeof(uint32_t); // Magic number + version.
 static const int kPBContainerV2HeaderLen =
     kPBContainerV1HeaderLen + kPBContainerChecksumLen; // Same as V1 plus a checksum.
+
+const int kPBContainerMinimumValidLength = kPBContainerV1HeaderLen;
 
 static_assert(arraysize(kPBContainerMagic) - 1 == kPBContainerMagicLen,
               "kPBContainerMagic does not match expected length");
@@ -622,7 +625,7 @@ Status WritablePBContainerFile::Flush() {
   DCHECK_EQ(FileState::OPEN, state_);
 
   // TODO: Flush just the dirty bytes.
-  RETURN_NOT_OK_PREPEND(writer_->Flush(RWFile::FLUSH_SYNC, 0, 0), "Failed to Flush() file");
+  RETURN_NOT_OK_PREPEND(writer_->Flush(RWFile::FLUSH_ASYNC, 0, 0), "Failed to Flush() file");
 
   return Status::OK();
 }
@@ -886,7 +889,7 @@ PbTracer::PbTracer(const Message& msg) : msg_(msg.New()) {
 
 void PbTracer::AppendAsTraceFormat(std::string* out) const {
   pb_util::TruncateFields(msg_.get(), kMaxFieldLengthToTrace);
-  std::stringstream ss;
+  std::ostringstream ss;
   JsonWriter jw(&ss, JsonWriter::COMPACT);
   jw.Protobuf(*msg_);
   out->append(ss.str());

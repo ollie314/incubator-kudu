@@ -19,6 +19,8 @@
 
 #include <algorithm>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -34,8 +36,10 @@
 #include "kudu/master/master_rpc.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
+#include "kudu/rpc/request_tracker.h"
 #include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/thread_restrictions.h"
@@ -43,6 +47,7 @@
 using std::set;
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
@@ -57,6 +62,8 @@ using master::DeleteTableResponsePB;
 using master::GetLeaderMasterRpc;
 using master::GetTableSchemaRequestPB;
 using master::GetTableSchemaResponsePB;
+using master::GetTabletLocationsRequestPB;
+using master::GetTabletLocationsResponsePB;
 using master::IsAlterTableDoneRequestPB;
 using master::IsAlterTableDoneResponsePB;
 using master::IsCreateTableDoneRequestPB;
@@ -65,8 +72,10 @@ using master::ListTablesRequestPB;
 using master::ListTablesResponsePB;
 using master::ListTabletServersRequestPB;
 using master::ListTabletServersResponsePB;
-using master::MasterServiceProxy;
 using master::MasterErrorPB;
+using master::MasterFeatures;
+using master::MasterServiceProxy;
+using rpc::ErrorStatusPB;
 using rpc::Rpc;
 using rpc::RpcController;
 using strings::Substitute;
@@ -83,27 +92,26 @@ Status RetryFunc(const MonoTime& deadline,
                  const boost::function<Status(const MonoTime&, bool*)>& func) {
   DCHECK(deadline.Initialized());
 
-  MonoTime now = MonoTime::Now(MonoTime::FINE);
-  if (deadline.ComesBefore(now)) {
+  if (deadline < MonoTime::Now()) {
     return Status::TimedOut(timeout_msg);
   }
 
   double wait_secs = 0.001;
   const double kMaxSleepSecs = 2;
   while (1) {
-    MonoTime func_stime = now;
+    MonoTime func_stime = MonoTime::Now();
     bool retry = true;
     Status s = func(deadline, &retry);
     if (!retry) {
       return s;
     }
-    now = MonoTime::Now(MonoTime::FINE);
-    MonoDelta func_time = now.GetDeltaSince(func_stime);
+    MonoTime now = MonoTime::Now();
+    MonoDelta func_time = now - func_stime;
 
     VLOG(1) << retry_msg << " status=" << s.ToString();
     double secs_remaining = std::numeric_limits<double>::max();
     if (deadline.Initialized()) {
-      secs_remaining = deadline.GetDeltaSince(now).ToSeconds();
+      secs_remaining = (deadline - now).ToSeconds();
     }
     wait_secs = std::min(wait_secs * 1.25, kMaxSleepSecs);
 
@@ -117,8 +125,6 @@ Status RetryFunc(const MonoTime& deadline,
     VLOG(1) << "Waiting for " << HumanReadableElapsedTime::ToShortString(wait_secs)
             << " before retrying...";
     SleepFor(MonoDelta::FromSeconds(wait_secs));
-    now = MonoTime::Now(MonoTime::FINE);
-
   }
 
   return Status::TimedOut(timeout_msg);
@@ -130,20 +136,25 @@ Status KuduClient::Data::SyncLeaderMasterRpc(
     KuduClient* client,
     const ReqClass& req,
     RespClass* resp,
-    int* num_attempts,
     const char* func_name,
     const boost::function<Status(MasterServiceProxy*,
                                  const ReqClass&,
                                  RespClass*,
-                                 RpcController*)>& func) {
+                                 RpcController*)>& func,
+    vector<uint32_t> required_feature_flags) {
   DCHECK(deadline.Initialized());
 
-  while (true) {
+  for (int num_attempts = 0;; num_attempts++) {
     RpcController rpc;
 
+    // Sleep if necessary.
+    if (num_attempts > 0) {
+      SleepFor(ComputeExponentialBackoff(num_attempts));
+    }
+
     // Have we already exceeded our deadline?
-    MonoTime now = MonoTime::Now(MonoTime::FINE);
-    if (deadline.ComesBefore(now)) {
+    MonoTime now = MonoTime::Now();
+    if (deadline < now) {
       return Status::TimedOut(Substitute("$0 timed out after deadline expired",
                                          func_name));
     }
@@ -153,14 +164,26 @@ Status KuduClient::Data::SyncLeaderMasterRpc(
     // leader master and retry before the overall deadline expires.
     //
     // TODO: KUDU-683 tracks cleanup for this.
-    MonoTime rpc_deadline = now;
-    rpc_deadline.AddDelta(client->default_rpc_timeout());
+    MonoTime rpc_deadline = now + client->default_rpc_timeout();
     rpc.set_deadline(MonoTime::Earliest(rpc_deadline, deadline));
 
-    if (num_attempts != nullptr) {
-      ++*num_attempts;
+    for (uint32_t required_feature_flag : required_feature_flags) {
+      rpc.RequireServerFeature(required_feature_flag);
     }
-    Status s = func(master_proxy_.get(), req, resp, &rpc);
+
+    // Take a ref to the proxy in case it disappears from underneath us.
+    shared_ptr<MasterServiceProxy> proxy(master_proxy());
+
+    Status s = func(proxy.get(), req, resp, &rpc);
+    if (s.IsRemoteError()) {
+      const ErrorStatusPB* err = rpc.error_response();
+      if (err &&
+          err->has_code() &&
+          err->code() == ErrorStatusPB::ERROR_SERVER_TOO_BUSY) {
+        continue;
+      }
+    }
+
     if (s.IsNetworkError()) {
       LOG(WARNING) << "Unable to send the request (" << req.ShortDebugString()
                    << ") to leader Master (" << leader_master_hostport().ToString()
@@ -174,7 +197,7 @@ Status KuduClient::Data::SyncLeaderMasterRpc(
     }
 
     if (s.IsTimedOut()) {
-      if (MonoTime::Now(MonoTime::FINE).ComesBefore(deadline)) {
+      if (MonoTime::Now() < deadline) {
         LOG(WARNING) << "Unable to send the request (" << req.ShortDebugString()
                      << ") to leader Master (" << leader_master_hostport().ToString()
                      << "): " << s.ToString();
@@ -211,26 +234,38 @@ template
 Status KuduClient::Data::SyncLeaderMasterRpc(
     const MonoTime& deadline,
     KuduClient* client,
+    const GetTabletLocationsRequestPB& req,
+    GetTabletLocationsResponsePB* resp,
+    const char* func_name,
+    const boost::function<Status(MasterServiceProxy*,
+                                 const GetTabletLocationsRequestPB&,
+                                 GetTabletLocationsResponsePB*,
+                                 RpcController*)>& func,
+    vector<uint32_t> required_feature_flags);
+template
+Status KuduClient::Data::SyncLeaderMasterRpc(
+    const MonoTime& deadline,
+    KuduClient* client,
     const ListTablesRequestPB& req,
     ListTablesResponsePB* resp,
-    int* num_attempts,
     const char* func_name,
     const boost::function<Status(MasterServiceProxy*,
                                  const ListTablesRequestPB&,
                                  ListTablesResponsePB*,
-                                 RpcController*)>& func);
+                                 RpcController*)>& func,
+    vector<uint32_t> required_feature_flags);
 template
 Status KuduClient::Data::SyncLeaderMasterRpc(
     const MonoTime& deadline,
     KuduClient* client,
     const ListTabletServersRequestPB& req,
     ListTabletServersResponsePB* resp,
-    int* num_attempts,
     const char* func_name,
     const boost::function<Status(MasterServiceProxy*,
                                  const ListTabletServersRequestPB&,
                                  ListTabletServersResponsePB*,
-                                 RpcController*)>& func);
+                                 RpcController*)>& func,
+    vector<uint32_t> required_feature_flags);
 
 KuduClient::Data::Data()
     : latest_observed_timestamp_(KuduClient::kNoTimestamp) {
@@ -335,50 +370,19 @@ Status KuduClient::Data::GetTabletServer(KuduClient* client,
 Status KuduClient::Data::CreateTable(KuduClient* client,
                                      const CreateTableRequestPB& req,
                                      const KuduSchema& schema,
-                                     const MonoTime& deadline) {
+                                     const MonoTime& deadline,
+                                     bool has_range_partition_bounds) {
   CreateTableResponsePB resp;
 
-  int attempts = 0;
+  vector<uint32_t> features;
+  if (has_range_partition_bounds) {
+    features.push_back(MasterFeatures::RANGE_PARTITION_BOUNDS);
+  }
   Status s = SyncLeaderMasterRpc<CreateTableRequestPB, CreateTableResponsePB>(
-      deadline, client, req, &resp, &attempts, "CreateTable", &MasterServiceProxy::CreateTable);
+      deadline, client, req, &resp, "CreateTable", &MasterServiceProxy::CreateTable,
+      features);
   RETURN_NOT_OK(s);
   if (resp.has_error()) {
-    if (resp.error().code() == MasterErrorPB::TABLE_ALREADY_PRESENT && attempts > 1) {
-      // If the table already exists and the number of attempts is >
-      // 1, then it means we may have succeeded in creating the
-      // table, but client didn't receive the successful
-      // response (e.g., due to failure before the successful
-      // response could be sent back, or due to a I/O pause or a
-      // network blip leading to a timeout, etc...)
-      KuduSchema actual_schema;
-      string table_id;
-      PartitionSchema actual_partition_schema;
-      RETURN_NOT_OK_PREPEND(
-          GetTableSchema(client, req.name(), deadline, &actual_schema,
-                         &actual_partition_schema, &table_id),
-          Substitute("Unable to check the schema of table $0", req.name()));
-      if (!schema.Equals(actual_schema)) {
-        string msg = Substitute("Table $0 already exists with a different "
-            "schema. Requested schema was: $1, actual schema is: $2",
-            req.name(), schema.schema_->ToString(), actual_schema.schema_->ToString());
-        LOG(ERROR) << msg;
-        return Status::AlreadyPresent(msg);
-      } else {
-        PartitionSchema partition_schema;
-        RETURN_NOT_OK(PartitionSchema::FromPB(req.partition_schema(),
-                                              *schema.schema_, &partition_schema));
-        if (!partition_schema.Equals(actual_partition_schema)) {
-          string msg = Substitute("Table $0 already exists with a different partition schema. "
-              "Requested partition schema was: $1, actual partition schema is: $2",
-              req.name(), partition_schema.DebugString(*schema.schema_),
-              actual_partition_schema.DebugString(*actual_schema.schema_));
-          LOG(ERROR) << msg;
-          return Status::AlreadyPresent(msg);
-        } else {
-          return Status::OK();
-        }
-      }
-    }
     return StatusFromPB(resp.error().status());
   }
   return Status::OK();
@@ -400,9 +404,9 @@ Status KuduClient::Data::IsCreateTableInProgress(KuduClient* client,
           client,
           req,
           &resp,
-          nullptr,
           "IsCreateTableDone",
-          &MasterServiceProxy::IsCreateTableDone);
+          &MasterServiceProxy::IsCreateTableDone,
+          {});
   // RETURN_NOT_OK macro can't take templated function call as param,
   // and SyncLeaderMasterRpc must be explicitly instantiated, else the
   // compiler complains.
@@ -430,20 +434,13 @@ Status KuduClient::Data::DeleteTable(KuduClient* client,
                                      const MonoTime& deadline) {
   DeleteTableRequestPB req;
   DeleteTableResponsePB resp;
-  int attempts = 0;
 
   req.mutable_table()->set_table_name(table_name);
   Status s = SyncLeaderMasterRpc<DeleteTableRequestPB, DeleteTableResponsePB>(
       deadline, client, req, &resp,
-      &attempts, "DeleteTable", &MasterServiceProxy::DeleteTable);
+      "DeleteTable", &MasterServiceProxy::DeleteTable, {});
   RETURN_NOT_OK(s);
   if (resp.has_error()) {
-    if (resp.error().code() == MasterErrorPB::TABLE_NOT_FOUND && attempts > 1) {
-      // A prior attempt to delete the table has succeeded, but
-      // appeared as a failure to the client due to, e.g., an I/O or
-      // network issue.
-      return Status::OK();
-    }
     return StatusFromPB(resp.error().status());
   }
   return Status::OK();
@@ -451,7 +448,12 @@ Status KuduClient::Data::DeleteTable(KuduClient* client,
 
 Status KuduClient::Data::AlterTable(KuduClient* client,
                                     const AlterTableRequestPB& req,
-                                    const MonoTime& deadline) {
+                                    const MonoTime& deadline,
+                                    bool has_add_drop_partition) {
+  vector<uint32_t> required_feature_flags;
+  if (has_add_drop_partition) {
+    required_feature_flags.push_back(MasterFeatures::ADD_DROP_RANGE_PARTITIONS);
+  }
   AlterTableResponsePB resp;
   Status s =
       SyncLeaderMasterRpc<AlterTableRequestPB, AlterTableResponsePB>(
@@ -459,15 +461,10 @@ Status KuduClient::Data::AlterTable(KuduClient* client,
           client,
           req,
           &resp,
-          nullptr,
           "AlterTable",
-          &MasterServiceProxy::AlterTable);
+          &MasterServiceProxy::AlterTable,
+          std::move(required_feature_flags));
   RETURN_NOT_OK(s);
-  // TODO: Consider the situation where the request is sent to the
-  // server, gets executed on the server and written to the server,
-  // but is seen as failed by the client, and is then retried (in which
-  // case the retry will fail due to original table being removed, a
-  // column being already added, etc...)
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
   }
@@ -488,9 +485,9 @@ Status KuduClient::Data::IsAlterTableInProgress(KuduClient* client,
           client,
           req,
           &resp,
-          nullptr,
           "IsAlterTableDone",
-          &MasterServiceProxy::IsAlterTableDone);
+          &MasterServiceProxy::IsAlterTableDone,
+          {});
   RETURN_NOT_OK(s);
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
@@ -554,197 +551,49 @@ bool KuduClient::Data::IsTabletServerLocal(const RemoteTabletServer& rts) const 
   return false;
 }
 
-namespace internal {
-
-// Gets a table's schema from the leader master. If the leader master
-// is down, waits for a new master to become the leader, and then gets
-// the table schema from the new leader master.
-//
-// TODO: When we implement the next fault tolerant client-master RPC
-// call (e.g., CreateTable/AlterTable), we should generalize this
-// method as to enable code sharing.
-class GetTableSchemaRpc : public Rpc {
- public:
-  GetTableSchemaRpc(KuduClient* client,
-                    StatusCallback user_cb,
-                    string table_name,
-                    KuduSchema* out_schema,
-                    PartitionSchema* out_partition_schema,
-                    string* out_id,
-                    const MonoTime& deadline,
-                    const shared_ptr<rpc::Messenger>& messenger);
-
-  virtual void SendRpc() OVERRIDE;
-
-  virtual string ToString() const OVERRIDE;
-
-  virtual ~GetTableSchemaRpc();
-
- private:
-  virtual void SendRpcCb(const Status& status) OVERRIDE;
-
-  void ResetLeaderMasterAndRetry();
-
-  void NewLeaderMasterDeterminedCb(const Status& status);
-
-  KuduClient* client_;
-  StatusCallback user_cb_;
-  const string table_name_;
-  KuduSchema* out_schema_;
-  PartitionSchema* out_partition_schema_;
-  string* out_id_;
-  GetTableSchemaResponsePB resp_;
-};
-
-GetTableSchemaRpc::GetTableSchemaRpc(KuduClient* client,
-                                     StatusCallback user_cb,
-                                     string table_name,
-                                     KuduSchema* out_schema,
-                                     PartitionSchema* out_partition_schema,
-                                     string* out_id,
-                                     const MonoTime& deadline,
-                                     const shared_ptr<rpc::Messenger>& messenger)
-    : Rpc(deadline, messenger),
-      client_(DCHECK_NOTNULL(client)),
-      user_cb_(std::move(user_cb)),
-      table_name_(std::move(table_name)),
-      out_schema_(DCHECK_NOTNULL(out_schema)),
-      out_partition_schema_(DCHECK_NOTNULL(out_partition_schema)),
-      out_id_(DCHECK_NOTNULL(out_id)) {
-}
-
-GetTableSchemaRpc::~GetTableSchemaRpc() {
-}
-
-void GetTableSchemaRpc::SendRpc() {
-  MonoTime now = MonoTime::Now(MonoTime::FINE);
-  if (retrier().deadline().ComesBefore(now)) {
-    SendRpcCb(Status::TimedOut("GetTableSchema timed out after deadline expired"));
-    return;
-  }
-
-  // See KuduClient::Data::SyncLeaderMasterRpc().
-  MonoTime rpc_deadline = now;
-  rpc_deadline.AddDelta(client_->default_rpc_timeout());
-  mutable_retrier()->mutable_controller()->set_deadline(
-      MonoTime::Earliest(rpc_deadline, retrier().deadline()));
-
-  GetTableSchemaRequestPB req;
-  req.mutable_table()->set_table_name(table_name_);
-  client_->data_->master_proxy()->GetTableSchemaAsync(
-      req, &resp_,
-      mutable_retrier()->mutable_controller(),
-      boost::bind(&GetTableSchemaRpc::SendRpcCb, this, Status::OK()));
-}
-
-string GetTableSchemaRpc::ToString() const {
-  return Substitute("GetTableSchemaRpc(table_name: $0, num_attempts: $1)",
-                    table_name_, num_attempts());
-}
-
-void GetTableSchemaRpc::ResetLeaderMasterAndRetry() {
-  client_->data_->SetMasterServerProxyAsync(
-      client_,
-      retrier().deadline(),
-      Bind(&GetTableSchemaRpc::NewLeaderMasterDeterminedCb,
-           Unretained(this)));
-}
-
-void GetTableSchemaRpc::NewLeaderMasterDeterminedCb(const Status& status) {
-  if (status.ok()) {
-    mutable_retrier()->mutable_controller()->Reset();
-    SendRpc();
-  } else {
-    LOG(WARNING) << "Failed to determine new Master: " << status.ToString();
-    mutable_retrier()->DelayedRetry(this, status);
-  }
-}
-
-void GetTableSchemaRpc::SendRpcCb(const Status& status) {
-  Status new_status = status;
-  if (new_status.ok() && mutable_retrier()->HandleResponse(this, &new_status)) {
-    return;
-  }
-
-  if (new_status.ok() && resp_.has_error()) {
-    if (resp_.error().code() == MasterErrorPB::NOT_THE_LEADER ||
-        resp_.error().code() == MasterErrorPB::CATALOG_MANAGER_NOT_INITIALIZED) {
-      if (client_->IsMultiMaster()) {
-        LOG(WARNING) << "Leader Master has changed ("
-                     << client_->data_->leader_master_hostport().ToString()
-                     << " is no longer the leader), re-trying...";
-        ResetLeaderMasterAndRetry();
-        return;
-      }
-    }
-    new_status = StatusFromPB(resp_.error().status());
-  }
-
-  if (new_status.IsTimedOut()) {
-    if (MonoTime::Now(MonoTime::FINE).ComesBefore(retrier().deadline())) {
-      if (client_->IsMultiMaster()) {
-        LOG(WARNING) << "Leader Master ("
-            << client_->data_->leader_master_hostport().ToString()
-            << ") timed out, re-trying...";
-        ResetLeaderMasterAndRetry();
-        return;
-      }
-    } else {
-      // Operation deadline expired during this latest RPC.
-      new_status = new_status.CloneAndPrepend(
-          "GetTableSchema timed out after deadline expired");
-    }
-  }
-
-  if (new_status.IsNetworkError()) {
-    if (client_->IsMultiMaster()) {
-      LOG(WARNING) << "Encountered a network error from the Master("
-                   << client_->data_->leader_master_hostport().ToString() << "): "
-                   << new_status.ToString() << ", retrying...";
-      ResetLeaderMasterAndRetry();
-      return;
-    }
-  }
-
-  if (new_status.ok()) {
-    gscoped_ptr<Schema> schema(new Schema());
-    new_status = SchemaFromPB(resp_.schema(), schema.get());
-    if (new_status.ok()) {
-      delete out_schema_->schema_;
-      out_schema_->schema_ = schema.release();
-      new_status = PartitionSchema::FromPB(resp_.partition_schema(),
-                                           *out_schema_->schema_,
-                                           out_partition_schema_);
-
-      *out_id_ = resp_.table_id();
-      CHECK_GT(out_id_->size(), 0) << "Running against a too-old master";
-    }
-  }
-  if (!new_status.ok()) {
-    LOG(WARNING) << ToString() << " failed: " << new_status.ToString();
-  }
-  user_cb_.Run(new_status);
-}
-
-} // namespace internal
-
 Status KuduClient::Data::GetTableSchema(KuduClient* client,
                                         const string& table_name,
                                         const MonoTime& deadline,
                                         KuduSchema* schema,
                                         PartitionSchema* partition_schema,
-                                        string* table_id) {
-  Synchronizer sync;
-  GetTableSchemaRpc rpc(client,
-                        sync.AsStatusCallback(),
-                        table_name,
-                        schema,
-                        partition_schema,
-                        table_id,
-                        deadline,
-                        messenger_);
-  rpc.SendRpc();
-  return sync.Wait();
+                                        string* table_id,
+                                        int* num_replicas) {
+  GetTableSchemaRequestPB req;
+  GetTableSchemaResponsePB resp;
+
+  req.mutable_table()->set_table_name(table_name);
+  Status s = SyncLeaderMasterRpc<GetTableSchemaRequestPB, GetTableSchemaResponsePB>(
+      deadline, client, req, &resp,
+      "GetTableSchema", &MasterServiceProxy::GetTableSchema, {});
+  RETURN_NOT_OK(s);
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+
+  // Parse the server schema out of the response.
+  unique_ptr<Schema> new_schema(new Schema());
+  RETURN_NOT_OK(SchemaFromPB(resp.schema(), new_schema.get()));
+
+  // Parse the server partition schema out of the response.
+  PartitionSchema new_partition_schema;
+  RETURN_NOT_OK(PartitionSchema::FromPB(resp.partition_schema(),
+                                        *new_schema.get(),
+                                        &new_partition_schema));
+
+  if (schema) {
+    delete schema->schema_;
+    schema->schema_ = new_schema.release();
+  }
+  if (partition_schema) {
+    *partition_schema = std::move(new_partition_schema);
+  }
+  if (table_id) {
+    *table_id = resp.table_id();
+  }
+  if (num_replicas) {
+    *num_replicas = resp.num_replicas();
+  }
+  return Status::OK();
 }
 
 void KuduClient::Data::LeaderMasterDetermined(const Status& status,
@@ -757,7 +606,7 @@ void KuduClient::Data::LeaderMasterDetermined(const Status& status,
 
   vector<StatusCallback> cbs;
   {
-    lock_guard<simple_spinlock> l(&leader_master_lock_);
+    std::lock_guard<simple_spinlock> l(leader_master_lock_);
     cbs.swap(leader_master_callbacks_);
     leader_master_rpc_.reset();
 
@@ -806,27 +655,21 @@ void KuduClient::Data::SetMasterServerProxyAsync(KuduClient* client,
     master_sockaddrs.push_back(addrs[0]);
   }
 
-  // Finding a new master involves a fan-out RPC to each master. A single
-  // RPC timeout's worth of time should be sufficient, though we'll use
-  // the provided deadline if it's sooner.
-  MonoTime leader_master_deadline = MonoTime::Now(MonoTime::FINE);
-  leader_master_deadline.AddDelta(client->default_rpc_timeout());
-  MonoTime actual_deadline = MonoTime::Earliest(deadline, leader_master_deadline);
-
   // This ensures that no more than one GetLeaderMasterRpc is in
   // flight at a time -- there isn't much sense in requesting this information
   // in parallel, since the requests should end up with the same result.
   // Instead, we simply piggy-back onto the existing request by adding our own
   // callback to leader_master_callbacks_.
-  unique_lock<simple_spinlock> l(&leader_master_lock_);
+  std::unique_lock<simple_spinlock> l(leader_master_lock_);
   leader_master_callbacks_.push_back(cb);
   if (!leader_master_rpc_) {
     // No one is sending a request yet - we need to be the one to do it.
     leader_master_rpc_.reset(new GetLeaderMasterRpc(
                                Bind(&KuduClient::Data::LeaderMasterDetermined,
                                     Unretained(this)),
-                               master_sockaddrs,
-                               actual_deadline,
+                               std::move(master_sockaddrs),
+                               deadline,
+                               client->default_rpc_timeout(),
                                messenger_));
     l.unlock();
     leader_master_rpc_->SendRpc();
@@ -836,12 +679,12 @@ void KuduClient::Data::SetMasterServerProxyAsync(KuduClient* client,
 }
 
 HostPort KuduClient::Data::leader_master_hostport() const {
-  lock_guard<simple_spinlock> l(&leader_master_lock_);
+  std::lock_guard<simple_spinlock> l(leader_master_lock_);
   return leader_master_hostport_;
 }
 
 shared_ptr<master::MasterServiceProxy> KuduClient::Data::master_proxy() const {
-  lock_guard<simple_spinlock> l(&leader_master_lock_);
+  std::lock_guard<simple_spinlock> l(leader_master_lock_);
   return master_proxy_;
 }
 

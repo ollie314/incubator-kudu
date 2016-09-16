@@ -118,8 +118,7 @@ rm -rf $BUILD_ROOT
 mkdir -p $BUILD_ROOT
 
 # Same for the Java tests, which aren't inside BUILD_ROOT
-rm -rf $SOURCE_ROOT/java/*/target/surefire-reports
-rm -rf $SOURCE_ROOT/java/*/target/testdata
+rm -rf $SOURCE_ROOT/java/*/target
 
 list_flaky_tests() {
   local url="http://$TEST_RESULT_SERVER/list_failed_tests?num_days=3&build_pattern=%25kudu-test%25"
@@ -163,33 +162,60 @@ fi
 # library (which the bindings depend on) is missing ASAN/TSAN symbols.
 cd $BUILD_ROOT
 if [ "$BUILD_TYPE" = "ASAN" ]; then
-  $SOURCE_ROOT/build-support/enable_devtoolset.sh \
-    "env CC=$CLANG CXX=$CLANG++ $THIRDPARTY_BIN/cmake -DKUDU_USE_ASAN=1 -DKUDU_USE_UBSAN=1 $SOURCE_ROOT"
-  BUILD_TYPE=fastdebug
+  USE_CLANG=1
+  CMAKE_BUILD=fastdebug
+  EXTRA_BUILD_FLAGS="-DKUDU_USE_ASAN=1 -DKUDU_USE_UBSAN=1"
   BUILD_PYTHON=0
 elif [ "$BUILD_TYPE" = "TSAN" ]; then
-  $SOURCE_ROOT/build-support/enable_devtoolset.sh \
-    "env CC=$CLANG CXX=$CLANG++ $THIRDPARTY_BIN/cmake -DKUDU_USE_TSAN=1 $SOURCE_ROOT"
-  BUILD_TYPE=fastdebug
+  USE_CLANG=1
+  CMAKE_BUILD=fastdebug
+  EXTRA_BUILD_FLAGS="-DKUDU_USE_TSAN=1"
   EXTRA_TEST_FLAGS="$EXTRA_TEST_FLAGS -LE no_tsan"
   BUILD_PYTHON=0
 elif [ "$BUILD_TYPE" = "COVERAGE" ]; then
+  USE_CLANG=1
+  CMAKE_BUILD=debug
+  EXTRA_BUILD_FLAGS="-DKUDU_GENERATE_COVERAGE=1"
   DO_COVERAGE=1
-  BUILD_TYPE=debug
 
   # We currently dont capture coverage for Java or Python.
   BUILD_JAVA=0
   BUILD_PYTHON=0
-
-  $SOURCE_ROOT/build-support/enable_devtoolset.sh \
-    "env CC=$CLANG CXX=$CLANG++ $THIRDPARTY_BIN/cmake -DKUDU_GENERATE_COVERAGE=1 $SOURCE_ROOT"
 elif [ "$BUILD_TYPE" = "LINT" ]; then
+  CMAKE_BUILD=debug
+else
+  # Must be DEBUG or RELEASE
+  CMAKE_BUILD=$BUILD_TYPE
+fi
+
+# Assemble the cmake command line.
+CMAKE=
+if [ -n "$USE_CLANG" ]; then
+  CMAKE="env CC=$CLANG CXX=$CLANG++"
+fi
+CMAKE="$CMAKE $SOURCE_ROOT/build-support/enable_devtoolset.sh"
+CMAKE="$CMAKE $THIRDPARTY_BIN/cmake"
+CMAKE="$CMAKE -DCMAKE_BUILD_TYPE=$CMAKE_BUILD"
+
+# On distributed tests, force dynamic linking even for release builds. Otherwise,
+# the test binaries are too large and we spend way too much time uploading them
+# to the test slaves.
+if [ "$ENABLE_DIST_TEST" == "1" ]; then
+  CMAKE="$CMAKE -DKUDU_LINK=dynamic"
+fi
+if [ -n "$EXTRA_BUILD_FLAGS" ]; then
+  CMAKE="$CMAKE $EXTRA_BUILD_FLAGS"
+fi
+CMAKE="$CMAKE $SOURCE_ROOT"
+$CMAKE
+
+# Short circuit for LINT builds.
+if [ "$BUILD_TYPE" = "LINT" ]; then
   # Create empty test logs or else Jenkins fails to archive artifacts, which
   # results in the build failing.
   mkdir -p Testing/Temporary
   mkdir -p $TEST_LOGDIR
 
-  $SOURCE_ROOT/build-support/enable_devtoolset.sh "$THIRDPARTY_BIN/cmake $SOURCE_ROOT"
   make lint | tee $TEST_LOGDIR/lint.log
   exit $?
 fi
@@ -216,16 +242,6 @@ if [ "$KUDU_FLAKY_TEST_ATTEMPTS" -gt 1 ]; then
     export KUDU_FLAKY_TEST_ATTEMPTS=1
   fi
 fi
-
-# On distributed tests, force dynamic linking even for release builds. Otherwise,
-# the test binaries are too large and we spend way too much time uploading them
-# to the test slaves.
-LINK_FLAGS=
-if [ "$ENABLE_DIST_TEST" == "1" ]; then
-  LINK_FLAGS="-DKUDU_LINK=dynamic"
-fi
-
-$SOURCE_ROOT/build-support/enable_devtoolset.sh "$THIRDPARTY_BIN/cmake -DCMAKE_BUILD_TYPE=${BUILD_TYPE} $LINK_FLAGS $SOURCE_ROOT"
 
 # our tests leave lots of data lying around, clean up before we run
 if [ -d "$TEST_TMPDIR" ]; then
@@ -373,13 +389,13 @@ if [ "$ENABLE_DIST_TEST" == "1" ]; then
   echo
   echo Fetching previously submitted dist-test results...
   echo ------------------------------------------------------------
-  if ! $DIST_TEST_HOME/client.py watch ; then
+  if ! $DIST_TEST_HOME/bin/client watch ; then
     EXIT_STATUS=1
     FAILURES="$FAILURES"$'Distributed tests failed\n'
   fi
   DT_DIR=$TEST_LOGDIR/dist-test-out
   rm -Rf $DT_DIR
-  $DIST_TEST_HOME/client.py fetch --artifacts -d $DT_DIR
+  $DIST_TEST_HOME/bin/client fetch --artifacts -d $DT_DIR
   # Fetching the artifacts expands each log into its own directory.
   # Move them back into the main log directory
   rm -f $DT_DIR/*zip
@@ -420,20 +436,16 @@ if [ $EXIT_STATUS != 0 ]; then
 fi
 
 # If all tests passed, ensure that they cleaned up their test output.
-#
-# TODO: Python is currently leaking a tmp directory sometimes (KUDU-1301).
-# Temporarily disabled until that's fixed.
-#
-# if [ $EXIT_STATUS == 0 ]; then
-#   TEST_TMPDIR_CONTENTS=$(ls $TEST_TMPDIR)
-#   if [ -n "$TEST_TMPDIR_CONTENTS" ]; then
-#     echo "All tests passed, yet some left behind their test output:"
-#     for SUBDIR in $TEST_TMPDIR_CONTENTS; do
-#       echo $SUBDIR
-#     done
-#     EXIT_STATUS=1
-#   fi
-# fi
+if [ $EXIT_STATUS == 0 ]; then
+  TEST_TMPDIR_CONTENTS=$(ls $TEST_TMPDIR)
+  if [ -n "$TEST_TMPDIR_CONTENTS" ]; then
+    echo "All tests passed, yet some left behind their test output:"
+    for SUBDIR in $TEST_TMPDIR_CONTENTS; do
+      echo $SUBDIR
+    done
+    EXIT_STATUS=1
+  fi
+fi
 
 set -e
 

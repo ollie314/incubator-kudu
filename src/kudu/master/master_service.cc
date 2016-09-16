@@ -45,44 +45,9 @@ using consensus::RaftPeerPB;
 using std::string;
 using std::vector;
 using std::shared_ptr;
+using strings::Substitute;
 
 namespace {
-
-template<class RespClass>
-bool CheckCatalogManagerInitializedOrRespond(Master* master,
-                                             RespClass* resp,
-                                             rpc::RpcContext* rpc) {
-  if (PREDICT_FALSE(!master->catalog_manager()->IsInitialized())) {
-    SetupErrorAndRespond(resp->mutable_error(),
-                         Status::ServiceUnavailable("catalog manager has not been initialized"),
-                         MasterErrorPB::CATALOG_MANAGER_NOT_INITIALIZED,
-                         rpc);
-    return false;
-  }
-  return true;
-}
-
-template<class RespClass>
-bool CheckIsLeaderOrRespond(Master* master,
-                            RespClass* resp,
-                            rpc::RpcContext* rpc) {
-  Status s = master->catalog_manager()->CheckIsLeaderAndReady();
-  if (PREDICT_FALSE(!s.ok())) {
-    SetupErrorAndRespond(resp->mutable_error(), s,
-                         MasterErrorPB::NOT_THE_LEADER,
-                         rpc);
-    return false;
-  }
-  return true;
-}
-
-template<class RespClass>
-bool CheckLeaderAndCatalogManagerInitializedOrRespond(Master* master,
-                                                      RespClass* resp,
-                                                      rpc::RpcContext* rpc) {
-  return PREDICT_TRUE(CheckCatalogManagerInitializedOrRespond(master, resp, rpc) &&
-                      CheckIsLeaderOrRespond(master, resp, rpc));
-}
 
 // If 's' is not OK and 'resp' has no application specific error set,
 // set the error field of 'resp' to match 's' and set the code to
@@ -97,19 +62,8 @@ void CheckRespErrorOrSetUnknown(const Status& s, RespClass* resp) {
 
 } // anonymous namespace
 
-static void SetupErrorAndRespond(MasterErrorPB* error,
-                                 const Status& s,
-                                 MasterErrorPB::Code code,
-                                 rpc::RpcContext* rpc) {
-  StatusToPB(s, error->mutable_status());
-  error->set_code(code);
-  // TODO RespondSuccess() is better called 'Respond'.
-  rpc->RespondSuccess();
-}
-
-
 MasterServiceImpl::MasterServiceImpl(Master* server)
-  : MasterServiceIf(server->metric_entity()),
+  : MasterServiceIf(server->metric_entity(), server->result_tracker()),
     server_(server) {
 }
 
@@ -125,80 +79,64 @@ void MasterServiceImpl::TSHeartbeat(const TSHeartbeatRequestPB* req,
   // If CatalogManager is not initialized don't even know whether
   // or not we will be a leader (so we can't tell whether or not we can
   // accept tablet reports).
-  if (!CheckCatalogManagerInitializedOrRespond(server_, resp, rpc)) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedOrRespond(resp, rpc)) {
     return;
   }
+  bool is_leader_master = l.leader_status().ok();
 
+  // 2. All responses contain this.
   resp->mutable_master_instance()->CopyFrom(server_->instance_pb());
-  Status s = server_->catalog_manager()->CheckIsLeaderAndReady();
-  if (!s.ok()) {
-    // For the time being, ignore heartbeats sent to non-leader distributed
-    // masters.
-    //
-    // TODO KUDU-493 Allow all master processes to receive heartbeat
-    // information: by having the TabletServers send heartbeats to all
-    // masters, or by storing heartbeat information in a replicated
-    // SysTable.
-    LOG(WARNING) << "Received a heartbeat, but this Master instance is not a leader or a "
-                 << "single Master: " << s.ToString();
-    resp->set_leader_master(false);
-    rpc->RespondSuccess();
-    return;
-  }
-  resp->set_leader_master(true);
+  resp->set_leader_master(is_leader_master);
 
+  // 3. Register or look up the tserver.
   shared_ptr<TSDescriptor> ts_desc;
-  // If the TS is registering, register in the TS manager.
   if (req->has_registration()) {
     Status s = server_->ts_manager()->RegisterTS(req->common().ts_instance(),
                                                  req->registration(),
                                                  &ts_desc);
     if (!s.ok()) {
-      LOG(WARNING) << "Unable to register tablet server (" << rpc->requestor_string() << "): "
-                   << s.ToString();
+      LOG(WARNING) << Substitute("Unable to register tserver ($0): $1",
+                                 rpc->requestor_string(), s.ToString());
       // TODO: add service-specific errors
       rpc->RespondFailure(s);
       return;
     }
-  }
+  } else {
+    Status s = server_->ts_manager()->LookupTS(req->common().ts_instance(), &ts_desc);
+    if (s.IsNotFound()) {
+      LOG(INFO) << Substitute("Got heartbeat from unknown tserver ($0) as $1; "
+          "Asking this server to re-register.",
+          req->common().ts_instance().ShortDebugString(), rpc->requestor_string());
+      resp->set_needs_reregister(true);
 
-  // TODO: KUDU-86 if something fails after this point the TS will not be able
-  //       to register again.
+      // Don't bother asking for a full tablet report if we're a follower;
+      // it'll just get ignored anyway.
+      resp->set_needs_full_tablet_report(is_leader_master);
 
-  // Look up the TS -- if it just registered above, it will be found here.
-  // This allows the TS to register and tablet-report in the same RPC.
-  s = server_->ts_manager()->LookupTS(req->common().ts_instance(), &ts_desc);
-  if (s.IsNotFound()) {
-    LOG(INFO) << "Got heartbeat from  unknown tablet server { "
-              << req->common().ts_instance().ShortDebugString()
-              << " } as " << rpc->requestor_string()
-              << "; Asking this server to re-register.";
-    resp->set_needs_reregister(true);
-    resp->set_needs_full_tablet_report(true);
-    rpc->RespondSuccess();
-    return;
-  } else if (!s.ok()) {
-    LOG(WARNING) << "Unable to look up tablet server for heartbeat request "
-                 << req->DebugString() << " from " << rpc->requestor_string()
-                 << "\nStatus: " << s.ToString();
-    rpc->RespondFailure(s.CloneAndPrepend("Unable to lookup TS"));
-    return;
-  }
-
-  ts_desc->UpdateHeartbeatTime();
-  ts_desc->set_num_live_replicas(req->num_live_tablets());
-
-  if (req->has_tablet_report()) {
-    s = server_->catalog_manager()->ProcessTabletReport(
-      ts_desc.get(), req->tablet_report(), resp->mutable_tablet_report(), rpc);
-    if (!s.ok()) {
-      rpc->RespondFailure(s.CloneAndPrepend("Failed to process tablet report"));
+      rpc->RespondSuccess();
+      return;
+    } else if (!s.ok()) {
+      LOG(WARNING) << Substitute("Unable to look up tserver for heartbeat "
+          "request $0 from $1: $2", req->DebugString(),
+          rpc->requestor_string(), s.ToString());
+      rpc->RespondFailure(s.CloneAndPrepend("Unable to lookup tserver"));
       return;
     }
   }
 
-  if (!ts_desc->has_tablet_report()) {
-    resp->set_needs_full_tablet_report(true);
+  // 4. Update tserver soft state based on the heartbeat contents.
+  ts_desc->UpdateHeartbeatTime();
+  ts_desc->set_num_live_replicas(req->num_live_tablets());
+
+  // 5. Only leaders handle tablet reports.
+  if (is_leader_master && req->has_tablet_report()) {
+    Status s = server_->catalog_manager()->ProcessTabletReport(
+        ts_desc.get(), req->tablet_report(), resp->mutable_tablet_report(), rpc);
+    if (!s.ok()) {
+      rpc->RespondFailure(s.CloneAndPrepend("Failed to process tablet report"));
+      return;
+    }
   }
 
   rpc->RespondSuccess();
@@ -207,7 +145,8 @@ void MasterServiceImpl::TSHeartbeat(const TSHeartbeatRequestPB* req,
 void MasterServiceImpl::GetTabletLocations(const GetTabletLocationsRequestPB* req,
                                            GetTabletLocationsResponsePB* resp,
                                            rpc::RpcContext* rpc) {
-  if (!CheckLeaderAndCatalogManagerInitializedOrRespond(server_, resp, rpc)) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
     return;
   }
 
@@ -215,7 +154,7 @@ void MasterServiceImpl::GetTabletLocations(const GetTabletLocationsRequestPB* re
     SleepFor(MonoDelta::FromMilliseconds(FLAGS_master_inject_latency_on_tablet_lookups_ms));
   }
 
-  TSRegistrationPB reg;
+  ServerRegistrationPB reg;
   vector<TSDescriptor*> locs;
   for (const string& tablet_id : req->tablet_ids()) {
     // TODO: once we have catalog data. ACL checks would also go here, probably.
@@ -236,7 +175,8 @@ void MasterServiceImpl::GetTabletLocations(const GetTabletLocationsRequestPB* re
 void MasterServiceImpl::CreateTable(const CreateTableRequestPB* req,
                                     CreateTableResponsePB* resp,
                                     rpc::RpcContext* rpc) {
-  if (!CheckLeaderAndCatalogManagerInitializedOrRespond(server_, resp, rpc)) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
     return;
   }
 
@@ -248,7 +188,8 @@ void MasterServiceImpl::CreateTable(const CreateTableRequestPB* req,
 void MasterServiceImpl::IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
                                           IsCreateTableDoneResponsePB* resp,
                                           rpc::RpcContext* rpc) {
-  if (!CheckLeaderAndCatalogManagerInitializedOrRespond(server_, resp, rpc)) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
     return;
   }
 
@@ -260,7 +201,8 @@ void MasterServiceImpl::IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
 void MasterServiceImpl::DeleteTable(const DeleteTableRequestPB* req,
                                     DeleteTableResponsePB* resp,
                                     rpc::RpcContext* rpc) {
-  if (!CheckLeaderAndCatalogManagerInitializedOrRespond(server_, resp, rpc)) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
     return;
   }
 
@@ -272,7 +214,8 @@ void MasterServiceImpl::DeleteTable(const DeleteTableRequestPB* req,
 void MasterServiceImpl::AlterTable(const AlterTableRequestPB* req,
                                    AlterTableResponsePB* resp,
                                    rpc::RpcContext* rpc) {
-  if (!CheckLeaderAndCatalogManagerInitializedOrRespond(server_, resp, rpc)) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
     return;
   }
 
@@ -284,7 +227,8 @@ void MasterServiceImpl::AlterTable(const AlterTableRequestPB* req,
 void MasterServiceImpl::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
                                          IsAlterTableDoneResponsePB* resp,
                                          rpc::RpcContext* rpc) {
-  if (!CheckLeaderAndCatalogManagerInitializedOrRespond(server_, resp, rpc)) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
     return;
   }
 
@@ -296,7 +240,8 @@ void MasterServiceImpl::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
 void MasterServiceImpl::ListTables(const ListTablesRequestPB* req,
                                    ListTablesResponsePB* resp,
                                    rpc::RpcContext* rpc) {
-  if (!CheckLeaderAndCatalogManagerInitializedOrRespond(server_, resp, rpc)) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
     return;
   }
 
@@ -308,9 +253,11 @@ void MasterServiceImpl::ListTables(const ListTablesRequestPB* req,
 void MasterServiceImpl::GetTableLocations(const GetTableLocationsRequestPB* req,
                                           GetTableLocationsResponsePB* resp,
                                           rpc::RpcContext* rpc) {
-  if (!CheckLeaderAndCatalogManagerInitializedOrRespond(server_, resp, rpc)) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
     return;
   }
+
   if (PREDICT_FALSE(FLAGS_master_inject_latency_on_tablet_lookups_ms > 0)) {
     SleepFor(MonoDelta::FromMilliseconds(FLAGS_master_inject_latency_on_tablet_lookups_ms));
   }
@@ -322,7 +269,8 @@ void MasterServiceImpl::GetTableLocations(const GetTableLocationsRequestPB* req,
 void MasterServiceImpl::GetTableSchema(const GetTableSchemaRequestPB* req,
                                        GetTableSchemaResponsePB* resp,
                                        rpc::RpcContext* rpc) {
-  if (!CheckLeaderAndCatalogManagerInitializedOrRespond(server_, resp, rpc)) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
     return;
   }
 
@@ -334,10 +282,6 @@ void MasterServiceImpl::GetTableSchema(const GetTableSchemaRequestPB* req,
 void MasterServiceImpl::ListTabletServers(const ListTabletServersRequestPB* req,
                                           ListTabletServersResponsePB* resp,
                                           rpc::RpcContext* rpc) {
-  if (!CheckLeaderAndCatalogManagerInitializedOrRespond(server_, resp, rpc)) {
-    return;
-  }
-
   vector<std::shared_ptr<TSDescriptor> > descs;
   server_->ts_manager()->GetAllDescriptors(&descs);
   for (const std::shared_ptr<TSDescriptor>& desc : descs) {
@@ -370,13 +314,24 @@ void MasterServiceImpl::GetMasterRegistration(const GetMasterRegistrationRequest
                                               rpc::RpcContext* rpc) {
   // instance_id must always be set in order for status pages to be useful.
   resp->mutable_instance_id()->CopyFrom(server_->instance_pb());
-  if (!CheckCatalogManagerInitializedOrRespond(server_, resp, rpc)) {
+
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedOrRespond(resp, rpc)) {
     return;
   }
+
   Status s = server_->GetMasterRegistration(resp->mutable_registration());
   CheckRespErrorOrSetUnknown(s, resp);
   resp->set_role(server_->catalog_manager()->Role());
   rpc->RespondSuccess();
+}
+
+bool MasterServiceImpl::SupportsFeature(uint32_t feature) const {
+  switch (feature) {
+    case MasterFeatures::RANGE_PARTITION_BOUNDS:
+    case MasterFeatures::ADD_DROP_RANGE_PARTITIONS: return true;
+    default: return false;
+  }
 }
 
 } // namespace master

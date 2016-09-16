@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <ctime>
+
 #include <glog/logging.h>
-#include <time.h>
 
 #include "kudu/common/iterator.h"
 #include "kudu/common/row.h"
@@ -203,7 +204,7 @@ TYPED_TEST(TestTablet, TestInsertDuplicateKey) {
 
   // Insert again, should fail!
   Status s = this->InsertTestRow(&writer, 12345, 0);
-  ASSERT_STR_CONTAINS(s.ToString(), "entry already present in memrowset");
+  ASSERT_STR_CONTAINS(s.ToString(), "key already present");
 
   ASSERT_EQ(1, this->TabletCount());
 
@@ -552,17 +553,22 @@ TYPED_TEST(TestTablet, TestInsertsPersist) {
   this->InsertTestRows(0, max_rows, 0);
   ASSERT_EQ(max_rows, this->TabletCount());
 
+  // Get current timestamp.
+  Timestamp t = this->tablet()->clock()->Now();
+
   // Flush it.
   ASSERT_OK(this->tablet()->Flush());
 
   ASSERT_EQ(max_rows, this->TabletCount());
 
-  // Close and re-open tablet
+  // Close and re-open tablet.
+  // TODO: Should we be reopening the tablet in a different way to persist the
+  // clock / timestamps?
   this->TabletReOpen();
 
   // Ensure that rows exist
   ASSERT_EQ(max_rows, this->TabletCount());
-  this->VerifyTestRows(0, max_rows);
+  this->VerifyTestRowsWithTimestampAndVerifier(0, max_rows, t, boost::none);
 
   // TODO: add some more data, re-flush
 }
@@ -643,8 +649,6 @@ TYPED_TEST(TestTablet, TestMultipleUpdates) {
   ASSERT_EQ(this->setup_.FormatDebugRow(0, 6, false), out_rows[0]);
   ASSERT_EQ(this->setup_.FormatDebugRow(1, 0, false), out_rows[1]);
 }
-
-
 
 TYPED_TEST(TestTablet, TestCompaction) {
   uint64_t max_rows = this->ClampRowCount(FLAGS_testcompaction_num_rows);
@@ -938,7 +942,7 @@ TYPED_TEST(TestTablet, TestMetricsInit) {
   // Create a tablet, but do not open it
   this->CreateTestTablet();
   MetricRegistry* registry = this->harness()->metrics_registry();
-  std::stringstream out;
+  std::ostringstream out;
   JsonWriter writer(&out, JsonWriter::PRETTY);
   ASSERT_OK(registry->WriteAsJson(&writer, { "*" }, MetricJsonOptions()));
   // Open tablet, should still work

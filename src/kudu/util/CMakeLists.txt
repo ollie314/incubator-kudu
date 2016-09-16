@@ -30,6 +30,20 @@ ADD_EXPORTABLE_LIBRARY(histogram_proto
   NONLINK_DEPS ${HISTOGRAM_PROTO_TGTS})
 
 #######################################
+# maintenance_manager_proto
+#######################################
+
+PROTOBUF_GENERATE_CPP(
+    MAINTENANCE_MANAGER_PROTO_SRCS MAINTENANCE_MANAGER_PROTO_HDRS MAINTENANCE_MANAGER_PROTO_TGTS
+    SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
+    BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
+    PROTO_FILES maintenance_manager.proto)
+ADD_EXPORTABLE_LIBRARY(maintenance_manager_proto
+    SRCS ${MAINTENANCE_MANAGER_PROTO_SRCS}
+    DEPS protobuf
+    NONLINK_DEPS ${MAINTENANCE_MANAGER_PROTO_TGTS})
+
+#######################################
 # pb_util_proto
 #######################################
 
@@ -118,12 +132,12 @@ set(UTIL_SRCS
   kernel_stack_watchdog.cc
   locks.cc
   logging.cc
+  maintenance_manager.cc
   malloc.cc
   memcmpable_varint.cc
   memory/arena.cc
   memory/memory.cc
   memory/overwrite.cc
-  memenv/memenv.cc
   mem_tracker.cc
   metrics.cc
   monotime.cc
@@ -141,6 +155,7 @@ set(UTIL_SRCS
   random_util.cc
   resettable_heartbeater.cc
   rolling_log.cc
+  rw_mutex.cc
   rwc_lock.cc
   ${SEMAPHORE_CC}
   slice.cc
@@ -152,6 +167,7 @@ set(UTIL_SRCS
   subprocess.cc
   sync_point.cc
   test_graph.cc
+  test_util_prod.cc
   thread.cc
   threadlocal.cc
   threadpool.cc
@@ -162,6 +178,7 @@ set(UTIL_SRCS
   user.cc
   url-coding.cc
   version_info.cc
+  zlib.cc
 )
 
 # overwrite.cc contains a single function which would be a hot spot in
@@ -176,13 +193,13 @@ if(NOT APPLE)
 endif()
 
 set(UTIL_LIBS
-  boost_system
-  boost_thread
   crcutil
   gflags
   glog
   gutil
   histogram_proto
+  libev
+  maintenance_manager_proto
   pb_util_proto
   protobuf
   version_info_proto
@@ -191,6 +208,7 @@ set(UTIL_LIBS
 if(NOT APPLE)
   set(UTIL_LIBS
     ${UTIL_LIBS}
+    dl
     rt
     vmem)
 endif()
@@ -204,9 +222,8 @@ endif()
 ADD_EXPORTABLE_LIBRARY(kudu_util
   SRCS ${UTIL_SRCS}
   DEPS ${UTIL_LIBS}
+  NONLINK_DEPS gen_version_info
   EXPORTED_DEPS ${EXPORTED_UTIL_LIBS})
-
-add_dependencies(kudu_util gen_version_info)
 
 #######################################
 # kudu_test_util
@@ -238,11 +255,11 @@ target_link_libraries(kudu_test_main
   glog
   gmock
   kudu_util
-  kudu_test_util
-  dl)
+  kudu_test_util)
 
 if(NOT APPLE)
   target_link_libraries(kudu_test_main
+    dl
     rt)
 endif()
 
@@ -269,6 +286,7 @@ ADD_KUDU_TEST(countdown_latch-test)
 ADD_KUDU_TEST(crc-test RUN_SERIAL true) # has a benchmark
 ADD_KUDU_TEST(debug-util-test)
 ADD_KUDU_TEST(env-test LABELS no_tsan)
+ADD_KUDU_TEST(env_util-test)
 ADD_KUDU_TEST(errno-test)
 ADD_KUDU_TEST(failure_detector-test)
 ADD_KUDU_TEST(flag_tags-test)
@@ -280,10 +298,10 @@ ADD_KUDU_TEST(interval_tree-test)
 ADD_KUDU_TEST(jsonreader-test)
 ADD_KUDU_TEST(knapsack_solver-test)
 ADD_KUDU_TEST(logging-test)
+ADD_KUDU_TEST(maintenance_manager-test)
 ADD_KUDU_TEST(map-util-test)
 ADD_KUDU_TEST(mem_tracker-test)
 ADD_KUDU_TEST(memcmpable_varint-test LABELS no_tsan)
-ADD_KUDU_TEST(memenv/memenv-test)
 ADD_KUDU_TEST(memory/arena-test)
 ADD_KUDU_TEST(metrics-test)
 ADD_KUDU_TEST(monotime-test)
@@ -293,6 +311,7 @@ ADD_KUDU_TEST(mt-threadlocal-test RUN_SERIAL true)
 ADD_KUDU_TEST(net/dns_resolver-test)
 ADD_KUDU_TEST(net/net_util-test)
 ADD_KUDU_TEST(object_pool-test)
+ADD_KUDU_TEST(oid_generator-test)
 ADD_KUDU_TEST(once-test)
 ADD_KUDU_TEST(os-util-test)
 ADD_KUDU_TEST(path_util-test)
@@ -302,6 +321,7 @@ ADD_KUDU_TEST(random_util-test)
 ADD_KUDU_TEST(resettable_heartbeater-test)
 ADD_KUDU_TEST(rle-test)
 ADD_KUDU_TEST(rolling_log-test)
+ADD_KUDU_TEST(rw_mutex-test)
 ADD_KUDU_TEST(rw_semaphore-test)
 ADD_KUDU_TEST(rwc_lock-test)
 ADD_KUDU_TEST(safe_math-test)

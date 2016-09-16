@@ -45,7 +45,6 @@ TAG_FLAG(tablet_inject_latency_on_apply_write_txn_ms, runtime);
 namespace kudu {
 namespace tablet {
 
-using boost::bind;
 using consensus::ReplicateMsg;
 using consensus::CommitMsg;
 using consensus::DriverType;
@@ -59,13 +58,16 @@ using strings::Substitute;
 WriteTransaction::WriteTransaction(unique_ptr<WriteTransactionState> state, DriverType type)
   : Transaction(state.get(), type, Transaction::WRITE_TXN),
   state_(std::move(state)) {
-  start_time_ = MonoTime::Now(MonoTime::FINE);
+  start_time_ = MonoTime::Now();
 }
 
 void WriteTransaction::NewReplicateMsg(gscoped_ptr<ReplicateMsg>* replicate_msg) {
   replicate_msg->reset(new ReplicateMsg);
   (*replicate_msg)->set_op_type(WRITE_OP);
   (*replicate_msg)->mutable_write_request()->CopyFrom(*state()->request());
+  if (state()->are_results_tracked()) {
+    (*replicate_msg)->mutable_request_id()->CopyFrom(state()->request_id());
+  }
 }
 
 Status WriteTransaction::Prepare() {
@@ -127,7 +129,7 @@ Status WriteTransaction::Apply(gscoped_ptr<CommitMsg>* commit_msg) {
   // Add per-row errors to the result, update metrics.
   int i = 0;
   for (const RowOp* op : state()->row_ops()) {
-    if (state()->response() != nullptr && op->result->has_failed_status()) {
+    if (op->result->has_failed_status()) {
       // Replicas disregard the per row errors, for now
       // TODO check the per-row errors against the leader's, at least in debug mode
       WriteResponsePB::PerRowErrorPB* error = state()->response()->add_per_row_errors();
@@ -175,7 +177,7 @@ void WriteTransaction::Finish(TransactionResult result) {
         metrics->commit_wait_duration->Increment(state_->metrics().commit_wait_duration_usec);
       }
       uint64_t op_duration_usec =
-          MonoTime::Now(MonoTime::FINE).GetDeltaSince(start_time_).ToMicroseconds();
+          (MonoTime::Now() - start_time_).ToMicroseconds();
       switch (state()->external_consistency_mode()) {
         case CLIENT_PROPAGATED:
           metrics->write_op_duration_client_propagated_consistency->Increment(op_duration_usec);
@@ -191,8 +193,8 @@ void WriteTransaction::Finish(TransactionResult result) {
 }
 
 string WriteTransaction::ToString() const {
-  MonoTime now(MonoTime::Now(MonoTime::FINE));
-  MonoDelta d = now.GetDeltaSince(start_time_);
+  MonoTime now(MonoTime::Now());
+  MonoDelta d = now - start_time_;
   WallTime abs_time = WallTime_Now() - d.ToSeconds();
   string abs_time_formatted;
   StringAppendStrftime(&abs_time_formatted, "%Y-%m-%d %H:%M:%S", (time_t)abs_time, true);
@@ -202,19 +204,21 @@ string WriteTransaction::ToString() const {
 
 WriteTransactionState::WriteTransactionState(TabletPeer* tablet_peer,
                                              const tserver::WriteRequestPB *request,
+                                             const rpc::RequestIdPB* request_id,
                                              tserver::WriteResponsePB *response)
   : TransactionState(tablet_peer),
-    request_(request),
+    request_(DCHECK_NOTNULL(request)),
     response_(response),
     mvcc_tx_(nullptr),
     schema_at_decode_time_(nullptr) {
-  if (request) {
-    external_consistency_mode_ = request->external_consistency_mode();
-  } else {
-    external_consistency_mode_ = CLIENT_PROPAGATED;
+  external_consistency_mode_ = request_->external_consistency_mode();
+  if (!response_) {
+    response_ = &owned_response_;
+  }
+  if (request_id) {
+    request_id_ = *request_id;
   }
 }
-
 
 void WriteTransactionState::SetMvccTxAndTimestamp(gscoped_ptr<ScopedTransaction> mvcc_tx) {
   DCHECK(!mvcc_tx_) << "Mvcc transaction already started/set.";
@@ -235,7 +239,7 @@ void WriteTransactionState::set_tablet_components(
 
 void WriteTransactionState::AcquireSchemaLock(rw_semaphore* schema_lock) {
   TRACE("Acquiring schema lock in shared mode");
-  shared_lock<rw_semaphore> temp(schema_lock);
+  shared_lock<rw_semaphore> temp(*schema_lock);
   schema_lock_.swap(temp);
   TRACE("Acquired schema lock");
 }
@@ -301,6 +305,10 @@ void WriteTransactionState::UpdateMetricsForOp(const RowOp& op) {
       break;
     case RowOperationsPB::UNKNOWN:
     case RowOperationsPB::SPLIT_ROW:
+    case RowOperationsPB::RANGE_LOWER_BOUND:
+    case RowOperationsPB::RANGE_UPPER_BOUND:
+    case RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND:
+    case RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND:
       break;
   }
 }
@@ -326,7 +334,7 @@ void WriteTransactionState::Reset() {
 }
 
 void WriteTransactionState::ResetRpcFields() {
-  lock_guard<simple_spinlock> l(&txn_state_lock_);
+  std::lock_guard<simple_spinlock> l(txn_state_lock_);
   request_ = nullptr;
   response_ = nullptr;
   STLDeleteElements(&row_ops_);
@@ -345,7 +353,7 @@ string WriteTransactionState::ToString() const {
   // user data escaping into the log. See KUDU-387.
   string row_ops_str = "[";
   {
-    lock_guard<simple_spinlock> l(&txn_state_lock_);
+    std::lock_guard<simple_spinlock> l(txn_state_lock_);
     const size_t kMaxToStringify = 3;
     for (int i = 0; i < std::min(row_ops_.size(), kMaxToStringify); i++) {
       if (i > 0) {

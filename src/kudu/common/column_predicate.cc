@@ -85,6 +85,28 @@ boost::optional<ColumnPredicate> ColumnPredicate::InclusiveRange(ColumnSchema co
   return ColumnPredicate::Range(move(column), lower, upper);
 }
 
+ColumnPredicate ColumnPredicate::ExclusiveRange(ColumnSchema column,
+                                                const void* lower,
+                                                const void* upper,
+                                                Arena* arena) {
+  CHECK(lower != nullptr || upper != nullptr);
+
+  if (lower != nullptr) {
+    // Transform the lower bound to inclusive by incrementing it.
+    // Make a copy of the value before incrementing in case it's aliased.
+    size_t size = column.type_info()->size();
+    void* buf = CHECK_NOTNULL(arena->AllocateBytes(size));
+    memcpy(buf, lower, size);
+    if (!key_util::IncrementCell(column, buf, arena)) {
+      // If incrementing the lower bound fails then the predicate can match no values.
+      return ColumnPredicate::None(move(column));
+    } else {
+      lower = buf;
+    }
+  }
+  return ColumnPredicate::Range(move(column), lower, upper);
+}
+
 ColumnPredicate ColumnPredicate::IsNotNull(ColumnSchema column) {
   CHECK(column.is_nullable());
   return ColumnPredicate(PredicateType::IsNotNull, move(column), nullptr, nullptr);
@@ -177,8 +199,8 @@ void ColumnPredicate::MergeIntoRange(const ColumnPredicate& other) {
     };
 
     case PredicateType::Equality: {
-      if (column_.type_info()->Compare(lower_, other.lower_) > 0 ||
-          column_.type_info()->Compare(upper_, other.lower_) <= 0) {
+      if ((lower_ != nullptr && column_.type_info()->Compare(lower_, other.lower_) > 0) ||
+          (upper_ != nullptr && column_.type_info()->Compare(upper_, other.lower_) <= 0)) {
         // The equality value does not fall in this range.
         SetToNone();
       } else {
@@ -202,8 +224,8 @@ void ColumnPredicate::MergeIntoEquality(const ColumnPredicate& other) {
       return;
     }
     case PredicateType::Range: {
-      if (column_.type_info()->Compare(lower_, other.lower_) < 0 ||
-          column_.type_info()->Compare(lower_, other.upper_) >= 0) {
+      if ((other.lower_ != nullptr && column_.type_info()->Compare(lower_, other.lower_) < 0) ||
+          (other.upper_ != nullptr && column_.type_info()->Compare(lower_, other.upper_) >= 0)) {
         // This equality value does not fall in the other range.
         SetToNone();
       }
@@ -243,49 +265,32 @@ void ApplyPredicate(const ColumnBlock& block, SelectionVector* sel, P p) {
 }
 } // anonymous namespace
 
-void ColumnPredicate::Evaluate(const ColumnBlock& block, SelectionVector *sel) const {
-  CHECK_NOTNULL(sel);
-
-  // The type-specific predicate is provided as a function template to
-  // ApplyPredicate in the hope that they are inlined.
-  //
-  // TODO: In the future we can improve this by also providing the type info as a
-  // template, so that the type-specific data comparisons can be inlined.
-  //
-  // Going a step further we could do runtime codegen to inline the
-  // lower/upper/equality bounds.
-
-  // TODO: equality predicates should use the bloomfilter if it's available.
-
+template <DataType PhysicalType>
+void ColumnPredicate::EvaluateForPhysicalType(const ColumnBlock& block,
+                                              SelectionVector* sel) const {
   switch (predicate_type()) {
-    case PredicateType::None: {
-      ApplyPredicate(block, sel, [] (const void*) {
-          return false;
-      });
-      return;
-    };
     case PredicateType::Range: {
       if (lower_ == nullptr) {
         ApplyPredicate(block, sel, [this] (const void* cell) {
-            return column_.type_info()->Compare(cell, this->upper_) < 0;
+          return DataTypeTraits<PhysicalType>::Compare(cell, this->upper_) < 0;
         });
       } else if (upper_ == nullptr) {
         ApplyPredicate(block, sel, [this] (const void* cell) {
-            return column_.type_info()->Compare(cell, this->lower_) >= 0;
+          return DataTypeTraits<PhysicalType>::Compare(cell, this->lower_) >= 0;
         });
       } else {
         ApplyPredicate(block, sel, [this] (const void* cell) {
-            return column_.type_info()->Compare(cell, this->upper_) < 0 &&
-                   column_.type_info()->Compare(cell, this->lower_) >= 0;
+          return DataTypeTraits<PhysicalType>::Compare(cell, this->upper_) < 0 &&
+                 DataTypeTraits<PhysicalType>::Compare(cell, this->lower_) >= 0;
         });
       }
       return;
     };
     case PredicateType::Equality: {
-        ApplyPredicate(block, sel, [this] (const void* cell) {
-            return column_.type_info()->Compare(cell, this->lower_) == 0;
-        });
-        return;
+      ApplyPredicate(block, sel, [this] (const void* cell) {
+        return DataTypeTraits<PhysicalType>::Compare(cell, this->lower_) == 0;
+      });
+      return;
     };
     case PredicateType::IsNotNull: {
       if (!block.is_nullable()) return;
@@ -298,8 +303,28 @@ void ColumnPredicate::Evaluate(const ColumnBlock& block, SelectionVector *sel) c
       }
       return;
     }
+    default:
+      LOG(FATAL) << "unknown predicate type";
   }
-  LOG(FATAL) << "unknown predicate type";
+}
+
+void ColumnPredicate::Evaluate(const ColumnBlock& block, SelectionVector* sel) const {
+  DCHECK(sel);
+  switch (block.type_info()->physical_type()) {
+    case BOOL: return EvaluateForPhysicalType<BOOL>(block, sel);
+    case INT8: return EvaluateForPhysicalType<INT8>(block, sel);
+    case INT16: return EvaluateForPhysicalType<INT16>(block, sel);
+    case INT32: return EvaluateForPhysicalType<INT32>(block, sel);
+    case INT64: return EvaluateForPhysicalType<INT64>(block, sel);
+    case UINT8: return EvaluateForPhysicalType<UINT8>(block, sel);
+    case UINT16: return EvaluateForPhysicalType<UINT16>(block, sel);
+    case UINT32: return EvaluateForPhysicalType<UINT32>(block, sel);
+    case UINT64: return EvaluateForPhysicalType<UINT64>(block, sel);
+    case FLOAT: return EvaluateForPhysicalType<FLOAT>(block, sel);
+    case DOUBLE: return EvaluateForPhysicalType<DOUBLE>(block, sel);
+    case BINARY: return EvaluateForPhysicalType<BINARY>(block, sel);
+    default: LOG(FATAL) << "unknown physical type: " << block.type_info()->physical_type();
+  }
 }
 
 string ColumnPredicate::ToString() const {
@@ -347,13 +372,15 @@ bool ColumnPredicate::operator==(const ColumnPredicate& other) const {
 
 namespace {
 int SelectivityRank(const ColumnPredicate& predicate) {
+  int rank;
   switch (predicate.predicate_type()) {
-    case PredicateType::None: return 0;
-    case PredicateType::Equality: return 1;
-    case PredicateType::Range: return 2;
-    case PredicateType::IsNotNull: return 3;
+    case PredicateType::None: rank = 0; break;
+    case PredicateType::Equality: rank = 1; break;
+    case PredicateType::Range: rank = 2; break;
+    case PredicateType::IsNotNull: rank = 3; break;
+    default: LOG(FATAL) << "unknown predicate type";
   }
-  LOG(FATAL) << "unknown predicate type";
+  return rank * (kLargestTypeSize + 1) + predicate.column().type_info()->size();
 }
 } // anonymous namespace
 

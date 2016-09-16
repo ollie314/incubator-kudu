@@ -132,7 +132,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
     return partition_schema_;
   }
 
-  // Set / get the remote bootstrap / tablet data state.
+  // Set / get the tablet copy / tablet data state.
   void set_tablet_data_state(TabletDataState state);
   TabletDataState tablet_data_state() const;
 
@@ -173,7 +173,9 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // then delete all of the rowsets in this tablet.
   // The metadata (superblock) is not deleted. For that, call DeleteSuperBlock().
   //
-  // 'delete_type' must be one of TABLET_DATA_DELETED or TABLET_DATA_TOMBSTONED.
+  // 'delete_type' must be one of TABLET_DATA_DELETED, TABLET_DATA_TOMBSTONED,
+  // or TABLET_DATA_COPYING.
+  //
   // 'last_logged_opid' should be set to the last opid in the log, if any is known.
   // If 'last_logged_opid' is not set, then the current value of
   // last_logged_opid is not modified. This is important for roll-forward of
@@ -323,7 +325,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // Protected by 'data_lock_'.
   std::unordered_set<BlockId, BlockIdHash, BlockIdEqual> orphaned_blocks_;
 
-  // The current state of remote bootstrap for the tablet.
+  // The current state of tablet copy for the tablet.
   TabletDataState tablet_data_state_;
 
   // Record of the last opid logged by the tablet before it was last

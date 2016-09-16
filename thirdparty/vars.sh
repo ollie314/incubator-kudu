@@ -136,8 +136,11 @@ GCC_BUILD_DIR=${GCC_DIR}.build
 #
 # The source can be found at https://github.com/cloudera/kudu-trace-viewer
 # and built with "kudu-build.sh" included within the repository.
-TRACE_VIEWER_VERSION=45f6525d8aa498be53e4137fb73a9e9e036ce91d
+TRACE_VIEWER_VERSION=cd1f3ba6a75aa98f7081353aca4e7ab75d6ad53d
 TRACE_VIEWER_DIR=$TP_DIR/kudu-trace-viewer-${TRACE_VIEWER_VERSION}
 
-NVML_VERSION=1.0-b1
+NVML_VERSION=1.1
 NVML_DIR=$TP_DIR/nvml-$NVML_VERSION
+
+BOOST_VERSION=1_61_0
+BOOST_DIR=$TP_DIR/boost_$BOOST_VERSION

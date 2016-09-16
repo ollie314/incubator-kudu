@@ -17,6 +17,7 @@
 
 #include "kudu/tablet/delta_tracker.h"
 
+#include <mutex>
 #include <set>
 
 #include "kudu/gutil/strings/join.h"
@@ -154,7 +155,7 @@ Status DeltaTracker::AtomicUpdateStores(const SharedDeltaStoreVector& to_remove,
   RETURN_NOT_OK_PREPEND(OpenDeltaReaders(new_delta_blocks, &new_stores, type),
                         "Unable to open delta blocks");
 
-  lock_guard<rw_spinlock> lock(&component_lock_);
+  std::lock_guard<rw_spinlock> lock(component_lock_);
   SharedDeltaStoreVector* stores_to_update =
       type == REDO ? &redo_delta_stores_ : &undo_delta_stores_;
   SharedDeltaStoreVector::iterator start_it;
@@ -197,7 +198,10 @@ Status DeltaTracker::CompactStores(int start_idx, int end_idx) {
   // Prevent concurrent compactions or a compaction concurrent with a flush
   //
   // TODO(perf): this could be more fine grained
-  lock_guard<Mutex> l(&compact_flush_lock_);
+  std::lock_guard<Mutex> l(compact_flush_lock_);
+
+  // At the time of writing, minor delta compaction only compacts REDO delta
+  // files, so we need at least 2 REDO delta stores to proceed.
   if (CountRedoDeltaStores() <= 1) {
     return Status::OK();
   }
@@ -272,7 +276,7 @@ Status DeltaTracker::DoCompactStores(size_t start_idx, size_t end_idx,
 
 void DeltaTracker::CollectStores(vector<shared_ptr<DeltaStore>>* deltas,
                                  WhichStores which) const {
-  lock_guard<rw_spinlock> lock(&component_lock_);
+  std::lock_guard<rw_spinlock> lock(component_lock_);
   if (which != REDOS_ONLY) {
     deltas->assign(undo_delta_stores_.begin(), undo_delta_stores_.end());
   }
@@ -298,7 +302,7 @@ Status DeltaTracker::NewDeltaFileIterator(
     vector<shared_ptr<DeltaStore> >* included_stores,
     unique_ptr<DeltaIterator>* out) const {
   {
-    lock_guard<rw_spinlock> lock(&component_lock_);
+    std::lock_guard<rw_spinlock> lock(component_lock_);
     // TODO perf: is this really needed? Will check
     // DeltaIteratorMerger::Create()
     if (type == UNDO) {
@@ -338,7 +342,7 @@ Status DeltaTracker::Update(Timestamp timestamp,
                             const consensus::OpId& op_id,
                             OperationResultPB* result) {
   // TODO: can probably lock this more fine-grained.
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
   DCHECK_LT(row_idx, num_rows_);
 
   Status s = dms_->Update(timestamp, row_idx, update, op_id);
@@ -354,7 +358,7 @@ Status DeltaTracker::Update(Timestamp timestamp,
 
 Status DeltaTracker::CheckRowDeleted(rowid_t row_idx, bool *deleted,
                                      ProbeStats* stats) const {
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
 
   DCHECK_LT(row_idx, num_rows_);
 
@@ -414,7 +418,7 @@ Status DeltaTracker::FlushDMS(DeltaMemStore* dms,
 }
 
 Status DeltaTracker::Flush(MetadataFlushType flush_type) {
-  lock_guard<Mutex> l(&compact_flush_lock_);
+  std::lock_guard<Mutex> l(compact_flush_lock_);
 
   // First, swap out the old DeltaMemStore a new one,
   // and add it to the list of delta stores to be reflected
@@ -424,7 +428,7 @@ Status DeltaTracker::Flush(MetadataFlushType flush_type) {
   {
     // Lock the component_lock_ in exclusive mode.
     // This shuts out any concurrent readers or writers.
-    lock_guard<rw_spinlock> lock(&component_lock_);
+    std::lock_guard<rw_spinlock> lock(component_lock_);
 
     count = dms_->Count();
 
@@ -460,7 +464,7 @@ Status DeltaTracker::Flush(MetadataFlushType flush_type) {
   // Now, re-take the lock and swap in the DeltaFileReader in place of
   // of the DeltaMemStore
   {
-    lock_guard<rw_spinlock> lock(&component_lock_);
+    std::lock_guard<rw_spinlock> lock(component_lock_);
     size_t idx = redo_delta_stores_.size() - 1;
 
     CHECK_EQ(redo_delta_stores_[idx], old_dms)
@@ -475,22 +479,22 @@ Status DeltaTracker::Flush(MetadataFlushType flush_type) {
 }
 
 size_t DeltaTracker::DeltaMemStoreSize() const {
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
   return dms_->memory_footprint();
 }
 
 int64_t DeltaTracker::MinUnflushedLogIndex() const {
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
   return dms_->MinLogIndex();
 }
 
 size_t DeltaTracker::CountRedoDeltaStores() const {
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
   return redo_delta_stores_.size();
 }
 
 uint64_t DeltaTracker::EstimateOnDiskSize() const {
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
   uint64_t size = 0;
   for (const shared_ptr<DeltaStore>& ds : redo_delta_stores_) {
     size += ds->EstimateSize();
@@ -499,7 +503,7 @@ uint64_t DeltaTracker::EstimateOnDiskSize() const {
 }
 
 void DeltaTracker::GetColumnIdsWithUpdates(std::vector<ColumnId>* col_ids) const {
-  shared_lock<rw_spinlock> lock(&component_lock_);
+  shared_lock<rw_spinlock> lock(component_lock_);
 
   set<ColumnId> column_ids_with_updates;
   for (const shared_ptr<DeltaStore>& ds : redo_delta_stores_) {

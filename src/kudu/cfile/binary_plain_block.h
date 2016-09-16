@@ -58,9 +58,17 @@ class BinaryPlainBlockBuilder : public BlockBuilder {
 
   size_t Count() const OVERRIDE;
 
+  // Return the key at index idx.
+  // key should be a Slice*
+  Status GetKeyAtIdx(void* key_void, int idx) const;
+
   // Return the first added key.
-  // key should be a Slice *
-  Status GetFirstKey(void *key) const OVERRIDE;
+  // key should be a Slice*
+  Status GetFirstKey(void* key) const OVERRIDE;
+
+  // Return the last added key.
+  // key should be a Slice*
+  Status GetLastKey(void* key) const OVERRIDE;
 
   // Length of a header.
   static const size_t kMaxHeaderSize = sizeof(uint32_t) * 3;
@@ -89,6 +97,10 @@ class BinaryPlainBlockDecoder : public BlockDecoder {
   virtual Status SeekAtOrAfterValue(const void *value,
                                     bool *exact_match) OVERRIDE;
   Status CopyNextValues(size_t *n, ColumnDataView *dst) OVERRIDE;
+  Status CopyNextAndEval(size_t* n,
+                         ColumnMaterializationContext* ctx,
+                         SelectionVectorView* sel,
+                         ColumnDataView* dst) override;
 
   virtual bool HasNext() const OVERRIDE {
     DCHECK(parsed_);
@@ -119,6 +131,14 @@ class BinaryPlainBlockDecoder : public BlockDecoder {
   static const size_t kMinHeaderSize = sizeof(uint32_t) * 3;
 
  private:
+  // Helper template for handling batches of rows. CellHandler is a lambda that
+  // gets called on every cell. When decoder evaluation is enabled, it
+  // evaluates whether or not the string should be copied and sets a
+  // SelectionVectorView bit at the appropriate location. When decoder
+  // evaluation is disabled, it copies the cell's string to dst.
+  template <typename CellHandler>
+  Status HandleBatch(size_t* n, ColumnDataView* dst, CellHandler c);
+
   Slice data_;
   bool parsed_;
 

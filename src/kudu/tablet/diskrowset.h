@@ -22,9 +22,9 @@
 #ifndef KUDU_TABLET_DISKROWSET_H_
 #define KUDU_TABLET_DISKROWSET_H_
 
-#include <boost/thread/mutex.hpp>
 #include <gtest/gtest_prod.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -61,6 +61,7 @@ class CFileSet;
 class DeltaFileWriter;
 class DeltaStats;
 class DeltaTracker;
+class HistoryGcOpts;
 class MultiColumnWriter;
 class Mutation;
 class OperationResultPB;
@@ -346,9 +347,9 @@ class DiskRowSet : public RowSet {
   double DeltaStoresCompactionPerfImprovementScore(DeltaCompactionType type) const OVERRIDE;
 
   // Major compacts all the delta files for all the columns.
-  Status MajorCompactDeltaStores();
+  Status MajorCompactDeltaStores(HistoryGcOpts history_gc_opts);
 
-  boost::mutex *compact_flush_lock() OVERRIDE {
+  std::mutex *compact_flush_lock() OVERRIDE {
     return &compact_flush_lock_;
   }
 
@@ -370,6 +371,7 @@ class DiskRowSet : public RowSet {
   FRIEND_TEST(TestRowSet, TestRowSetUpdate);
   FRIEND_TEST(TestRowSet, TestDMSFlush);
   FRIEND_TEST(TestCompaction, TestOneToOne);
+  FRIEND_TEST(TabletHistoryGcTest, TestMajorDeltaCompactionOnSubsetOfColumns);
 
   friend class CompactionInput;
   friend class Tablet;
@@ -382,10 +384,12 @@ class DiskRowSet : public RowSet {
 
   // Create a new major delta compaction object to compact the specified columns.
   Status NewMajorDeltaCompaction(const std::vector<ColumnId>& col_ids,
+                                 HistoryGcOpts history_gc_opts,
                                  gscoped_ptr<MajorDeltaCompaction>* out) const;
 
   // Major compacts all the delta files for the specified columns.
-  Status MajorCompactDeltaStoresWithColumnIds(const std::vector<ColumnId>& col_ids);
+  Status MajorCompactDeltaStoresWithColumnIds(const std::vector<ColumnId>& col_ids,
+                                              HistoryGcOpts history_gc_opts);
 
   std::shared_ptr<RowSetMetadata> rowset_metadata_;
 
@@ -402,7 +406,7 @@ class DiskRowSet : public RowSet {
 
   // Lock governing this rowset's inclusion in a compact/flush. If locked,
   // no other compactor will attempt to include this rowset.
-  boost::mutex compact_flush_lock_;
+  std::mutex compact_flush_lock_;
 
   DISALLOW_COPY_AND_ASSIGN(DiskRowSet);
 };

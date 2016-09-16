@@ -15,15 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/ptr_container/ptr_vector.hpp>
-#include <boost/thread/thread.hpp>
-#include <boost/thread/barrier.hpp>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <boost/unordered_set.hpp>
+#include <thread>
+#include <unordered_set>
 
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/tablet/concurrent_btree.h"
+#include "kudu/util/barrier.h"
 #include "kudu/util/hexdump.h"
 #include "kudu/util/memory/memory.h"
 #include "kudu/util/memory/overwrite.h"
@@ -35,7 +34,9 @@ namespace kudu {
 namespace tablet {
 namespace btree {
 
-using boost::unordered_set;
+using std::thread;
+using std::unordered_set;
+using std::vector;
 
 class TestCBTree : public KuduTest {
  protected:
@@ -244,20 +245,20 @@ void VerifyRange(const CBTree<T> &tree,
 // into the given tree, then verifies that they are all
 // inserted properly
 template<class T>
-void InsertAndVerify(boost::barrier *go_barrier,
-                     boost::barrier *done_barrier,
+void InsertAndVerify(Barrier *go_barrier,
+                     Barrier *done_barrier,
                      gscoped_ptr<CBTree<T> > *tree,
                      int start_idx,
                      int end_idx) {
   while (true) {
-    go_barrier->wait();
+    go_barrier->Wait();
 
     if (tree->get() == nullptr) return;
 
     InsertRange(tree->get(), start_idx, end_idx);
     VerifyRange(*tree->get(), start_idx, end_idx);
 
-    done_barrier->wait();
+    done_barrier->Wait();
   }
 }
 
@@ -384,7 +385,7 @@ TEST_F(TestCBTree, TestVersionLockSimple) {
 // locks and unlocks a version field a predetermined number of times.
 // Verifies that the counters are correct at the end.
 TEST_F(TestCBTree, TestVersionLockConcurrent) {
-  boost::ptr_vector<boost::thread> threads;
+  vector<thread> threads;
   int num_threads = 4;
   int split_per_thread = 2348;
   int insert_per_thread = 8327;
@@ -392,11 +393,10 @@ TEST_F(TestCBTree, TestVersionLockConcurrent) {
   AtomicVersion v = 0;
 
   for (int i = 0; i < num_threads; i++) {
-    threads.push_back(new boost::thread(
-                        LockCycleThread, &v, split_per_thread, insert_per_thread));
+    threads.emplace_back(LockCycleThread, &v, split_per_thread, insert_per_thread);
   }
 
-  for (boost::thread &thr : threads) {
+  for (thread& thr : threads) {
     thr.join();
   }
 
@@ -431,19 +431,18 @@ void TestCBTree::DoTestConcurrentInsert() {
   int n_trials = 30;
 #endif
 
-  boost::ptr_vector<boost::thread> threads;
-  boost::barrier go_barrier(num_threads + 1);
-  boost::barrier done_barrier(num_threads + 1);
+  vector<thread> threads;
+  Barrier go_barrier(num_threads + 1);
+  Barrier done_barrier(num_threads + 1);
 
 
   for (int i = 0; i < num_threads; i++) {
-    threads.push_back(new boost::thread(
-                        InsertAndVerify<TraitsClass>,
-                        &go_barrier,
-                        &done_barrier,
-                        &tree,
-                        ins_per_thread * i,
-                        ins_per_thread * (i + 1)));
+    threads.emplace_back(InsertAndVerify<TraitsClass>,
+                         &go_barrier,
+                         &done_barrier,
+                         &tree,
+                         ins_per_thread * i,
+                         ins_per_thread * (i + 1));
   }
 
 
@@ -454,9 +453,9 @@ void TestCBTree::DoTestConcurrentInsert() {
 
   for (int trial = 0; trial < n_trials; trial++) {
     tree.reset(new CBTree<TraitsClass>());
-    go_barrier.wait();
+    go_barrier.Wait();
 
-    done_barrier.wait();
+    done_barrier.Wait();
 
     if (::testing::Test::HasFatalFailure()) {
       tree->DebugPrint();
@@ -465,9 +464,9 @@ void TestCBTree::DoTestConcurrentInsert() {
   }
 
   tree.reset(nullptr);
-  go_barrier.wait();
+  go_barrier.Wait();
 
-  for (boost::thread &thr : threads) {
+  for (thread &thr : threads) {
     thr.join();
   }
 }
@@ -639,11 +638,11 @@ TEST_F(TestCBTree, TestIteratorSeekConditions) {
 //   go_barrier: waits on this barrier to start running
 //   done_barrier: waits on this barrier once finished.
 template<class T>
-static void ScanThread(boost::barrier *go_barrier,
-                       boost::barrier *done_barrier,
+static void ScanThread(Barrier *go_barrier,
+                       Barrier *done_barrier,
                        gscoped_ptr<CBTree<T> > *tree) {
   while (true) {
-    go_barrier->wait();
+    go_barrier->Wait();
     if (tree->get() == nullptr) return;
 
     int prev_count = 0;
@@ -673,7 +672,7 @@ static void ScanThread(boost::barrier *go_barrier,
       ASSERT_GE(count, prev_count);
     } while (count != prev_count || count == 0);
 
-    done_barrier->wait();
+    done_barrier->Wait();
   }
 }
 
@@ -693,25 +692,23 @@ TEST_F(TestCBTree, TestConcurrentIterateAndInsert) {
     ins_per_thread = 30000;
   }
 
-  boost::ptr_vector<boost::thread> threads;
-  boost::barrier go_barrier(num_threads + 1);
-  boost::barrier done_barrier(num_threads + 1);
+  vector<thread> threads;
+  Barrier go_barrier(num_threads + 1);
+  Barrier done_barrier(num_threads + 1);
 
   for (int i = 0; i < num_ins_threads; i++) {
-    threads.push_back(new boost::thread(
-                        InsertAndVerify<SmallFanoutTraits>,
-                        &go_barrier,
-                        &done_barrier,
-                        &tree,
-                        ins_per_thread * i,
-                        ins_per_thread * (i + 1)));
+    threads.emplace_back(InsertAndVerify<SmallFanoutTraits>,
+                         &go_barrier,
+                         &done_barrier,
+                         &tree,
+                         ins_per_thread * i,
+                         ins_per_thread * (i + 1));
   }
   for (int i = 0; i < num_scan_threads; i++) {
-    threads.push_back(new boost::thread(
-                        ScanThread<SmallFanoutTraits>,
-                        &go_barrier,
-                        &done_barrier,
-                        &tree));
+    threads.emplace_back(ScanThread<SmallFanoutTraits>,
+                         &go_barrier,
+                         &done_barrier,
+                         &tree);
   }
 
 
@@ -721,9 +718,9 @@ TEST_F(TestCBTree, TestConcurrentIterateAndInsert) {
   // on areas of the key space diminishes.
   for (int trial = 0; trial < trials; trial++) {
     tree.reset(new CBTree<SmallFanoutTraits>());
-    go_barrier.wait();
+    go_barrier.Wait();
 
-    done_barrier.wait();
+    done_barrier.Wait();
 
     if (::testing::Test::HasFatalFailure()) {
       tree->DebugPrint();
@@ -732,9 +729,9 @@ TEST_F(TestCBTree, TestConcurrentIterateAndInsert) {
   }
 
   tree.reset(nullptr);
-  go_barrier.wait();
+  go_barrier.Wait();
 
-  for (boost::thread &thr : threads) {
+  for (thread& thr : threads) {
     thr.join();
   }
 }

@@ -16,10 +16,12 @@
 // under the License.
 #include "kudu/server/server_base.h"
 
-#include <boost/algorithm/string/predicate.hpp>
-#include <gflags/gflags.h>
+#include <sstream>
 #include <string>
 #include <vector>
+
+#include <boost/algorithm/string/predicate.hpp>
+#include <gflags/gflags.h>
 
 #include "kudu/codegen/compilation_manager.h"
 #include "kudu/common/wire_protocol.pb.h"
@@ -59,9 +61,9 @@ TAG_FLAG(num_reactor_threads, advanced);
 
 DECLARE_bool(use_hybrid_clock);
 
+using std::ostringstream;
 using std::shared_ptr;
 using std::string;
-using std::stringstream;
 using std::vector;
 using strings::Substitute;
 
@@ -93,6 +95,8 @@ ServerBase::ServerBase(string name, const ServerBaseOptions& options,
                                                       metric_namespace)),
       rpc_server_(new RpcServer(options.rpc_opts)),
       web_server_(new Webserver(options.webserver_opts)),
+      result_tracker_(new rpc::ResultTracker(shared_ptr<MemTracker>(
+          MemTracker::CreateTracker(-1, "result-tracker", mem_tracker_)))),
       is_first_run_(false),
       options_(options),
       stop_metrics_logging_latch_(1) {
@@ -116,7 +120,6 @@ ServerBase::ServerBase(string name, const ServerBaseOptions& options,
 
 ServerBase::~ServerBase() {
   Shutdown();
-  mem_tracker_->UnregisterFromParent();
 }
 
 Sockaddr ServerBase::first_rpc_address() const {
@@ -182,6 +185,8 @@ Status ServerBase::Init() {
   clock_->RegisterMetrics(metric_entity_);
 
   RETURN_NOT_OK_PREPEND(StartMetricsLogging(), "Could not enable metrics logging");
+
+  result_tracker_->StartGCThread();
 
   return Status::OK();
 }
@@ -256,12 +261,12 @@ void ServerBase::MetricsLoggingThread() {
   const MonoDelta kWaitBetweenFailures = MonoDelta::FromSeconds(60);
 
 
-  MonoTime next_log = MonoTime::Now(MonoTime::FINE);
+  MonoTime next_log = MonoTime::Now();
   while (!stop_metrics_logging_latch_.WaitUntil(next_log)) {
-    next_log = MonoTime::Now(MonoTime::FINE);
-    next_log.AddDelta(MonoDelta::FromMilliseconds(options_.metrics_log_interval_ms));
+    next_log = MonoTime::Now() +
+        MonoDelta::FromMilliseconds(options_.metrics_log_interval_ms);
 
-    std::stringstream buf;
+    std::ostringstream buf;
     buf << "metrics " << GetCurrentTimeMicros() << " ";
 
     // Collect the metrics JSON string.
@@ -274,7 +279,7 @@ void ServerBase::MetricsLoggingThread() {
     Status s = metric_registry_->WriteAsJson(&writer, metrics, opts);
     if (!s.ok()) {
       WARN_NOT_OK(s, "Unable to collect metrics to log");
-      next_log.AddDelta(kWaitBetweenFailures);
+      next_log += kWaitBetweenFailures;
       continue;
     }
 
@@ -283,7 +288,7 @@ void ServerBase::MetricsLoggingThread() {
     s = log.Append(buf.str());
     if (!s.ok()) {
       WARN_NOT_OK(s, "Unable to write metrics to log");
-      next_log.AddDelta(kWaitBetweenFailures);
+      next_log += kWaitBetweenFailures;
       continue;
     }
   }

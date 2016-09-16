@@ -18,6 +18,8 @@
 #include "kudu/consensus/log.h"
 
 #include <algorithm>
+#include <mutex>
+#include <limits>
 
 #include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/log_index.h"
@@ -42,6 +44,7 @@
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/random.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/thread.h"
 #include "kudu/util/threadpool.h"
@@ -56,16 +59,13 @@ DEFINE_int32(log_min_segments_to_retain, 2,
 TAG_FLAG(log_min_segments_to_retain, runtime);
 TAG_FLAG(log_min_segments_to_retain, advanced);
 
-DEFINE_int32(log_min_seconds_to_retain, 300,
-             "The minimum number of seconds for which to keep log segments to keep at all times, "
-             "regardless of what is required for durability. Logs may be still retained for "
-             "a longer amount of time if they are necessary for correct restart. This should be "
-             "set long enough such that a tablet server which has temporarily failed can be "
-             "restarted within the given time period. If a server is down for longer than this "
-             "amount of time, it is possible that its tablets will be re-replicated on other "
-             "machines.");
-TAG_FLAG(log_min_seconds_to_retain, runtime);
-TAG_FLAG(log_min_seconds_to_retain, advanced);
+DEFINE_int32(log_max_segments_to_retain, 10,
+             "The maximum number of past log segments to keep at all times for "
+             "the purposes of catching up other peers.");
+TAG_FLAG(log_max_segments_to_retain, runtime);
+TAG_FLAG(log_max_segments_to_retain, advanced);
+TAG_FLAG(log_max_segments_to_retain, experimental);
+
 
 // Group commit configuration.
 // -----------------------------
@@ -92,6 +92,23 @@ TAG_FLAG(log_inject_latency, unsafe);
 TAG_FLAG(log_inject_latency_ms_mean, unsafe);
 TAG_FLAG(log_inject_latency_ms_stddev, unsafe);
 TAG_FLAG(fault_crash_before_append_commit, unsafe);
+
+DEFINE_double(log_inject_io_error_on_append_fraction, 0.0,
+              "Fraction of the time when the log will fail to append and return an IOError. "
+              "(For testing only!)");
+TAG_FLAG(log_inject_io_error_on_append_fraction, unsafe);
+TAG_FLAG(log_inject_io_error_on_append_fraction, runtime);
+
+DEFINE_double(log_inject_io_error_on_preallocate_fraction, 0.0,
+              "Fraction of the time when the log will fail to preallocate and return an IOError. "
+              "(For testing only!)");
+TAG_FLAG(log_inject_io_error_on_preallocate_fraction, unsafe);
+TAG_FLAG(log_inject_io_error_on_preallocate_fraction, runtime);
+
+DEFINE_int64(fs_wal_dir_reserved_bytes, 0,
+             "Number of bytes to reserve on the log directory filesystem for non-Kudu usage");
+TAG_FLAG(fs_wal_dir_reserved_bytes, runtime);
+TAG_FLAG(fs_wal_dir_reserved_bytes, evolving);
 
 // Validate that log_min_segments_to_retain >= 1
 static bool ValidateLogsToRetain(const char* flagname, int value) {
@@ -138,7 +155,7 @@ class Log::AppendThread {
   Log* const log_;
 
   // Lock to protect access to thread_ during shutdown.
-  mutable boost::mutex lock_;
+  mutable std::mutex lock_;
   scoped_refptr<Thread> thread_;
 };
 
@@ -184,7 +201,6 @@ void Log::AppendThread::RunThread() {
       Status s = log_->DoAppend(entry_batch);
       if (PREDICT_FALSE(!s.ok())) {
         LOG(ERROR) << "Error appending to the log: " << s.ToString();
-        DLOG(FATAL) << "Aborting: " << s.ToString();
         entry_batch->set_failed_to_append();
         // TODO If a single transaction fails to append, should we
         // abort all subsequent transactions in this batch or allow
@@ -205,7 +221,6 @@ void Log::AppendThread::RunThread() {
     }
     if (PREDICT_FALSE(!s.ok())) {
       LOG(ERROR) << "Error syncing log" << s.ToString();
-      DLOG(FATAL) << "Aborting: " << s.ToString();
       for (LogEntryBatch* entry_batch : entry_batches) {
         if (!entry_batch->callback().is_null()) {
           entry_batch->callback().Run(s);
@@ -233,7 +248,7 @@ void Log::AppendThread::RunThread() {
 
 void Log::AppendThread::Shutdown() {
   log_->entry_queue()->Shutdown();
-  boost::lock_guard<boost::mutex> lock_guard(lock_);
+  std::lock_guard<std::mutex> lock_guard(lock_);
   if (thread_) {
     VLOG(1) << "Shutting down log append thread for tablet " << log_->tablet_id();
     CHECK_OK(ThreadJoiner(thread_.get()).Join());
@@ -301,7 +316,7 @@ Log::Log(LogOptions options, FsManager* fs_manager, string log_path,
 }
 
 Status Log::Init() {
-  boost::lock_guard<percpu_rwlock> write_lock(state_lock_);
+  std::lock_guard<percpu_rwlock> write_lock(state_lock_);
   CHECK_EQ(kLogInitialized, log_state_);
 
   // Init the index
@@ -343,7 +358,7 @@ Status Log::Init() {
 }
 
 Status Log::AsyncAllocateSegment() {
-  boost::lock_guard<boost::shared_mutex> lock_guard(allocation_lock_);
+  std::lock_guard<RWMutex> l(allocation_lock_);
   CHECK_EQ(allocation_state_, kAllocationNotStarted);
   allocation_status_.Reset();
   allocation_state_ = kAllocationInProgress;
@@ -389,7 +404,7 @@ Status Log::Reserve(LogEntryTypePB type,
   TRACE_EVENT0("log", "Log::Reserve");
   DCHECK(reserved_entry != nullptr);
   {
-    boost::shared_lock<rw_spinlock> read_lock(state_lock_.get_lock());
+    shared_lock<rw_spinlock> l(state_lock_.get_lock());
     CHECK_EQ(kLogWriting, log_state_);
   }
 
@@ -422,7 +437,7 @@ Status Log::Reserve(LogEntryTypePB type,
 Status Log::AsyncAppend(LogEntryBatch* entry_batch, const StatusCallback& callback) {
   TRACE_EVENT0("log", "Log::AsyncAppend");
   {
-    boost::shared_lock<rw_spinlock> read_lock(state_lock_.get_lock());
+    shared_lock<rw_spinlock> l(state_lock_.get_lock());
     CHECK_EQ(kLogWriting, log_state_);
   }
 
@@ -467,9 +482,12 @@ Status Log::AsyncAppendCommit(gscoped_ptr<consensus::CommitMsg> commit_msg,
   return Status::OK();
 }
 
-Status Log::DoAppend(LogEntryBatch* entry_batch, bool caller_owns_operation) {
+Status Log::DoAppend(LogEntryBatch* entry_batch) {
   size_t num_entries = entry_batch->count();
   DCHECK_GT(num_entries, 0) << "Cannot call DoAppend() with zero entries reserved";
+
+  MAYBE_RETURN_FAILURE(FLAGS_log_inject_io_error_on_append_fraction,
+                       Status::IOError("Injected IOError in Log::DoAppend()"));
 
   Slice entry_batch_data = entry_batch->data();
   uint32_t entry_batch_bytes = entry_batch->total_size_bytes();
@@ -486,7 +504,7 @@ Status Log::DoAppend(LogEntryBatch* entry_batch, bool caller_owns_operation) {
     // is not the last durable operation. Either move this to tablet peer (since we're
     // using in flights anyway no need to scan for ids here) or actually delay doing this
     // until fsync() has been done. See KUDU-527.
-    boost::lock_guard<rw_spinlock> write_lock(last_entry_op_id_lock_);
+    std::lock_guard<rw_spinlock> write_lock(last_entry_op_id_lock_);
     last_entry_op_id_.CopyFrom(entry_batch->MaxReplicateOpId());
   }
 
@@ -531,15 +549,6 @@ Status Log::DoAppend(LogEntryBatch* entry_batch, bool caller_owns_operation) {
 
   CHECK_OK(UpdateIndexForBatch(*entry_batch, start_offset));
   UpdateFooterForBatch(entry_batch);
-
-  // For REPLICATE batches, we expect the caller to free the actual entries if
-  // caller_owns_operation is set.
-  if (entry_batch->type_ == REPLICATE && caller_owns_operation) {
-    for (int i = 0; i < entry_batch->entry_batch_pb_->entry_size(); i++) {
-      LogEntryPB* entry_pb = entry_batch->entry_batch_pb_->mutable_entry(i);
-      entry_pb->release_replicate();
-    }
-  }
 
   return Status::OK();
 }
@@ -618,45 +627,39 @@ Status Log::Sync() {
   return Status::OK();
 }
 
-Status Log::GetSegmentsToGCUnlocked(int64_t min_op_idx, SegmentSequence* segments_to_gc) const {
-  // Find the prefix of segments in the segment sequence that is guaranteed not to include
-  // 'min_op_idx'.
-  RETURN_NOT_OK(reader_->GetSegmentPrefixNotIncluding(min_op_idx, segments_to_gc));
-
-  int max_to_delete = std::max(reader_->num_segments() - FLAGS_log_min_segments_to_retain, 0);
-  if (segments_to_gc->size() > max_to_delete) {
-    VLOG(2) << "GCing " << segments_to_gc->size() << " in " << log_dir_
-        << " would not leave enough remaining segments to satisfy minimum "
-        << "retention requirement. Only considering "
-        << max_to_delete << "/" << reader_->num_segments();
-    segments_to_gc->resize(max_to_delete);
-  } else if (segments_to_gc->size() < max_to_delete) {
-    int extra_segments = max_to_delete - segments_to_gc->size();
-    VLOG(2) << tablet_id_ << " has too many log segments, need to GC "
-        << extra_segments << " more. ";
-  }
-
-  // Don't GC segments that are newer than the configured time-based retention.
-  int64_t now = GetCurrentTimeMicros();
-  for (int i = 0; i < segments_to_gc->size(); i++) {
-    const scoped_refptr<ReadableLogSegment>& segment = (*segments_to_gc)[i];
-
-    // Segments here will always have a footer, since we don't return the in-progress segment
-    // up above. However, segments written by older Kudu builds may not have the timestamp
-    // info. In that case, we're allowed to GC them.
-    if (!segment->footer().has_close_timestamp_micros()) continue;
-
-    int64_t age_seconds = (now - segment->footer().close_timestamp_micros()) / 1000000;
-    if (age_seconds < FLAGS_log_min_seconds_to_retain) {
-      VLOG(2) << "Segment " << segment->path() << " is only " << age_seconds << "s old: "
-              << "cannot GC it yet due to configured time-based retention policy.";
-      // Truncate the list of segments to GC here -- if this one is too new, then
-      // all later ones are also too new.
-      segments_to_gc->resize(i);
+int GetPrefixSizeToGC(RetentionIndexes retention, const SegmentSequence& segments) {
+  int rem_segs = segments.size();
+  int prefix_size = 0;
+  for (const scoped_refptr<ReadableLogSegment>& segment : segments) {
+    if (rem_segs <= FLAGS_log_min_segments_to_retain) {
       break;
     }
-  }
 
+    if (!segment->HasFooter()) break;
+
+    int64_t seg_max_idx = segment->footer().max_replicate_index();
+    // If removing this segment would compromise durability, we cannot remove it.
+    if (seg_max_idx >= retention.for_durability) {
+      break;
+    }
+
+    // Check if removing this segment would compromise the ability to catch up a peer,
+    // we should retain it, unless this would break the max_segments flag.
+    if (seg_max_idx >= retention.for_peers &&
+        rem_segs <= FLAGS_log_max_segments_to_retain) {
+      break;
+    }
+
+    prefix_size++;
+    rem_segs--;
+  }
+  return prefix_size;
+}
+
+Status Log::GetSegmentsToGCUnlocked(RetentionIndexes retention,
+                                    SegmentSequence* segments_to_gc) const {
+  RETURN_NOT_OK(reader_->GetSegmentsSnapshot(segments_to_gc));
+  segments_to_gc->resize(GetPrefixSizeToGC(retention, *segments_to_gc));
   return Status::OK();
 }
 
@@ -668,7 +671,7 @@ Status Log::Append(LogEntryPB* phys_entry) {
   Status s = entry_batch.Serialize();
   if (s.ok()) {
     entry_batch.state_ = LogEntryBatch::kEntryReady;
-    s = DoAppend(&entry_batch, false);
+    s = DoAppend(&entry_batch);
     if (s.ok()) {
       s = Sync();
     }
@@ -690,7 +693,7 @@ Status Log::WaitUntilAllFlushed() {
 }
 
 void Log::GetLatestEntryOpId(consensus::OpId* op_id) const {
-  boost::shared_lock<rw_spinlock> read_lock(last_entry_op_id_lock_);
+  shared_lock<rw_spinlock> l(last_entry_op_id_lock_);
   if (last_entry_op_id_.IsInitialized()) {
     DCHECK_NOTNULL(op_id)->CopyFrom(last_entry_op_id_);
   } else {
@@ -698,18 +701,20 @@ void Log::GetLatestEntryOpId(consensus::OpId* op_id) const {
   }
 }
 
-Status Log::GC(int64_t min_op_idx, int32_t* num_gced) {
-  CHECK_GE(min_op_idx, 0);
+Status Log::GC(RetentionIndexes retention, int32_t* num_gced) {
+  CHECK_GE(retention.for_durability, 0);
 
-  VLOG(1) << "Running Log GC on " << log_dir_ << ": retaining ops >= " << min_op_idx;
+  VLOG(1) << "Running Log GC on " << log_dir_ << ": retaining "
+      "ops >= " << retention.for_durability << " for durability, "
+      "ops >= " << retention.for_peers << " for peers";
   VLOG_TIMING(1, "Log GC") {
     SegmentSequence segments_to_delete;
 
     {
-      boost::lock_guard<percpu_rwlock> l(state_lock_);
+      std::lock_guard<percpu_rwlock> l(state_lock_);
       CHECK_EQ(kLogWriting, log_state_);
 
-      GetSegmentsToGCUnlocked(min_op_idx, &segments_to_delete);
+      RETURN_NOT_OK(GetSegmentsToGCUnlocked(retention, &segments_to_delete));
 
       if (segments_to_delete.size() == 0) {
         VLOG(1) << "No segments to delete.";
@@ -725,8 +730,14 @@ Status Log::GC(int64_t min_op_idx, int32_t* num_gced) {
     // Now that they are no longer referenced by the Log, delete the files.
     *num_gced = 0;
     for (const scoped_refptr<ReadableLogSegment>& segment : segments_to_delete) {
-      LOG(INFO) << "Deleting log segment in path: " << segment->path()
-                << " (GCed ops < " << min_op_idx << ")";
+      string ops_str;
+      if (segment->HasFooter() && segment->footer().has_min_replicate_index()) {
+        DCHECK(segment->footer().has_max_replicate_index());
+        ops_str = Substitute(" (ops $0-$1)",
+                             segment->footer().min_replicate_index(),
+                             segment->footer().max_replicate_index());
+      }
+      LOG(INFO) << "Deleting log segment in path: " << segment->path() << ops_str;
       RETURN_NOT_OK(fs_manager_->env()->DeleteFile(segment->path()));
       (*num_gced)++;
     }
@@ -741,14 +752,14 @@ Status Log::GC(int64_t min_op_idx, int32_t* num_gced) {
   return Status::OK();
 }
 
-void Log::GetGCableDataSize(int64_t min_op_idx, int64_t* total_size) const {
-  CHECK_GE(min_op_idx, 0);
+void Log::GetGCableDataSize(RetentionIndexes retention, int64_t* total_size) const {
+  CHECK_GE(retention.for_durability, 0);
   SegmentSequence segments_to_delete;
   *total_size = 0;
   {
-    boost::shared_lock<rw_spinlock> read_lock(state_lock_.get_lock());
+    shared_lock<rw_spinlock> l(state_lock_.get_lock());
     CHECK_EQ(kLogWriting, log_state_);
-    Status s = GetSegmentsToGCUnlocked(min_op_idx, &segments_to_delete);
+    Status s = GetSegmentsToGCUnlocked(retention, &segments_to_delete);
 
     if (!s.ok() || segments_to_delete.size() == 0) {
       return;
@@ -759,26 +770,29 @@ void Log::GetGCableDataSize(int64_t min_op_idx, int64_t* total_size) const {
   }
 }
 
-void Log::GetMaxIndexesToSegmentSizeMap(int64_t min_op_idx,
+void Log::GetMaxIndexesToSegmentSizeMap(int64_t idx_for_durability,
                                         std::map<int64_t, int64_t>* max_idx_to_segment_size)
                                         const {
-  boost::shared_lock<rw_spinlock> read_lock(state_lock_.get_lock());
-  CHECK_EQ(kLogWriting, log_state_);
-  // We want to retain segments so we're only asking the extra ones.
-  int segments_count = std::max(reader_->num_segments() - FLAGS_log_min_segments_to_retain, 0);
-  if (segments_count == 0) {
-    return;
+  max_idx_to_segment_size->clear();
+  SegmentSequence segments;
+  {
+    shared_lock<rw_spinlock> l(state_lock_.get_lock());
+    CHECK_EQ(kLogWriting, log_state_);
+    CHECK_OK(reader_->GetSegmentsSnapshot(&segments));
   }
 
-  int64_t now = GetCurrentTimeMicros();
-  int64_t max_close_time_us = now - (FLAGS_log_min_seconds_to_retain * 1000000);
-  reader_->GetMaxIndexesToSegmentSizeMap(min_op_idx, segments_count, max_close_time_us,
-                                         max_idx_to_segment_size);
+  int gc_prefix = GetPrefixSizeToGC(RetentionIndexes(idx_for_durability),
+                                    segments);
+  for (int i = gc_prefix; i < segments.size() - FLAGS_log_min_segments_to_retain; i++) {
+    if (!segments[i]->HasFooter()) break;
+    int64_t max_repl_idx = segments[i]->footer().max_replicate_index();
+    (*max_idx_to_segment_size)[max_repl_idx] = segments[i]->file_size();
+  }
 }
 
 void Log::SetSchemaForNextLogSegment(const Schema& schema,
                                      uint32_t version) {
-  boost::lock_guard<rw_spinlock> l(schema_lock_);
+  std::lock_guard<rw_spinlock> l(schema_lock_);
   schema_ = schema;
   schema_version_ = version;
 }
@@ -787,7 +801,7 @@ Status Log::Close() {
   allocation_pool_->Shutdown();
   append_thread_->Shutdown();
 
-  boost::lock_guard<percpu_rwlock> l(state_lock_);
+  std::lock_guard<percpu_rwlock> l(state_lock_);
   switch (log_state_) {
     case kLogWriting:
       if (log_hooks_) {
@@ -815,7 +829,7 @@ Status Log::Close() {
       return Status::OK();
 
     default:
-      return Status::IllegalState(Substitute("Bad state for Close() $0", log_state_));
+      return Status::IllegalState(Substitute("Log not open. State: $0", log_state_));
   }
 }
 
@@ -834,21 +848,30 @@ Status Log::PreAllocateNewSegment() {
   TRACE_EVENT1("log", "PreAllocateNewSegment", "file", next_segment_path_);
   CHECK_EQ(allocation_state(), kAllocationInProgress);
 
+  // We must mark allocation as finished when returning from this method.
+  auto alloc_finished = MakeScopedCleanup([&] () {
+    std::lock_guard<RWMutex> l(allocation_lock_);
+    allocation_state_ = kAllocationFinished;
+  });
+
   WritableFileOptions opts;
   opts.sync_on_close = force_sync_all_;
   RETURN_NOT_OK(CreatePlaceholderSegment(opts, &next_segment_path_, &next_segment_file_));
 
+  MAYBE_RETURN_FAILURE(FLAGS_log_inject_io_error_on_preallocate_fraction,
+                       Status::IOError("Injected IOError in Log::PreAllocateNewSegment()"));
+
   if (options_.preallocate_segments) {
     TRACE("Preallocating $0 byte segment in $1", max_segment_size_, next_segment_path_);
+    RETURN_NOT_OK(env_util::VerifySufficientDiskSpace(fs_manager_->env(),
+                                                      next_segment_path_,
+                                                      max_segment_size_,
+                                                      FLAGS_fs_wal_dir_reserved_bytes));
     // TODO (perf) zero the new segments -- this could result in
     // additional performance improvements.
     RETURN_NOT_OK(next_segment_file_->PreAllocate(max_segment_size_));
   }
 
-  {
-    boost::lock_guard<boost::shared_mutex> lock_guard(allocation_lock_);
-    allocation_state_ = kAllocationFinished;
-  }
   return Status::OK();
 }
 
@@ -884,7 +907,7 @@ Status Log::SwitchToAllocatedSegment() {
 
   // Set the new segment's schema.
   {
-    boost::shared_lock<rw_spinlock> l(schema_lock_);
+    shared_lock<rw_spinlock> l(schema_lock_);
     RETURN_NOT_OK(SchemaToPB(schema_, header.mutable_schema()));
     header.set_schema_version(schema_version_);
   }
@@ -895,7 +918,7 @@ Status Log::SwitchToAllocatedSegment() {
   // need to be able to replay the segments for other peers.
   {
     if (active_segment_.get() != nullptr) {
-      boost::lock_guard<percpu_rwlock> l(state_lock_);
+      std::lock_guard<percpu_rwlock> l(state_lock_);
       CHECK_OK(ReplaceSegmentInReaderUnlocked());
     }
   }
@@ -967,6 +990,13 @@ LogEntryBatch::LogEntryBatch(LogEntryTypePB type,
 }
 
 LogEntryBatch::~LogEntryBatch() {
+  if (type_ == REPLICATE && entry_batch_pb_) {
+    for (LogEntryPB& entry : *entry_batch_pb_->mutable_entry()) {
+      // ReplicateMsg elements are owned by and must be freed by the caller
+      // (e.g. the LogCache).
+      entry.release_replicate();
+    }
+  }
 }
 
 void LogEntryBatch::MarkReserved() {

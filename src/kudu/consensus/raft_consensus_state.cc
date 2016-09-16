@@ -16,6 +16,7 @@
 // under the License.
 
 #include <algorithm>
+#include <memory>
 
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/quorum_util.h"
@@ -33,6 +34,7 @@ namespace kudu {
 namespace consensus {
 
 using std::string;
+using std::unique_ptr;
 using strings::Substitute;
 using strings::SubstituteAndAppend;
 
@@ -41,7 +43,7 @@ using strings::SubstituteAndAppend;
 //////////////////////////////////////////////////
 
 ReplicaState::ReplicaState(ConsensusOptions options, string peer_uuid,
-                           gscoped_ptr<ConsensusMetadata> cmeta,
+                           unique_ptr<ConsensusMetadata> cmeta,
                            ReplicaTransactionFactory* txn_factory)
     : options_(std::move(options)),
       peer_uuid_(std::move(peer_uuid)),
@@ -50,7 +52,7 @@ ReplicaState::ReplicaState(ConsensusOptions options, string peer_uuid,
       txn_factory_(txn_factory),
       last_received_op_id_(MinimumOpId()),
       last_received_op_id_current_leader_(MinimumOpId()),
-      last_committed_index_(MinimumOpId()),
+      last_committed_op_id_(MinimumOpId()),
       state_(kInitialized) {
   CHECK(cmeta_) << "ConsensusMeta passed as NULL";
 }
@@ -78,57 +80,41 @@ Status ReplicaState::StartUnlocked(const OpId& last_id_in_wal) {
 
 Status ReplicaState::LockForStart(UniqueLock* lock) const {
   ThreadRestrictions::AssertWaitAllowed();
-  UniqueLock l(&update_lock_);
+  UniqueLock l(update_lock_);
   CHECK_EQ(state_, kInitialized) << "Illegal state for Start()."
       << " Replica is not in kInitialized state";
-  lock->swap(&l);
+  lock->swap(l);
   return Status::OK();
 }
 
 Status ReplicaState::LockForRead(UniqueLock* lock) const {
   ThreadRestrictions::AssertWaitAllowed();
-  UniqueLock l(&update_lock_);
-  lock->swap(&l);
+  UniqueLock l(update_lock_);
+  lock->swap(l);
   return Status::OK();
 }
 
 Status ReplicaState::LockForReplicate(UniqueLock* lock, const ReplicateMsg& msg) const {
   ThreadRestrictions::AssertWaitAllowed();
   DCHECK(!msg.has_id()) << "Should not have an ID yet: " << msg.ShortDebugString();
-  UniqueLock l(&update_lock_);
+  UniqueLock l(update_lock_);
   if (PREDICT_FALSE(state_ != kRunning)) {
     return Status::IllegalState("Replica not in running state");
   }
 
   RETURN_NOT_OK(CheckActiveLeaderUnlocked());
-  lock->swap(&l);
+  lock->swap(l);
   return Status::OK();
 }
 
 Status ReplicaState::LockForCommit(UniqueLock* lock) const {
   TRACE_EVENT0("consensus", "ReplicaState::LockForCommit");
   ThreadRestrictions::AssertWaitAllowed();
-  UniqueLock l(&update_lock_);
+  UniqueLock l(update_lock_);
   if (PREDICT_FALSE(state_ != kRunning && state_ != kShuttingDown)) {
     return Status::IllegalState("Replica not in running state");
   }
-  lock->swap(&l);
-  return Status::OK();
-}
-
-Status ReplicaState::LockForMajorityReplicatedIndexUpdate(UniqueLock* lock) const {
-  TRACE_EVENT0("consensus", "ReplicaState::LockForMajorityReplicatedIndexUpdate");
-  ThreadRestrictions::AssertWaitAllowed();
-  UniqueLock l(&update_lock_);
-
-  if (PREDICT_FALSE(state_ != kRunning)) {
-    return Status::IllegalState("Replica not in running state");
-  }
-
-  if (PREDICT_FALSE(GetActiveRoleUnlocked() != RaftPeerPB::LEADER)) {
-    return Status::IllegalState("Replica not LEADER");
-  }
-  lock->swap(&l);
+  lock->swap(l);
   return Status::OK();
 }
 
@@ -151,38 +137,38 @@ Status ReplicaState::LockForConfigChange(UniqueLock* lock) const {
   TRACE_EVENT0("consensus", "ReplicaState::LockForConfigChange");
 
   ThreadRestrictions::AssertWaitAllowed();
-  UniqueLock l(&update_lock_);
+  UniqueLock l(update_lock_);
   // Can only change the config on running replicas.
   if (PREDICT_FALSE(state_ != kRunning)) {
     return Status::IllegalState("Unable to lock ReplicaState for config change",
                                 Substitute("State = $0", state_));
   }
-  lock->swap(&l);
+  lock->swap(l);
   return Status::OK();
 }
 
 Status ReplicaState::LockForUpdate(UniqueLock* lock) const {
   TRACE_EVENT0("consensus", "ReplicaState::LockForUpdate");
   ThreadRestrictions::AssertWaitAllowed();
-  UniqueLock l(&update_lock_);
+  UniqueLock l(update_lock_);
   if (PREDICT_FALSE(state_ != kRunning)) {
     return Status::IllegalState("Replica not in running state");
   }
   if (!IsRaftConfigVoter(peer_uuid_, ConsensusStateUnlocked(CONSENSUS_CONFIG_ACTIVE).config())) {
     LOG_WITH_PREFIX_UNLOCKED(INFO) << "Allowing update even though not a member of the config";
   }
-  lock->swap(&l);
+  lock->swap(l);
   return Status::OK();
 }
 
 Status ReplicaState::LockForShutdown(UniqueLock* lock) {
   TRACE_EVENT0("consensus", "ReplicaState::LockForShutdown");
   ThreadRestrictions::AssertWaitAllowed();
-  UniqueLock l(&update_lock_);
+  UniqueLock l(update_lock_);
   if (state_ != kShuttingDown && state_ != kShutDown) {
     state_ = kShuttingDown;
   }
-  lock->swap(&l);
+  lock->swap(l);
   return Status::OK();
 }
 
@@ -276,7 +262,7 @@ bool ReplicaState::IsOpCommittedOrPending(const OpId& op_id, bool* term_mismatch
 
   *term_mismatch = false;
 
-  if (op_id.index() <= GetCommittedOpIdUnlocked().index()) {
+  if (op_id.index() <= GetCommittedIndexUnlocked()) {
     return true;
   }
 
@@ -366,7 +352,7 @@ int ReplicaState::GetNumPendingTxnsUnlocked() const {
 Status ReplicaState::CancelPendingTransactions() {
   {
     ThreadRestrictions::AssertWaitAllowed();
-    UniqueLock lock(&update_lock_);
+    UniqueLock lock(update_lock_);
     if (state_ != kShuttingDown) {
       return Status::IllegalState("Can only wait for pending commits on kShuttingDown state.");
     }
@@ -390,30 +376,30 @@ Status ReplicaState::CancelPendingTransactions() {
 void ReplicaState::GetUncommittedPendingOperationsUnlocked(
     vector<scoped_refptr<ConsensusRound> >* ops) {
   for (const IndexToRoundMap::value_type& entry : pending_txns_) {
-    if (entry.first > last_committed_index_.index()) {
+    if (entry.first > last_committed_op_id_.index()) {
       ops->push_back(entry.second);
     }
   }
 }
 
-Status ReplicaState::AbortOpsAfterUnlocked(int64_t new_preceding_idx) {
+void ReplicaState::AbortOpsAfterUnlocked(int64_t index) {
   DCHECK(update_lock_.is_locked());
   LOG_WITH_PREFIX_UNLOCKED(INFO) << "Aborting all transactions after (but not including): "
-      << new_preceding_idx << ". Current State: " << ToStringUnlocked();
+      << index << ". Current State: " << ToStringUnlocked();
 
-  DCHECK_GE(new_preceding_idx, 0);
+  DCHECK_GE(index, 0);
   OpId new_preceding;
 
-  auto iter = pending_txns_.lower_bound(new_preceding_idx);
+  auto iter = pending_txns_.lower_bound(index);
 
   // Either the new preceding id is in the pendings set or it must be equal to the
   // committed index since we can't truncate already committed operations.
-  if (iter != pending_txns_.end() && (*iter).first == new_preceding_idx) {
+  if (iter != pending_txns_.end() && (*iter).first == index) {
     new_preceding = (*iter).second->replicate_msg()->id();
     ++iter;
   } else {
-    CHECK_EQ(new_preceding_idx, last_committed_index_.index());
-    new_preceding = last_committed_index_;
+    CHECK_EQ(index, last_committed_op_id_.index());
+    new_preceding = last_committed_op_id_;
   }
 
   // This is the same as UpdateLastReceivedOpIdUnlocked() but we do it
@@ -443,8 +429,6 @@ Status ReplicaState::AbortOpsAfterUnlocked(int64_t new_preceding_idx) {
     // Erase the entry from pendings.
     pending_txns_.erase(iter++);
   }
-
-  return Status::OK();
 }
 
 Status ReplicaState::AddPendingOperation(const scoped_refptr<ConsensusRound>& round) {
@@ -501,93 +485,45 @@ scoped_refptr<ConsensusRound> ReplicaState::GetPendingOpByIndexOrNullUnlocked(in
   return FindPtrOrNull(pending_txns_, index);
 }
 
-Status ReplicaState::UpdateMajorityReplicatedUnlocked(const OpId& majority_replicated,
-                                                      OpId* committed_index,
-                                                      bool* committed_index_changed) {
-  DCHECK(update_lock_.is_locked());
-  DCHECK(majority_replicated.IsInitialized());
-  DCHECK(last_committed_index_.IsInitialized());
-  if (PREDICT_FALSE(state_ == kShuttingDown || state_ == kShutDown)) {
-    return Status::ServiceUnavailable("Cannot trigger apply. Replica is shutting down.");
-  }
-  if (PREDICT_FALSE(state_ != kRunning)) {
-    return Status::IllegalState("Cannot trigger apply. Replica is not in kRunning state.");
-  }
-
-  // If the last committed operation was in the current term (the normal case)
-  // then 'committed_index' is simply equal to majority replicated.
-  if (last_committed_index_.term() == GetCurrentTermUnlocked()) {
-    RETURN_NOT_OK(AdvanceCommittedIndexUnlocked(majority_replicated,
-                                                committed_index_changed));
-    committed_index->CopyFrom(last_committed_index_);
-    return Status::OK();
-  }
-
-  // If the last committed operation is not in the current term (such as when
-  // we change leaders) but 'majority_replicated' is then we can advance the
-  // 'committed_index' too.
-  if (majority_replicated.term() == GetCurrentTermUnlocked()) {
-    OpId previous = last_committed_index_;
-    RETURN_NOT_OK(AdvanceCommittedIndexUnlocked(majority_replicated,
-                                                committed_index_changed));
-    committed_index->CopyFrom(last_committed_index_);
-    LOG_WITH_PREFIX_UNLOCKED(INFO) << "Advanced the committed_index across terms."
-        << " Last committed operation was: " << previous.ShortDebugString()
-        << " New committed index is: " << last_committed_index_.ShortDebugString();
-    return Status::OK();
-  }
-
-  committed_index->CopyFrom(last_committed_index_);
-  KLOG_EVERY_N_SECS(WARNING, 1) << LogPrefixUnlocked()
-          << "Can't advance the committed index across term boundaries"
-          << " until operations from the current term are replicated."
-          << " Last committed operation was: " << last_committed_index_.ShortDebugString() << ","
-          << " New majority replicated is: " << majority_replicated.ShortDebugString() << ","
-          << " Current term is: " << GetCurrentTermUnlocked();
-
-  return Status::OK();
-}
-
-Status ReplicaState::AdvanceCommittedIndexUnlocked(const OpId& committed_index,
-                                                   bool *committed_index_changed) {
-  *committed_index_changed = false;
+Status ReplicaState::AdvanceCommittedIndexUnlocked(int64_t committed_index) {
   // If we already committed up to (or past) 'id' return.
   // This can happen in the case that multiple UpdateConsensus() calls end
   // up in the RPC queue at the same time, and then might get interleaved out
   // of order.
-  if (last_committed_index_.index() >= committed_index.index()) {
+  if (last_committed_op_id_.index() >= committed_index) {
     VLOG_WITH_PREFIX_UNLOCKED(1)
-      << "Already marked ops through " << last_committed_index_ << " as committed. "
+      << "Already marked ops through " << last_committed_op_id_ << " as committed. "
       << "Now trying to mark " << committed_index << " which would be a no-op.";
     return Status::OK();
   }
 
   if (pending_txns_.empty()) {
-    last_committed_index_.CopyFrom(committed_index);
+    LOG(ERROR) << "Advancing commit index to " << committed_index
+               << " from " << last_committed_op_id_
+               << " we have no pending txns"
+               << GetStackTrace();
     VLOG_WITH_PREFIX_UNLOCKED(1) << "No transactions to mark as committed up to: "
-        << committed_index.ShortDebugString();
+                                 << committed_index;
     return Status::OK();
   }
 
   // Start at the operation after the last committed one.
-  auto iter = pending_txns_.upper_bound(last_committed_index_.index());
+  auto iter = pending_txns_.upper_bound(last_committed_op_id_.index());
   // Stop at the operation after the last one we must commit.
-  auto end_iter = pending_txns_.upper_bound(committed_index.index());
+  auto end_iter = pending_txns_.upper_bound(committed_index);
   CHECK(iter != pending_txns_.end());
 
   VLOG_WITH_PREFIX_UNLOCKED(1) << "Last triggered apply was: "
-      <<  last_committed_index_.ShortDebugString()
+      <<  last_committed_op_id_
       << " Starting to apply from log index: " << (*iter).first;
-
-  OpId prev_id = last_committed_index_;
 
   while (iter != end_iter) {
     scoped_refptr<ConsensusRound> round = (*iter).second; // Make a copy.
     DCHECK(round);
     const OpId& current_id = round->id();
 
-    if (PREDICT_TRUE(!OpIdEquals(prev_id, MinimumOpId()))) {
-      CHECK_OK(CheckOpInSequence(prev_id, current_id));
+    if (PREDICT_TRUE(!OpIdEquals(last_committed_op_id_, MinimumOpId()))) {
+      CHECK_OK(CheckOpInSequence(last_committed_op_id_, current_id));
     }
 
     pending_txns_.erase(iter++);
@@ -607,9 +543,9 @@ Status ReplicaState::AdvanceCommittedIndexUnlocked(const OpId& committed_index,
       const RaftConfigPB& committed_config = GetCommittedConfigUnlocked();
       if (new_config.opid_index() > committed_config.opid_index()) {
         LOG_WITH_PREFIX_UNLOCKED(INFO) << "Committing config change with OpId "
-            << current_id << ". "
-            << "Old config: { " << old_config.ShortDebugString() << " }. "
-            << "New config: { " << new_config.ShortDebugString() << " }";
+            << current_id << ": "
+            << DiffRaftConfigs(old_config, new_config)
+            << ". New config: { " << new_config.ShortDebugString() << " }";
         CHECK_OK(SetCommittedConfigUnlocked(new_config));
       } else {
         LOG_WITH_PREFIX_UNLOCKED(INFO) << "Ignoring commit of config change with OpId "
@@ -620,23 +556,52 @@ Status ReplicaState::AdvanceCommittedIndexUnlocked(const OpId& committed_index,
       }
     }
 
-    prev_id.CopyFrom(round->id());
+    last_committed_op_id_ = round->id();
     round->NotifyReplicationFinished(Status::OK());
   }
 
-  last_committed_index_.CopyFrom(committed_index);
-  *committed_index_changed = true;
   return Status::OK();
 }
 
-const OpId& ReplicaState::GetCommittedOpIdUnlocked() const {
-  DCHECK(update_lock_.is_locked());
-  return last_committed_index_;
+
+Status ReplicaState::SetInitialCommittedOpIdUnlocked(const OpId& committed_op) {
+  CHECK_EQ(last_committed_op_id_.index(), 0);
+  if (!pending_txns_.empty()) {
+    int64_t first_pending_index = pending_txns_.begin()->first;
+    if (committed_op.index() < first_pending_index) {
+      if (committed_op.index() != first_pending_index - 1) {
+        return Status::Corruption(Substitute(
+            "pending operations should start at first operation "
+            "after the committed operation (committed=$0, first pending=$1)",
+            OpIdToString(committed_op), first_pending_index));
+      }
+      last_committed_op_id_ = committed_op;
+    }
+
+    RETURN_NOT_OK(AdvanceCommittedIndexUnlocked(committed_op.index()));
+    CHECK_EQ(last_committed_op_id_.ShortDebugString(),
+             committed_op.ShortDebugString());
+
+  } else {
+    last_committed_op_id_ = committed_op;
+  }
+  return Status::OK();
 }
+
+int64_t ReplicaState::GetCommittedIndexUnlocked() const {
+  DCHECK(update_lock_.is_locked());
+  return last_committed_op_id_.index();
+}
+
+int64_t ReplicaState::GetTermWithLastCommittedOpUnlocked() const {
+  DCHECK(update_lock_.is_locked());
+  return last_committed_op_id_.term();
+}
+
 
 Status ReplicaState::CheckHasCommittedOpInCurrentTermUnlocked() const {
   int64_t term = GetCurrentTermUnlocked();
-  const OpId& opid = GetCommittedOpIdUnlocked();
+  const OpId& opid = last_committed_op_id_;
   if (opid.term() != term) {
     return Status::IllegalState("Latest committed op is not from this term", OpIdToString(opid));
   }
@@ -645,13 +610,12 @@ Status ReplicaState::CheckHasCommittedOpInCurrentTermUnlocked() const {
 
 void ReplicaState::UpdateLastReceivedOpIdUnlocked(const OpId& op_id) {
   DCHECK(update_lock_.is_locked());
-  DCHECK_LE(OpIdCompare(last_received_op_id_, op_id), 0)
-    << "Previously received OpId: " << last_received_op_id_.ShortDebugString()
-    << ", updated OpId: " << op_id.ShortDebugString()
-    << ", Trace:" << std::endl << Trace::CurrentTrace()->DumpToString();
-  last_received_op_id_ = op_id;
-  last_received_op_id_current_leader_ = last_received_op_id_;
-  next_index_ = op_id.index() + 1;
+  if (OpIdCompare(op_id, last_received_op_id_) > 0) {
+    TRACE("Updating last received op as $0", OpIdToString(op_id));
+    last_received_op_id_ = op_id;
+    next_index_ = op_id.index() + 1;
+  }
+  last_received_op_id_current_leader_ = op_id;
 }
 
 const OpId& ReplicaState::GetLastReceivedOpIdUnlocked() const {
@@ -723,7 +687,7 @@ ReplicaState::State ReplicaState::state() const {
 
 string ReplicaState::ToString() const {
   ThreadRestrictions::AssertWaitAllowed();
-  ReplicaState::UniqueLock lock(&update_lock_);
+  ReplicaState::UniqueLock lock(update_lock_);
   return ToStringUnlocked();
 }
 
@@ -736,7 +700,7 @@ string ReplicaState::ToStringUnlocked() const {
 
   SubstituteAndAppend(&ret, "Watermarks: {Received: $0 Committed: $1}\n",
                       last_received_op_id_.ShortDebugString(),
-                      last_committed_index_.ShortDebugString());
+                      last_committed_op_id_.ShortDebugString());
   return ret;
 }
 

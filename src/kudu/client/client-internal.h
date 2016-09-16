@@ -17,6 +17,7 @@
 #ifndef KUDU_CLIENT_CLIENT_INTERNAL_H
 #define KUDU_CLIENT_CLIENT_INTERNAL_H
 
+#include <algorithm>
 #include <boost/function.hpp>
 #include <set>
 #include <string>
@@ -43,6 +44,7 @@ class MasterServiceProxy;
 
 namespace rpc {
 class Messenger;
+class RequestTracker;
 class RpcController;
 } // namespace rpc
 
@@ -71,7 +73,8 @@ class KuduClient::Data {
   Status CreateTable(KuduClient* client,
                      const master::CreateTableRequestPB& req,
                      const KuduSchema& schema,
-                     const MonoTime& deadline);
+                     const MonoTime& deadline,
+                     bool has_range_partition_bounds);
 
   Status IsCreateTableInProgress(KuduClient* client,
                                  const std::string& table_name,
@@ -88,7 +91,8 @@ class KuduClient::Data {
 
   Status AlterTable(KuduClient* client,
                     const master::AlterTableRequestPB& req,
-                    const MonoTime& deadline);
+                    const MonoTime& deadline,
+                    bool has_add_drop_partition);
 
   Status IsAlterTableInProgress(KuduClient* client,
                                 const std::string& table_name,
@@ -104,7 +108,8 @@ class KuduClient::Data {
                         const MonoTime& deadline,
                         KuduSchema* schema,
                         PartitionSchema* partition_schema,
-                        std::string* table_id);
+                        std::string* table_id,
+                        int* num_replicas);
 
   Status InitLocalHostNames();
 
@@ -167,9 +172,6 @@ class KuduClient::Data {
   //    errors, timeouts, or leadership issues.
   // 3) 'deadline' (if initialized) elapses.
   //
-  // If 'num_attempts' is not NULL, it will be incremented on every
-  // attempt (successful or not) to call 'func'.
-  //
   // NOTE: 'rpc_timeout' is a per-call timeout, while 'deadline' is a
   // per operation deadline. If 'deadline' is not initialized, 'func' is
   // retried forever. If 'deadline' expires, 'func_name' is included in
@@ -180,11 +182,25 @@ class KuduClient::Data {
       KuduClient* client,
       const ReqClass& req,
       RespClass* resp,
-      int* num_attempts,
       const char* func_name,
       const boost::function<Status(master::MasterServiceProxy*,
                                    const ReqClass&, RespClass*,
-                                   rpc::RpcController*)>& func);
+                                   rpc::RpcController*)>& func,
+      std::vector<uint32_t> required_feature_flags);
+
+  // Exponential backoff with jitter anchored between 10ms and 20ms, and an
+  // upper bound between 2.5s and 5s.
+  static MonoDelta ComputeExponentialBackoff(int num_attempts) {
+    return MonoDelta::FromMilliseconds(
+        (10 + rand() % 10) * static_cast<int>(
+            std::pow(2.0, std::min(8, num_attempts - 1))));
+  }
+
+  // The unique id of this client.
+  std::string client_id_;
+
+  // The request tracker for this client.
+  scoped_refptr<rpc::RequestTracker> request_tracker_;
 
   std::shared_ptr<rpc::Messenger> messenger_;
   gscoped_ptr<DnsResolver> dns_resolver_;
@@ -222,6 +238,7 @@ class KuduClient::Data {
 
   AtomicInt<uint64_t> latest_observed_timestamp_;
 
+ private:
   DISALLOW_COPY_AND_ASSIGN(Data);
 };
 

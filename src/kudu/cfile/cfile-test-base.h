@@ -20,6 +20,7 @@
 
 #include <glog/logging.h>
 #include <algorithm>
+#include <functional>
 #include <stdlib.h>
 #include <string>
 #include <vector>
@@ -229,11 +230,16 @@ template<bool HAS_NULLS>
 class StringDataGenerator : public DataGenerator<STRING, HAS_NULLS> {
  public:
   explicit StringDataGenerator(const char* format)
-  : format_(format) {
+      : StringDataGenerator(
+          [=](size_t x) { return StringPrintf(format, x); }) {
+  }
+
+  explicit StringDataGenerator(std::function<std::string(size_t)> formatter)
+      : formatter_(std::move(formatter)) {
   }
 
   Slice BuildTestValue(size_t block_index, size_t value) OVERRIDE {
-    data_buffers_[block_index] = StringPrintf(format_, value);
+    data_buffers_[block_index] = formatter_(value);
     return Slice(data_buffers_[block_index]);
   }
 
@@ -244,7 +250,7 @@ class StringDataGenerator : public DataGenerator<STRING, HAS_NULLS> {
 
  private:
   std::vector<std::string> data_buffers_;
-  const char* format_;
+  std::function<std::string(size_t)> formatter_;
 };
 
 // Class for generating strings that contain duplicate
@@ -296,6 +302,11 @@ class CFileTestBase : public KuduTest {
     ASSERT_OK(fs_manager_->Open());
   }
 
+  // Place a ColumnBlock and SelectionVector into a context. This context will
+  // not support decoder evaluation.
+  ColumnMaterializationContext CreateNonDecoderEvalContext(ColumnBlock* cb, SelectionVector* sel) {
+    return ColumnMaterializationContext(0, nullptr, cb, sel);
+  }
  protected:
   enum Flags {
     NO_FLAGS = 0,
@@ -382,13 +393,15 @@ SumType FastSum(const Indexable &data, size_t n) {
 }
 
 template<DataType Type, typename SumType>
-static void TimeReadFileForDataType(gscoped_ptr<CFileIterator> &iter, int &count) {
+void TimeReadFileForDataType(gscoped_ptr<CFileIterator> &iter, int &count) {
   ScopedColumnBlock<Type> cb(8192);
-
+  SelectionVector sel(cb.nrows());
+  ColumnMaterializationContext ctx(0, nullptr, &cb, &sel);
+  ctx.SetDecoderEvalNotSupported();
   SumType sum = 0;
   while (iter->HasNext()) {
     size_t n = cb.nrows();
-    ASSERT_OK_FAST(iter->CopyNextValues(&n, &cb));
+    ASSERT_OK_FAST(iter->CopyNextValues(&n, &ctx));
     sum += FastSum<ScopedColumnBlock<Type>, SumType>(cb, n);
     count += n;
     cb.arena()->Reset();
@@ -398,12 +411,15 @@ static void TimeReadFileForDataType(gscoped_ptr<CFileIterator> &iter, int &count
 }
 
 template<DataType Type>
-static void ReadBinaryFile(CFileIterator* iter, int* count) {
+void ReadBinaryFile(CFileIterator* iter, int* count) {
   ScopedColumnBlock<Type> cb(100);
+  SelectionVector sel(cb.nrows());
+  ColumnMaterializationContext ctx(0, nullptr, &cb, &sel);
+  ctx.SetDecoderEvalNotSupported();
   uint64_t sum_lens = 0;
   while (iter->HasNext()) {
     size_t n = cb.nrows();
-    ASSERT_OK_FAST(iter->CopyNextValues(&n, &cb));
+    ASSERT_OK_FAST(iter->CopyNextValues(&n, &ctx));
     for (int i = 0; i < n; i++) {
       sum_lens += cb[i].size();
     }
@@ -414,7 +430,7 @@ static void ReadBinaryFile(CFileIterator* iter, int* count) {
   LOG(INFO) << "Count: " << *count;
 }
 
-static void TimeReadFile(FsManager* fs_manager, const BlockId& block_id, size_t *count_ret) {
+void TimeReadFile(FsManager* fs_manager, const BlockId& block_id, size_t *count_ret) {
   Status s;
 
   gscoped_ptr<fs::ReadableBlock> source;

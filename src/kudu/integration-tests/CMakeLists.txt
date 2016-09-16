@@ -20,6 +20,7 @@ set(INTEGRATION_TESTS_SRCS
   cluster_verifier.cc
   external_mini_cluster.cc
   external_mini_cluster_fs_inspector.cc
+  log_verifier.cc
   mini_cluster.cc
   test_workload.cc
 )
@@ -40,31 +41,40 @@ add_dependencies(integration-tests
 
 # Tests
 set(KUDU_TEST_LINK_LIBS integration-tests ${KUDU_MIN_TEST_LIBS})
-ADD_KUDU_TEST(alter_table-test)
+ADD_KUDU_TEST(all_types-itest RESOURCE_LOCK "master-rpc-ports")
 ADD_KUDU_TEST(alter_table-randomized-test)
-ADD_KUDU_TEST(registration-test RESOURCE_LOCK "master-web-port")
+ADD_KUDU_TEST(alter_table-test)
 ADD_KUDU_TEST(client_failover-itest)
 ADD_KUDU_TEST(client-stress-test
   RESOURCE_LOCK "master-rpc-ports"
   RUN_SERIAL true)
-ADD_KUDU_TEST(master_replication-itest RESOURCE_LOCK "master-rpc-ports")
-ADD_KUDU_TEST(master_failover-itest RESOURCE_LOCK "master-rpc-ports")
-ADD_KUDU_TEST(raft_consensus-itest RUN_SERIAL true)
-ADD_KUDU_TEST(ts_tablet_manager-itest)
-ADD_KUDU_TEST(ts_recovery-itest)
+ADD_KUDU_TEST(create-table-itest)
 ADD_KUDU_TEST(create-table-stress-test)
 ADD_KUDU_TEST(delete_table-test)
+ADD_KUDU_TEST(disk_reservation-itest)
+ADD_KUDU_TEST(exactly_once_writes-itest)
 ADD_KUDU_TEST(external_mini_cluster-test RESOURCE_LOCK "master-rpc-ports")
-ADD_KUDU_TEST(linked_list-test RESOURCE_LOCK "master-rpc-ports")
-ADD_KUDU_TEST(all_types-itest RESOURCE_LOCK "master-rpc-ports")
-ADD_KUDU_TEST(remote_bootstrap-itest)
-ADD_KUDU_TEST(tablet_replacement-itest)
-ADD_KUDU_TEST(create-table-itest)
 ADD_KUDU_TEST(fuzz-itest)
+ADD_KUDU_TEST(linked_list-test RESOURCE_LOCK "master-rpc-ports")
+ADD_KUDU_TEST(master_failover-itest RESOURCE_LOCK "master-rpc-ports")
+ADD_KUDU_TEST(master_migration-itest RESOURCE_LOCK "master-rpc-ports")
+ADD_KUDU_TEST_DEPENDENCIES(master_migration-itest
+  kudu)
+ADD_KUDU_TEST(master_replication-itest RESOURCE_LOCK "master-rpc-ports")
+ADD_KUDU_TEST(master-stress-test RESOURCE_LOCK "master-rpc-ports")
+ADD_KUDU_TEST(raft_consensus-itest RUN_SERIAL true)
+ADD_KUDU_TEST(registration-test RESOURCE_LOCK "master-web-port")
+ADD_KUDU_TEST(table_locations-itest)
+ADD_KUDU_TEST(tablet_copy-itest)
+ADD_KUDU_TEST(tablet_history_gc-itest)
+ADD_KUDU_TEST(tablet_replacement-itest)
+ADD_KUDU_TEST(ts_recovery-itest)
+ADD_KUDU_TEST(ts_tablet_manager-itest)
+ADD_KUDU_TEST(webserver-stress-itest)
 ADD_KUDU_TEST(write_throttling-itest)
 
 # Some tests have additional dependencies
-set(KUDU_TEST_LINK_LIBS kudu_client kudu_tools_util ${KUDU_TEST_LINK_LIBS})
+set(KUDU_TEST_LINK_LIBS kudu_tools_util ${KUDU_TEST_LINK_LIBS})
+ADD_KUDU_TEST(flex_partitioning-itest)
 ADD_KUDU_TEST(full_stack-insert-scan-test RUN_SERIAL true)
 ADD_KUDU_TEST(update_scan_delta_compact-test RUN_SERIAL true)
-ADD_KUDU_TEST(flex_partitioning-itest)

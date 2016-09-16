@@ -26,6 +26,7 @@
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/integration-tests/mini_cluster_base.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/status.h"
@@ -118,19 +119,13 @@ struct ExternalMiniClusterOptions {
 // cluster participants, which isn't feasible in the normal MiniCluster.
 // On the other hand, there is little access to inspect the internal state
 // of the daemons.
-class ExternalMiniCluster {
+class ExternalMiniCluster : public MiniClusterBase {
  public:
-  // Mode to which node types a certain action (like Shutdown()) should apply.
-  enum NodeSelectionMode {
-    TS_ONLY,
-    ALL
-  };
-
   explicit ExternalMiniCluster(const ExternalMiniClusterOptions& opts);
-  ~ExternalMiniCluster();
+  virtual ~ExternalMiniCluster();
 
   // Start the cluster.
-  Status Start();
+  Status Start() override;
 
   // Restarts the cluster. Requires that it has been Shutdown() first.
   Status Restart();
@@ -144,10 +139,8 @@ class ExternalMiniCluster {
   // Requires that the master is already running.
   Status AddTabletServer();
 
-  // Shuts down the whole cluster or part of it, depending on the selected
-  // 'mode'.
   // Currently, this uses SIGKILL on each daemon for a non-graceful shutdown.
-  void Shutdown(NodeSelectionMode mode = ALL);
+  void ShutdownNodes(ClusterNodes nodes) override;
 
   // Return the IP address that the tablet server with the given index will bind to.
   // If options.bind_to_unique_loopback_addresses is false, this will be 127.0.0.1
@@ -202,11 +195,11 @@ class ExternalMiniCluster {
   // Return all tablet servers and masters.
   std::vector<ExternalDaemon*> daemons() const;
 
-  int num_tablet_servers() const {
+  int num_tablet_servers() const override {
     return tablet_servers_.size();
   }
 
-  int num_masters() const {
+  int num_masters() const override {
     return masters_.size();
   }
 
@@ -222,26 +215,31 @@ class ExternalMiniCluster {
   // master at 'idx' is running.
   std::shared_ptr<master::MasterServiceProxy> master_proxy(int idx);
 
-  // Wait until the number of registered tablet servers reaches the
-  // given count on at least one of the running masters.  Returns
-  // Status::TimedOut if the desired count is not achieved with the
-  // given timeout.
+  // Wait until the number of registered tablet servers reaches the given count
+  // on all of the running masters. Returns Status::TimedOut if the desired
+  // count is not achieved with the given timeout.
   Status WaitForTabletServerCount(int count, const MonoDelta& timeout);
 
   // Runs gtest assertions that no servers have crashed.
   void AssertNoCrashes();
 
-  // Wait until all tablets on the given tablet server are in 'RUNNING'
-  // state.
-  Status WaitForTabletsRunning(ExternalTabletServer* ts, const MonoDelta& timeout);
+  // Wait until all tablets on the given tablet server are in the RUNNING
+  // state. Returns Status::TimedOut if 'timeout' elapses and at least one
+  // tablet is not yet RUNNING.
+  //
+  // If 'min_tablet_count' is not -1, will also wait for at least that many
+  // RUNNING tablets to appear before returning (potentially timing out if that
+  // number is never reached).
+  Status WaitForTabletsRunning(ExternalTabletServer* ts, int min_tablet_count,
+                               const MonoDelta& timeout);
 
   // Create a client configured to talk to this cluster.
   // Builder may contain override options for the client. The master address will
   // be overridden to talk to the running master.
   //
   // REQUIRES: the cluster must have already been Start()ed.
-  Status CreateClient(client::KuduClientBuilder& builder,
-                      client::sp::shared_ptr<client::KuduClient>* client);
+  Status CreateClient(client::KuduClientBuilder* builder,
+                      client::sp::shared_ptr<client::KuduClient>* client) const override;
 
   // Sets the given flag on the given daemon, which must be running.
   //
@@ -251,15 +249,22 @@ class ExternalMiniCluster {
                  const std::string& flag,
                  const std::string& value);
 
+  // Returns the path where 'binary' is expected to live, based on
+  // ExternalMiniClusterOptions.daemon_bin_path if it was provided, or on the
+  // path of the currently running executable otherwise.
+  std::string GetBinaryPath(const std::string& binary) const;
+
+  // Returns the path where 'daemon_id' is expected to store its data, based on
+  // ExternalMiniClusterOptions.data_root if it was provided, or on the
+  // standard Kudu test directory otherwise.
+  std::string GetDataPath(const std::string& daemon_id) const;
+
  private:
   FRIEND_TEST(MasterFailoverTest, TestKillAnyMaster);
 
   Status StartSingleMaster();
 
   Status StartDistributedMasters();
-
-  std::string GetBinaryPath(const std::string& binary) const;
-  std::string GetDataPath(const std::string& daemon_id) const;
 
   Status DeduceBinRoot(std::string* ret);
   Status HandleOptions();
@@ -397,6 +402,9 @@ class ExternalMaster : public ExternalDaemon {
   // Requires that it has previously been shutdown.
   Status Restart() WARN_UNUSED_RESULT;
 
+  // Blocks until the master's catalog manager is initialized and responding to
+  // RPCs.
+  Status WaitForCatalogManager() WARN_UNUSED_RESULT;
 
  private:
   friend class RefCountedThreadSafe<ExternalMaster>;
@@ -418,7 +426,6 @@ class ExternalTabletServer : public ExternalDaemon {
   // Restarts the daemon.
   // Requires that it has previously been shutdown.
   Status Restart() WARN_UNUSED_RESULT;
-
 
  private:
   const std::string master_addrs_;

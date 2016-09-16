@@ -290,11 +290,16 @@ class PeriodicWebUIChecker {
     master_pages.push_back("/tables");
     master_pages.push_back("/dump-entities");
     master_pages.push_back("/tablet-servers");
+    master_pages.push_back("/mem-trackers");
 
     ts_pages.push_back("/metrics");
     ts_pages.push_back("/tablets");
-    ts_pages.push_back(strings::Substitute("/transactions?tablet_id=$0", tablet_id));
+    if (!tablet_id.empty()) {
+      ts_pages.push_back(strings::Substitute("/transactions?tablet_id=$0",
+                                             tablet_id));
+    }
     ts_pages.push_back("/maintenance-manager");
+    ts_pages.push_back("/mem-trackers");
 
     // Generate list of urls for each master and tablet server
     for (int i = 0; i < cluster.num_masters(); i++) {
@@ -334,17 +339,16 @@ class PeriodicWebUIChecker {
     for (std::string url : urls_) {
       LOG(INFO) << url;
     }
-    for (int count = 0; is_running_.Load(); count++) {
-      const std::string &url = urls_[count % urls_.size()];
-      LOG(INFO) << "Curling URL " << url;
-      const MonoTime start = MonoTime::Now(MonoTime::FINE);
-      Status status = curl.FetchURL(url, &dst);
-      if (status.ok()) {
-        CHECK_GT(dst.length(), 0);
+    while (is_running_.Load()) {
+      // Poll all of the URLs.
+      const MonoTime start = MonoTime::Now();
+      for (const auto& url : urls_) {
+        if (curl.FetchURL(url, &dst).ok()) {
+          CHECK_GT(dst.length(), 0);
+        }
       }
       // Sleep until the next period
-      const MonoTime end = MonoTime::Now(MonoTime::FINE);
-      const MonoDelta elapsed = end.GetDeltaSince(start);
+      const MonoDelta elapsed = MonoTime::Now() - start;
       const int64_t sleep_ns = period_.ToNanoseconds() - elapsed.ToNanoseconds();
       if (sleep_ns > 0) {
         SleepFor(MonoDelta::FromNanoseconds(sleep_ns));
@@ -419,6 +423,7 @@ Status LinkedListTester::CreateLinkedListTable() {
   gscoped_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
   RETURN_NOT_OK_PREPEND(table_creator->table_name(table_name_)
                         .schema(&schema_)
+                        .set_range_partition_columns({ kKeyColumnName })
                         .split_rows(GenerateSplitRows(schema_))
                         .num_replicas(num_replicas_)
                         .Create(),
@@ -444,9 +449,8 @@ Status LinkedListTester::LoadLinkedList(
   scoped_refptr<server::Clock> ht_clock(new server::HybridClock());
   RETURN_NOT_OK(ht_clock->Init());
 
-  MonoTime start = MonoTime::Now(MonoTime::COARSE);
-  MonoTime deadline = start;
-  deadline.AddDelta(run_for);
+  MonoTime start = MonoTime::Now();
+  MonoTime deadline = start + run_for;
 
   client::sp::shared_ptr<client::KuduSession> session = client_->NewSession();
   session->SetTimeoutMillis(15000);
@@ -461,8 +465,7 @@ Status LinkedListTester::LoadLinkedList(
   }
 
   MonoDelta sample_interval = MonoDelta::FromMicroseconds(run_for.ToMicroseconds() / num_samples);
-  MonoTime next_sample = start;
-  next_sample.AddDelta(sample_interval);
+  MonoTime next_sample = start + sample_interval;
   LOG(INFO) << "Running for: " << run_for.ToString();
   LOG(INFO) << "Sampling every " << sample_interval.ToMicroseconds() << " us";
 
@@ -474,16 +477,16 @@ Status LinkedListTester::LoadLinkedList(
       DumpInsertHistogram(false);
     }
 
-    MonoTime now = MonoTime::Now(MonoTime::COARSE);
-    if (next_sample.ComesBefore(now)) {
+    MonoTime now = MonoTime::Now();
+    if (next_sample < now) {
       Timestamp now = ht_clock->Now();
       sampled_timestamps_and_counts_.push_back(
           pair<uint64_t,int64_t>(now.ToUint64(), *written_count));
-      next_sample.AddDelta(sample_interval);
+      next_sample += sample_interval;
       LOG(INFO) << "Sample at HT timestamp: " << now.ToString()
                 << " Inserted count: " << *written_count;
     }
-    if (deadline.ComesBefore(now)) {
+    if (deadline < now) {
       LOG(INFO) << "Finished inserting list. Added " << (*written_count) << " in chain";
       LOG(INFO) << "Last entries inserted had keys:";
       for (int i = 0; i < num_chains_; i++) {
@@ -496,9 +499,9 @@ Status LinkedListTester::LoadLinkedList(
                             "Unable to generate next insert into linked list chain");
     }
 
-    MonoTime flush_start(MonoTime::Now(MonoTime::FINE));
+    MonoTime flush_start(MonoTime::Now());
     FlushSessionOrDie(session);
-    MonoDelta elapsed = MonoTime::Now(MonoTime::FINE).GetDeltaSince(flush_start);
+    MonoDelta elapsed = MonoTime::Now() - flush_start;
     latency_histogram_.Increment(elapsed.ToMicroseconds());
 
     (*written_count) += chains.size();

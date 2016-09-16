@@ -33,6 +33,9 @@
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/util/hexdump.h"
 
+using google::protobuf::FieldDescriptor;
+using google::protobuf::Reflection;
+
 using std::set;
 using std::string;
 
@@ -119,13 +122,10 @@ Status KuduScanner::Data::HandleError(const ScanRpcStatus& err,
   }
 
   if (backoff) {
-    // Exponential backoff with jitter anchored between 10ms and 20ms, and an
-    // upper bound between 2.5s and 5s.
-    MonoDelta sleep = MonoDelta::FromMilliseconds(
-        (10 + rand() % 10) * static_cast<int>(std::pow(2.0, std::min(8, scan_attempts_ - 1))));
-    MonoTime now = MonoTime::Now(MonoTime::FINE);
-    now.AddDelta(sleep);
-    if (deadline.ComesBefore(now)) {
+    MonoDelta sleep =
+        KuduClient::Data::ComputeExponentialBackoff(scan_attempts_);
+    MonoTime now = MonoTime::Now() + sleep;
+    if (deadline < now) {
       Status ret = Status::TimedOut("unable to retry before timeout",
                                     err.status.ToString());
       return last_error_.ok() ?
@@ -140,6 +140,21 @@ Status KuduScanner::Data::HandleError(const ScanRpcStatus& err,
     return Status::OK();
   }
   return err.status;
+}
+
+void KuduScanner::Data::UpdateResourceMetrics() {
+  if (last_response_.has_resource_metrics()) {
+    tserver::ResourceMetricsPB resource_metrics = last_response_.resource_metrics();
+    const Reflection* reflection = resource_metrics.GetReflection();
+    vector<const FieldDescriptor*> fields;
+    reflection->ListFields(resource_metrics, &fields);
+    for (const FieldDescriptor* field : fields) {
+      if (reflection->HasField(resource_metrics, field) &&
+          field->cpp_type() == FieldDescriptor::CPPTYPE_INT64) {
+        resource_metrics_.Increment(field->name(), reflection->GetInt64(resource_metrics, field));
+      }
+    }
+  }
 }
 
 ScanRpcStatus KuduScanner::Data::AnalyzeResponse(const Status& rpc_status,
@@ -166,7 +181,7 @@ ScanRpcStatus KuduScanner::Data::AnalyzeResponse(const Status& rpc_status,
     }
 
     if (rpc_status.IsTimedOut()) {
-      if (overall_deadline.Equals(deadline)) {
+      if (overall_deadline == deadline) {
         return ScanRpcStatus{ScanRpcStatus::OVERALL_DEADLINE_EXCEEDED, rpc_status};
       } else {
         return ScanRpcStatus{ScanRpcStatus::RPC_DEADLINE_EXCEEDED, rpc_status};
@@ -215,8 +230,7 @@ ScanRpcStatus KuduScanner::Data::SendScanRpc(const MonoTime& overall_deadline,
   // if the first server we try happens to be hung.
   MonoTime rpc_deadline;
   if (allow_time_for_failover) {
-    rpc_deadline = MonoTime::Now(MonoTime::FINE);
-    rpc_deadline.AddDelta(table_->client()->default_rpc_timeout());
+    rpc_deadline = MonoTime::Now() + table_->client()->default_rpc_timeout();
     rpc_deadline = MonoTime::Earliest(overall_deadline, rpc_deadline);
   } else {
     rpc_deadline = overall_deadline;
@@ -227,11 +241,15 @@ ScanRpcStatus KuduScanner::Data::SendScanRpc(const MonoTime& overall_deadline,
   if (!configuration_.spec().predicates().empty()) {
     controller_.RequireServerFeature(TabletServerFeatures::COLUMN_PREDICATES);
   }
-  return AnalyzeResponse(
+  ScanRpcStatus scan_status = AnalyzeResponse(
       proxy_->Scan(next_req_,
                    &last_response_,
                    &controller_),
       rpc_deadline, overall_deadline);
+  if (scan_status.result == ScanRpcStatus::OK) {
+    UpdateResourceMetrics();
+  }
+  return scan_status;
 }
 
 Status KuduScanner::Data::OpenTablet(const string& partition_key,
@@ -295,12 +313,28 @@ Status KuduScanner::Data::OpenTablet(const string& partition_key,
 
   for (int attempt = 1;; attempt++) {
     Synchronizer sync;
-    table_->client()->data_->meta_cache_->LookupTabletByKey(table_.get(),
-                                                            partition_key,
-                                                            deadline,
-                                                            &remote_,
-                                                            sync.AsStatusCallback());
-    RETURN_NOT_OK(sync.Wait());
+    table_->client()->data_->meta_cache_->LookupTabletByKeyOrNext(table_.get(),
+                                                                  partition_key,
+                                                                  deadline,
+                                                                  &remote_,
+                                                                  sync.AsStatusCallback());
+    Status s = sync.Wait();
+    if (s.IsNotFound()) {
+      // No more tablets in the table.
+      partition_pruner_.RemovePartitionKeyRange("");
+      return Status::OK();
+    } else {
+      RETURN_NOT_OK(s);
+    }
+
+    // Check if the meta cache returned a tablet covering a partition key range past
+    // what we asked for. This can happen if the requested partition key falls
+    // in a non-covered range. In this case we can potentially prune the tablet.
+    if (partition_key < remote_->partition().partition_key_start() &&
+        partition_pruner_.ShouldPrune(remote_->partition())) {
+      partition_pruner_.RemovePartitionKeyRange(remote_->partition().partition_key_end());
+      return Status::OK();
+    }
 
     scan->set_tablet_id(remote_->tablet_id());
 
@@ -317,9 +351,7 @@ Status KuduScanner::Data::OpenTablet(const string& partition_key,
     // currently have any known leader. We should sleep and retry, since
     // it's likely that the tablet is undergoing a leader election and will
     // soon have one.
-    if (lookup_status.IsServiceUnavailable() &&
-        MonoTime::Now(MonoTime::FINE).ComesBefore(deadline)) {
-
+    if (lookup_status.IsServiceUnavailable() && MonoTime::Now() < deadline) {
       // ServiceUnavailable means that we have already blacklisted all of the candidate
       // tablet servers. So, we clear the list so that we will cycle through them all
       // another time.

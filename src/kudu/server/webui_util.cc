@@ -17,9 +17,9 @@
 
 #include "kudu/server/webui_util.h"
 
+#include <sstream>
 #include <string>
 
-#include "kudu/common/schema.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/human_readable.h"
@@ -32,10 +32,11 @@ using strings::Substitute;
 namespace kudu {
 
 void HtmlOutputSchemaTable(const Schema& schema,
-                           std::stringstream* output) {
+                           std::ostringstream* output) {
   *output << "<table class='table table-striped'>\n";
   *output << "  <tr>"
           << "<th>Column</th><th>ID</th><th>Type</th>"
+          << "<th>Encoding</th><th>Compression</th>"
           << "<th>Read default</th><th>Write default</th>"
           << "</tr>\n";
 
@@ -49,10 +50,16 @@ void HtmlOutputSchemaTable(const Schema& schema,
     if (col.has_write_default()) {
       write_default = col.Stringify(col.write_default_value());
     }
-    *output << Substitute("<tr><th>$0</th><td>$1</td><td>$2</td><td>$3</td><td>$4</td></tr>\n",
+    const ColumnStorageAttributes& attrs = col.attributes();
+    const string& encoding = EncodingType_Name(attrs.encoding);
+    const string& compression = CompressionType_Name(attrs.compression);
+    *output << Substitute("<tr><th>$0</th><td>$1</td><td>$2</td><td>$3</td>"
+                          "<td>$4</td><td>$5</td><td>$6</td></tr>\n",
                           EscapeForHtmlToString(col.name()),
                           schema.column_id(i),
                           col.TypeToString(),
+                          EscapeForHtmlToString(encoding),
+                          EscapeForHtmlToString(compression),
                           EscapeForHtmlToString(read_default),
                           EscapeForHtmlToString(write_default));
   }
@@ -62,8 +69,8 @@ void HtmlOutputSchemaTable(const Schema& schema,
 void HtmlOutputImpalaSchema(const std::string& table_name,
                             const Schema& schema,
                             const string& master_addresses,
-                            std::stringstream* output) {
-  *output << "<code><pre>\n";
+                            std::ostringstream* output) {
+  *output << "<pre><code>\n";
 
   // Escape table and column names with ` to avoid conflicts with Impala reserved words.
   *output << "CREATE EXTERNAL TABLE " << EscapeForHtmlToString("`" + table_name + "`")
@@ -98,8 +105,8 @@ void HtmlOutputImpalaSchema(const std::string& table_name,
       case INT64:
         *output << "BIGINT";
         break;
-      case TIMESTAMP:
-        *output << "TIMESTAMP";
+      case UNIXTIME_MICROS:
+        *output << "INT64";
         break;
       case FLOAT:
         *output << "FLOAT";
@@ -127,15 +134,18 @@ void HtmlOutputImpalaSchema(const std::string& table_name,
 
   *output << "TBLPROPERTIES(\n";
   *output << "  'storage_handler' = 'com.cloudera.kudu.hive.KuduStorageHandler',\n";
-  *output << "  'kudu.table_name' = '" << table_name << "',\n";
-  *output << "  'kudu.master_addresses' = '" << master_addresses << "',\n";
-  *output << "  'kudu.key_columns' = '" << JoinElements(key_columns, ", ") << "'\n";
+  *output << "  'kudu.table_name' = '";
+  *output << EscapeForHtmlToString(table_name) << "',\n";
+  *output << "  'kudu.master_addresses' = '";
+  *output << EscapeForHtmlToString(master_addresses) << "',\n";
+  *output << "  'kudu.key_columns' = '";
+  *output << EscapeForHtmlToString(JoinElements(key_columns, ", ")) << "'\n";
   *output << ");\n";
-  *output << "</pre></code>\n";
+  *output << "</code></pre>\n";
 }
 
 void HtmlOutputTaskList(const std::vector<scoped_refptr<MonitoredTask> >& tasks,
-                        std::stringstream* output) {
+                        std::ostringstream* output) {
   *output << "<table class='table table-striped'>\n";
   *output << "  <tr><th>Task Name</th><th>State</th><th>Time</th><th>Description</th></tr>\n";
   for (const scoped_refptr<MonitoredTask>& task : tasks) {
@@ -160,11 +170,10 @@ void HtmlOutputTaskList(const std::vector<scoped_refptr<MonitoredTask> >& tasks,
 
     double running_secs = 0;
     if (task->completion_timestamp().Initialized()) {
-      running_secs = task->completion_timestamp().GetDeltaSince(
-        task->start_timestamp()).ToSeconds();
+      running_secs =
+          (task->completion_timestamp() - task->start_timestamp()).ToSeconds();
     } else if (task->start_timestamp().Initialized()) {
-      running_secs = MonoTime::Now(MonoTime::FINE).GetDeltaSince(
-        task->start_timestamp()).ToSeconds();
+      running_secs = (MonoTime::Now() - task->start_timestamp()).ToSeconds();
     }
 
     *output << Substitute(
@@ -176,5 +185,4 @@ void HtmlOutputTaskList(const std::vector<scoped_refptr<MonitoredTask> >& tasks,
   }
   *output << "</table>\n";
 }
-
 } // namespace kudu

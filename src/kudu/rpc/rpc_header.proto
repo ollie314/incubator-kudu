@@ -19,7 +19,9 @@ option optimize_for = SPEED;
 
 package kudu.rpc;
 
-option java_package = "org.kududb.rpc";
+option java_package = "org.apache.kudu.rpc";
+
+import "google/protobuf/descriptor.proto";
 
 // The Kudu RPC protocol is similar to the RPC protocol of Hadoop and HBase.
 // See the following for reference on those other protocols:
@@ -121,17 +123,19 @@ message RequestIdPB {
 
   // The sequence number of the first RPC that has not been marked as completed by the client.
   // Unset if there isn't an incomplete RPC.
-  optional int64 first_incomplete_seq_no = 3;
+  required int64 first_incomplete_seq_no = 3;
 
-  // The number of times this RPC has been tried, only set after the first attempt.
-  optional int32 attempt_no = 4;
+  // The number of times this RPC has been tried.
+  // Set to 1 in the first attempt.
+  required int64 attempt_no = 4;
 }
 
 // The header for the RPC request frame.
 message RequestHeader {
-  // A sequence number that is sent back in the Response. Hadoop specifies a uint32 and
-  // casts it to a signed int. That is counterintuitive, so we use an int32 instead.
-  // Allowed values (inherited from Hadoop):
+  // A sequence number that uniquely identifies a call to a single remote server. This number is
+  // sent back in the Response and allows to match it to the original Request.
+  // Hadoop specifies a uint32 and casts it to a signed int. That is counterintuitive, so we use an
+  // int32 instead. Allowed values (inherited from Hadoop):
   //   0 through INT32_MAX: Regular RPC call IDs.
   //   -2: Invalid call ID.
   //   -3: Connection context call ID.
@@ -161,6 +165,11 @@ message RequestHeader {
   repeated uint32 required_feature_flags = 11;
 
   // The unique id of this request, if it's retriable and if the results are to be tracked.
+  // The request id is unique per logical request, i.e. retries of the same RPC must have the
+  // same request id.
+  // Note that this is different from 'call_id' in that a call_id is unique to a server while a
+  // request_id is unique to a logical request (i.e. the request_id remains the same when a request
+  // is retried on a different server).
   // Optional for requests that are naturally idempotent or to maintain compatibility with
   // older clients for requests that are not.
   optional RequestIdPB request_id = 15;
@@ -207,6 +216,10 @@ message ErrorStatusPB {
     // or the server does not support the required feature flags.
     ERROR_INVALID_REQUEST = 5;
 
+    // The server might have previously received this request but its response is no
+    // longer cached. It's unknown whether the request was executed or not.
+    ERROR_REQUEST_STALE = 6;
+
     // FATAL_* errors indicate that the client should shut down the connection.
     //------------------------------------------------------------
     // The RPC server is already shutting down.
@@ -234,4 +247,10 @@ message ErrorStatusPB {
   // should also fill in exactly one of these extension fields, which contains
   // more details on the service-specific error.
   extensions 100 to max;
+}
+
+// An option for RPC methods that allows to set whether that method's
+// RPC results should be tracked with a ResultTracker.
+extend google.protobuf.MethodOptions {
+  optional bool track_rpc_result = 50006 [default=false];
 }

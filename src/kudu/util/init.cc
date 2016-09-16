@@ -50,6 +50,8 @@ Status CheckCPUFlags() {
 
 void InitKuduOrDie() {
   CHECK_OK(CheckCPUFlags());
+  // NOTE: this function is called before flags are parsed.
+  // Do not add anything in here which is flag-dependent.
 }
 
 } // namespace kudu

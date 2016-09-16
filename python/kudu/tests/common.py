@@ -27,7 +27,7 @@ import tempfile
 import time
 
 import kudu
-
+from kudu.client import Partitioning
 
 class KuduTestBase(object):
 
@@ -38,6 +38,7 @@ class KuduTestBase(object):
 
     BASE_PORT = 37000
     NUM_TABLET_SERVERS = 3
+    TSERVER_START_TIMEOUT_SECS = 10
 
     @classmethod
     def start_cluster(cls):
@@ -53,6 +54,8 @@ class KuduTestBase(object):
 
         path = [
             "{0}/kudu-master".format(bin_path),
+            "-unlock_unsafe_flags",
+            "-unlock_experimental_flags",
             "-rpc_server_allow_ephemeral_ports",
             "-rpc_bind_addresses=0.0.0.0:0",
             "-fs_wal_dir={0}/master/data".format(local_path),
@@ -93,6 +96,8 @@ class KuduTestBase(object):
 
             path = [
                 "{0}/kudu-tserver".format(bin_path),
+                "-unlock_unsafe_flags",
+                "-unlock_experimental_flags",
                 "-rpc_server_allow_ephemeral_ports",
                 "-rpc_bind_addresses=0.0.0.0:0",
                 "-tserver_master_addrs=127.0.0.1:{0}".format(master_port),
@@ -131,12 +136,23 @@ class KuduTestBase(object):
 
         cls.client = kudu.connect(cls.master_host, cls.master_port)
 
+        # Wait for all tablet servers to start with the configured timeout
+        timeout = time.time() + cls.TSERVER_START_TIMEOUT_SECS
+        while len(cls.client.list_tablet_servers()) < cls.NUM_TABLET_SERVERS:
+            if time.time() > timeout:
+                raise TimeoutError(
+                    "Tablet servers took too long to start. Timeout set to {}"
+                                   .format(cls.TSERVER_START_TIMEOUT_SECS))
+            # Sleep 50 milliseconds to avoid tight-looping rpc
+            time.sleep(0.05)
+
         cls.schema = cls.example_schema()
+        cls.partitioning = cls.example_partitioning()
 
         cls.ex_table = 'example-table'
         if cls.client.table_exists(cls.ex_table):
             cls.client.delete_table(cls.ex_table)
-        cls.client.create_table(cls.ex_table, cls.schema)
+        cls.client.create_table(cls.ex_table, cls.schema, cls.partitioning)
 
     @classmethod
     def tearDownClass(cls):
@@ -151,3 +167,7 @@ class KuduTestBase(object):
         builder.set_primary_keys(['key'])
 
         return builder.build()
+
+    @classmethod
+    def example_partitioning(cls):
+        return Partitioning().set_range_partition_columns(['key'])

@@ -17,6 +17,8 @@
 
 #include "kudu/util/throttler.h"
 
+#include <mutex>
+
 namespace kudu {
 
 Throttler::Throttler(MonoTime now, uint64_t op_rate, uint64_t byte_rate, double burst_factor) :
@@ -33,7 +35,7 @@ bool Throttler::Take(MonoTime now, uint64_t op, uint64_t byte) {
   if (op_refill_ == 0 && byte_refill_ == 0) {
     return true;
   }
-  boost::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard<simple_spinlock> lock(lock_);
   Refill(now);
   if ((op_refill_ == 0 || op <= op_token_) &&
       (byte_refill_ == 0 || byte <= byte_token_)) {
@@ -49,12 +51,12 @@ bool Throttler::Take(MonoTime now, uint64_t op, uint64_t byte) {
 }
 
 void Throttler::Refill(MonoTime now) {
-  int64_t d = now.GetDeltaSince(next_refill_).ToMicroseconds();
+  int64_t d = (now - next_refill_).ToMicroseconds();
   if (d < 0) {
     return;
   }
   uint64_t num_period = d / kRefillPeriodMicros + 1;
-  next_refill_.AddDelta(MonoDelta::FromMicroseconds(num_period * kRefillPeriodMicros));
+  next_refill_ += MonoDelta::FromMicroseconds(num_period * kRefillPeriodMicros);
   op_token_ += num_period * op_refill_;
   op_token_ = std::min(op_token_, op_token_max_);
   byte_token_ += num_period * byte_refill_;

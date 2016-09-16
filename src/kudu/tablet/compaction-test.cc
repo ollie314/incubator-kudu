@@ -208,7 +208,7 @@ class TestCompaction : public KuduRowSetTest {
                                 BloomFilterSizing::BySizeAndFPRate(32*1024, 0.01f),
                                 roll_threshold);
     ASSERT_OK(rsw.Open());
-    ASSERT_OK(FlushCompactionInput(input, snap, &rsw));
+    ASSERT_OK(FlushCompactionInput(input, snap, HistoryGcOpts::Disabled(), &rsw));
     ASSERT_OK(rsw.Finish());
 
     vector<shared_ptr<RowSetMetadata> > metas;
@@ -378,16 +378,10 @@ class TestCompaction : public KuduRowSetTest {
                                     BloomFilterSizing::BySizeAndFPRate(32 * 1024, 0.01f),
                                     1024 * 1024); // 1 MB
       ASSERT_OK(rdrsw.Open());
-      ASSERT_OK(FlushCompactionInput(compact_input.get(), merge_snap, &rdrsw));
+      ASSERT_OK(FlushCompactionInput(compact_input.get(), merge_snap, HistoryGcOpts::Disabled(),
+                                     &rdrsw));
       ASSERT_OK(rdrsw.Finish());
     }
-  }
-
-  Status GetDataDiskSpace(uint64_t* bytes_used) {
-    *bytes_used = 0;
-    return env_->Walk(fs_manager()->GetDataRootDirs().at(0),
-                      Env::PRE_ORDER, Bind(&TestCompaction::GetDataDiskSpaceCb,
-                                           Unretained(this), bytes_used));
   }
 
  protected:
@@ -398,28 +392,6 @@ class TestCompaction : public KuduRowSetTest {
   MvccManager mvcc_;
 
   scoped_refptr<LogAnchorRegistry> log_anchor_registry_;
-
- private:
-
-  Status GetDataDiskSpaceCb(uint64_t* bytes_used,
-                            Env::FileType type,
-                            const string& dirname, const string& basename) {
-    uint64_t file_bytes_used = 0;
-    switch (type) {
-      case Env::FILE_TYPE:
-        RETURN_NOT_OK(env_->GetFileSizeOnDisk(
-            JoinPathSegments(dirname, basename), &file_bytes_used));
-        *bytes_used += file_bytes_used;
-        break;
-      case Env::DIRECTORY_TYPE:
-        // Ignore directory space consumption; it varies from filesystem to
-        // filesystem and isn't interesting for this test.
-        break;
-      default:
-        LOG(FATAL) << "Unknown file type: " << type;
-    }
-    return Status::OK();
-  }
 };
 
 TEST_F(TestCompaction, TestMemRowSetInput) {
@@ -604,7 +576,8 @@ TEST_F(TestCompaction, TestOneToOne) {
 
   string dummy_name = "";
 
-  ASSERT_OK(ReupdateMissedDeltas(dummy_name, input.get(), snap, snap2, { rs }));
+  ASSERT_OK(ReupdateMissedDeltas(dummy_name, input.get(), HistoryGcOpts::Disabled(), snap, snap2,
+                                 { rs }));
 
   // If we look at the contents of the DiskRowSet now, we should see the "re-updated" data.
   vector<string> out;
@@ -657,9 +630,9 @@ TEST_F(TestCompaction, TestKUDU102) {
   string dummy_name = "";
 
   // This would fail without KUDU-102
-  ASSERT_OK(ReupdateMissedDeltas(dummy_name, input.get(), snap, snap2, { rs, rs_b }));
+  ASSERT_OK(ReupdateMissedDeltas(dummy_name, input.get(), HistoryGcOpts::Disabled(), snap, snap2,
+                                 { rs, rs_b }));
 }
-
 
 // Test compacting when all of the inputs and the output have the same schema
 TEST_F(TestCompaction, TestMerge) {
@@ -771,22 +744,23 @@ TEST_F(TestCompaction, TestCompactionFreesDiskSpace) {
   }
 
   uint64_t bytes_before;
-  ASSERT_NO_FATAL_FAILURE(GetDataDiskSpace(&bytes_before));
+  ASSERT_OK(env_->GetFileSizeOnDiskRecursively(
+      fs_manager()->GetDataRootDirs().at(0), &bytes_before));
 
   ASSERT_OK(tablet()->Compact(Tablet::FORCE_COMPACT_ALL));
 
   // Block deletion may happen asynchronously, so let's loop for a bit until
   // the space becomes free.
-  MonoTime deadline = MonoTime::Now(MonoTime::FINE);
-  deadline.AddDelta(MonoDelta::FromSeconds(30));
+  MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(30);
   while (true) {
     uint64_t bytes_after;
-    ASSERT_NO_FATAL_FAILURE(GetDataDiskSpace(&bytes_after));
+    ASSERT_OK(env_->GetFileSizeOnDiskRecursively(
+        fs_manager()->GetDataRootDirs().at(0), &bytes_after));
     LOG(INFO) << Substitute("Data disk space: $0 (before), $1 (after) ",
                             bytes_before, bytes_after);
     if (bytes_after < bytes_before) {
       break;
-    } else if (deadline.ComesBefore(MonoTime::Now(MonoTime::FINE))) {
+    } else if (MonoTime::Now() > deadline) {
       FAIL() << "Timed out waiting for compaction to reduce data block disk "
              << "space usage";
     }

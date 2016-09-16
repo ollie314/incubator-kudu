@@ -18,15 +18,15 @@
 #include "kudu/tablet/tablet_peer_mm_ops.h"
 
 #include <algorithm>
+#include <gflags/gflags.h>
 #include <map>
+#include <mutex>
 #include <string>
 
-#include <gflags/gflags.h>
-
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/tablet/maintenance_manager.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/metrics.h"
 
 DEFINE_int32(flush_threshold_mb, 1024,
@@ -90,7 +90,7 @@ void FlushOpPerfImprovementPolicy::SetPerfImprovementForFlush(MaintenanceOpStats
 //
 
 void FlushMRSOp::UpdateStats(MaintenanceOpStats* stats) {
-  boost::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
 
   map<int64_t, int64_t> max_idx_to_segment_size;
   if (tablet_peer_->tablet()->MemRowSetEmpty() ||
@@ -99,8 +99,7 @@ void FlushMRSOp::UpdateStats(MaintenanceOpStats* stats) {
   }
 
   {
-    boost::unique_lock<Semaphore> lock(tablet_peer_->tablet()->rowsets_flush_sem_,
-                                       boost::defer_lock);
+    std::unique_lock<Semaphore> lock(tablet_peer_->tablet()->rowsets_flush_sem_, std::defer_lock);
     stats->set_runnable(lock.try_lock());
   }
 
@@ -129,7 +128,7 @@ void FlushMRSOp::Perform() {
                         Substitute("FlushMRS failed on $0", tablet_peer_->tablet_id()));
 
   {
-    boost::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     time_since_flush_.start();
   }
   tablet_peer_->tablet()->rowsets_flush_sem_.unlock();
@@ -148,7 +147,7 @@ scoped_refptr<AtomicGauge<uint32_t> > FlushMRSOp::RunningGauge() const {
 //
 
 void FlushDeltaMemStoresOp::UpdateStats(MaintenanceOpStats* stats) {
-  boost::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   int64_t dms_size;
   int64_t retention_size;
   map<int64_t, int64_t> max_idx_to_segment_size;
@@ -174,11 +173,12 @@ void FlushDeltaMemStoresOp::Perform() {
     LOG(WARNING) << "Won't flush deltas since tablet shutting down: " << tablet_peer_->tablet_id();
     return;
   }
-  WARN_NOT_OK(tablet_peer_->tablet()->FlushDMSWithHighestRetention(max_idx_to_segment_size),
-                  Substitute("Failed to flush DMS on $0",
-                             tablet_peer_->tablet()->tablet_id()));
+  KUDU_CHECK_OK_PREPEND(tablet_peer_->tablet()->FlushDMSWithHighestRetention(
+                            max_idx_to_segment_size),
+                        Substitute("Failed to flush DMS on $0",
+                                   tablet_peer_->tablet()->tablet_id()));
   {
-    boost::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard<simple_spinlock> l(lock_);
     time_since_flush_.start();
   }
 }

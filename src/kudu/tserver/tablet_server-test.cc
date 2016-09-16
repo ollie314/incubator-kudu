@@ -16,6 +16,11 @@
 // under the License.
 #include "kudu/tserver/tablet_server-test-base.h"
 
+#include <memory>
+#include <sstream>
+
+#include <zlib.h>
+
 #include "kudu/consensus/log-test-base.h"
 #include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -23,9 +28,11 @@
 #include "kudu/server/hybrid_clock.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
+#include "kudu/tablet/tablet_bootstrap.h"
 #include "kudu/util/crc.h"
 #include "kudu/util/curl_util.h"
 #include "kudu/util/url-coding.h"
+#include "kudu/util/zlib.h"
 
 using kudu::consensus::RaftConfigPB;
 using kudu::consensus::RaftPeerPB;
@@ -38,6 +45,7 @@ using kudu::tablet::Tablet;
 using kudu::tablet::TabletPeer;
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using strings::Substitute;
 
 DEFINE_int32(single_threaded_insert_latency_bench_warmup_rows, 100,
@@ -65,8 +73,8 @@ class TabletServerTest : public TabletServerTestBase {
  public:
   // Starts the tablet server, override to start it later.
   virtual void SetUp() OVERRIDE {
-    TabletServerTestBase::SetUp();
-    StartTabletServer();
+    NO_FATALS(TabletServerTestBase::SetUp());
+    NO_FATALS(StartTabletServer());
   }
 
   void DoOrderedScanTest(const Schema& projection, const string& expected_rows_as_string);
@@ -164,7 +172,7 @@ TEST_F(TabletServerTest, TestWebPages) {
   ASSERT_OK(c.FetchURL(Substitute("http://$0/tablets", addr),
                               &buf));
   ASSERT_STR_CONTAINS(buf.ToString(), kTabletId);
-  ASSERT_STR_CONTAINS(buf.ToString(), "<td>range: [(&lt;start&gt;), (&lt;end&gt;))</td>");
+  ASSERT_STR_CONTAINS(buf.ToString(), "<td>range: [&lt;start&gt;, &lt;end&gt;)</td>");
 
   // Tablet page should include the schema.
   ASSERT_OK(c.FetchURL(Substitute("http://$0/tablet?id=$1", addr, kTabletId),
@@ -187,7 +195,7 @@ TEST_F(TabletServerTest, TestWebPages) {
     // Check that the tablet entry shows up.
     ASSERT_STR_CONTAINS(buf.ToString(), "\"type\": \"tablet\"");
     ASSERT_STR_CONTAINS(buf.ToString(), "\"id\": \"TestTablet\"");
-    ASSERT_STR_CONTAINS(buf.ToString(), "\"partition\": \"range: [(<start>), (<end>))\"");
+    ASSERT_STR_CONTAINS(buf.ToString(), "\"partition\": \"range: [<start>, <end>)\"");
 
 
     // Check entity attributes.
@@ -217,16 +225,29 @@ TEST_F(TabletServerTest, TestWebPages) {
   string req_b64;
   Base64Escape(enable_req_json, &req_b64);
 
-  ASSERT_OK(c.FetchURL(Substitute("http://$0/tracing/json/begin_recording?$1",
-                                         addr,
-                                         req_b64), &buf));
-  ASSERT_EQ(buf.ToString(), "");
-  ASSERT_OK(c.FetchURL(Substitute("http://$0/tracing/json/end_recording", addr),
-                       &buf));
-  ASSERT_STR_CONTAINS(buf.ToString(), "__metadata");
+  for (bool compressed : {false, true}) {
+    ASSERT_OK(c.FetchURL(Substitute("http://$0/tracing/json/begin_recording?$1",
+                                    addr,
+                                    req_b64), &buf));
+    ASSERT_EQ(buf.ToString(), "");
+    ASSERT_OK(c.FetchURL(Substitute("http://$0/tracing/json/end_recording$1", addr,
+                                    compressed ? "_compressed" : ""),
+                         &buf));
+    string json;
+    if (compressed) {
+      std::ostringstream ss;
+      ASSERT_OK(zlib::Uncompress(buf, &ss));
+      json = ss.str();
+    } else {
+      json = buf.ToString();
+    }
+
+    ASSERT_STR_CONTAINS(json, "__metadata");
+  }
+
   ASSERT_OK(c.FetchURL(Substitute("http://$0/tracing/json/categories", addr),
                        &buf));
-  ASSERT_STR_CONTAINS(buf.ToString(), "\"rpc\"");
+  ASSERT_STR_CONTAINS(buf.ToString(), "\"log\"");
 
   // Smoke test the pprof contention profiler handler.
   ASSERT_OK(c.FetchURL(Substitute("http://$0/pprof/contention?seconds=1", addr),
@@ -973,6 +994,10 @@ TEST_F(TabletServerTest, TestClientGetsErrorBackWhenRecoveryFailed) {
   ASSERT_OK(DCHECK_NOTNULL(proxy_.get())->Write(req, &resp, &controller));
   ASSERT_EQ(TabletServerErrorPB::TABLET_NOT_RUNNING, resp.error().code());
   ASSERT_STR_CONTAINS(resp.error().status().message(), "Tablet not RUNNING: FAILED");
+
+  // Check that the tablet peer's status message is updated with the failure.
+  ASSERT_STR_CONTAINS(tablet_peer_->last_status(),
+                      "Log file corruption detected");
 }
 
 TEST_F(TabletServerTest, TestScan) {
@@ -2022,21 +2047,21 @@ TEST_F(TabletServerTest, TestInsertLatencyMicroBenchmark) {
   uint64_t max_rows = AllowSlowTests() ?
       FLAGS_single_threaded_insert_latency_bench_insert_rows : 100;
 
-  MonoTime start = MonoTime::Now(MonoTime::FINE);
+  MonoTime start = MonoTime::Now();
 
   for (int i = warmup; i < warmup + max_rows; i++) {
-    MonoTime before = MonoTime::Now(MonoTime::FINE);
+    MonoTime before = MonoTime::Now();
     InsertTestRowsRemote(0, i, 1);
-    MonoTime after = MonoTime::Now(MonoTime::FINE);
-    MonoDelta delta = after.GetDeltaSince(before);
+    MonoTime after = MonoTime::Now();
+    MonoDelta delta = after - before;
     histogram->Increment(delta.ToMicroseconds());
   }
 
-  MonoTime end = MonoTime::Now(MonoTime::FINE);
-  double throughput = ((max_rows - warmup) * 1.0) / end.GetDeltaSince(start).ToSeconds();
+  MonoTime end = MonoTime::Now();
+  double throughput = ((max_rows - warmup) * 1.0) / (end - start).ToSeconds();
 
   // Generate the JSON.
-  std::stringstream out;
+  std::ostringstream out;
   JsonWriter writer(&out, JsonWriter::PRETTY);
   ASSERT_OK(histogram->WriteAsJson(&writer, MetricJsonOptions()));
 
@@ -2074,7 +2099,7 @@ TEST_F(TabletServerTest, TestWriteOutOfBounds) {
   ASSERT_OK(end_row.SetInt32("key", 20));
 
   vector<Partition> partitions;
-  ASSERT_OK(partition_schema.CreatePartitions({ start_row, end_row }, schema, &partitions));
+  ASSERT_OK(partition_schema.CreatePartitions({ start_row, end_row }, {}, schema, &partitions));
 
   ASSERT_EQ(3, partitions.size());
 
@@ -2165,6 +2190,8 @@ TEST_F(TabletServerTest, TestChecksumScan) {
   ASSERT_FALSE(resp.has_error()) << resp.error().DebugString();
   ASSERT_EQ(total_crc, resp.checksum());
   ASSERT_FALSE(resp.has_more_results());
+  EXPECT_TRUE(resp.has_resource_metrics());
+  EXPECT_EQ(1, resp.rows_checksummed());
 
   // Second row (null string field).
   key = 2;

@@ -29,7 +29,7 @@
 
 namespace kudu {
 
-class ExternalMiniCluster;
+class MiniClusterBase;
 class Thread;
 
 // Utility class for generating a workload against a test cluster.
@@ -41,7 +41,7 @@ class TestWorkload {
  public:
   static const char* const kDefaultTableName;
 
-  explicit TestWorkload(ExternalMiniCluster* cluster);
+  explicit TestWorkload(MiniClusterBase* cluster);
   ~TestWorkload();
 
   void set_payload_bytes(int n) {
@@ -78,6 +78,12 @@ class TestWorkload {
     not_found_allowed_ = allowed;
   }
 
+  // Whether per-row errors with Status::AlreadyPresent() are allowed.
+  // By default this triggers a check failure.
+  void set_already_present_allowed(bool allowed) {
+    already_present_allowed_ = allowed;
+  }
+
   void set_num_replicas(int r) {
     num_replicas_ = r;
   }
@@ -97,8 +103,32 @@ class TestWorkload {
     return table_name_;
   }
 
-  void set_pathological_one_row_enabled(bool enabled) {
-    pathological_one_row_enabled_ = enabled;
+  static const int kNumRowsForDuplicateKeyWorkload = 20;
+
+  enum WritePattern {
+    // The default: insert random row keys. This may cause an occasional
+    // duplicate, but with 32-bit keys, they won't be frequent.
+    INSERT_RANDOM_ROWS,
+
+    // All threads generate updates against a single row.
+    UPDATE_ONE_ROW,
+
+    // Insert rows in random order, but restricted to only
+    // kNumRowsForDuplicateKeyWorkload unique keys. This ensures that,
+    // after a very short initial warm-up period, all inserts fail with
+    // duplicate keys.
+    INSERT_WITH_MANY_DUP_KEYS,
+
+    // Insert sequential rows.
+    // This causes flushes but no compactions.
+    INSERT_SEQUENTIAL_ROWS
+  };
+
+  void set_write_pattern(WritePattern pattern) {
+    write_pattern_ = pattern;
+    // Since we're writing with dup keys we will get AlreadyPresent() errors on the response
+    // so allow it.
+    set_already_present_allowed(true);
   }
 
   // Sets up the internal client and creates the table which will be used for
@@ -129,7 +159,7 @@ class TestWorkload {
  private:
   void WriteThread();
 
-  ExternalMiniCluster* cluster_;
+  MiniClusterBase* cluster_;
   client::KuduClientBuilder client_builder_;
   client::sp::shared_ptr<client::KuduClient> client_;
 
@@ -139,7 +169,8 @@ class TestWorkload {
   int write_timeout_millis_;
   bool timeout_allowed_;
   bool not_found_allowed_;
-  bool pathological_one_row_enabled_;
+  bool already_present_allowed_;
+  WritePattern write_pattern_ = INSERT_RANDOM_ROWS;
 
   int num_replicas_;
   int num_tablets_;
@@ -149,6 +180,7 @@ class TestWorkload {
   AtomicBool should_run_;
   AtomicInt<int64_t> rows_inserted_;
   AtomicInt<int64_t> batches_completed_;
+  AtomicInt<int32_t> sequential_key_gen_;
 
   std::vector<scoped_refptr<Thread> > threads_;
 

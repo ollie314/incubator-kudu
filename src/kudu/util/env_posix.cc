@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -470,7 +471,8 @@ class PosixWritableFile : public WritableFile {
 
     if (PREDICT_FALSE(written != nbytes)) {
       return Status::IOError(
-          Substitute("pwritev error: expected to write $0 bytes, wrote $1 bytes instead",
+          Substitute("pwritev error: expected to write $0 bytes, wrote $1 bytes instead"
+                     " (perhaps the disk is out of space)",
                      nbytes, written));
     }
 #else
@@ -487,7 +489,8 @@ class PosixWritableFile : public WritableFile {
 
       if (PREDICT_FALSE(written != data.size())) {
         return Status::IOError(
-            Substitute("pwrite error: expected to write $0 bytes, wrote $1 bytes instead",
+            Substitute("pwrite error: expected to write $0 bytes, wrote $1 bytes instead"
+                       " (perhaps the disk is out of space)",
                        data.size(), written));
       }
     }
@@ -559,7 +562,8 @@ class PosixRWFile : public RWFile {
 
     if (PREDICT_FALSE(written != data.size())) {
       return Status::IOError(
-          Substitute("pwrite error: expected to write $0 bytes, wrote $1 bytes instead",
+          Substitute("pwrite error: expected to write $0 bytes, wrote $1 bytes instead"
+                     " (perhaps the disk is out of space)",
                      data.size(), written));
     }
 
@@ -897,6 +901,17 @@ class PosixEnv : public Env {
     return s;
   }
 
+  virtual Status GetFileSizeOnDiskRecursively(const string& root,
+                                              uint64_t* bytes_used) OVERRIDE {
+    TRACE_EVENT1("io", "PosixEnv::GetFileSizeOnDiskRecursively", "path", root);
+    uint64_t total = 0;
+    RETURN_NOT_OK(Walk(root, Env::PRE_ORDER,
+                       Bind(&PosixEnv::GetFileSizeOnDiskRecursivelyCb,
+                            Unretained(this), &total)));
+    *bytes_used = total;
+    return Status::OK();
+  }
+
   virtual Status GetBlockSize(const string& fname, uint64_t* block_size) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::GetBlockSize", "path", fname);
     ThreadRestrictions::AssertIOAllowed();
@@ -908,6 +923,29 @@ class PosixEnv : public Env {
       *block_size = sbuf.st_blksize;
     }
     return s;
+  }
+
+  // Local convenience function for safely running statvfs().
+  static Status StatVfs(const string& path, struct statvfs* buf) {
+    ThreadRestrictions::AssertIOAllowed();
+    int ret;
+    RETRY_ON_EINTR(ret, statvfs(path.c_str(), buf));
+    if (ret == -1) {
+      return IOError(Substitute("statvfs: $0", path), errno);
+    }
+    return Status::OK();
+  }
+
+  virtual Status GetBytesFree(const string& path, int64_t* bytes_free) OVERRIDE {
+    TRACE_EVENT1("io", "PosixEnv::GetBytesFree", "path", path);
+    struct statvfs buf;
+    RETURN_NOT_OK(StatVfs(path, &buf));
+    if (geteuid() == 0) {
+      *bytes_free = buf.f_frsize * buf.f_bfree;
+    } else {
+      *bytes_free = buf.f_frsize * buf.f_bavail;
+    }
+    return Status::OK();
   }
 
   virtual Status RenameFile(const std::string& src, const std::string& target) OVERRIDE {
@@ -997,7 +1035,7 @@ class PosixEnv : public Env {
 #if defined(__linux__)
       int rc = readlink("/proc/self/exe", buf.get(), size);
       if (rc == -1) {
-        return Status::IOError("Unable to determine own executable path", "", errno);
+        return IOError("Unable to determine own executable path", errno);
       } else if (rc >= size) {
         // The buffer wasn't large enough
         size *= 2;
@@ -1182,6 +1220,27 @@ class PosixEnv : public Env {
         LOG(FATAL) << "Unknown file type: " << type;
         return Status::OK();
     }
+  }
+
+  Status GetFileSizeOnDiskRecursivelyCb(uint64_t* bytes_used,
+                                        Env::FileType type,
+                                        const string& dirname,
+                                        const string& basename) {
+    uint64_t file_bytes_used = 0;
+    switch (type) {
+      case Env::FILE_TYPE:
+        RETURN_NOT_OK(GetFileSizeOnDisk(
+            JoinPathSegments(dirname, basename), &file_bytes_used));
+        *bytes_used += file_bytes_used;
+        break;
+      case Env::DIRECTORY_TYPE:
+        // Ignore directory space consumption as it varies from filesystem to
+        // filesystem.
+        break;
+      default:
+        LOG(FATAL) << "Unknown file type: " << type;
+    }
+    return Status::OK();
   }
 };
 

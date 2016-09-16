@@ -54,6 +54,7 @@ set(KRPC_SRCS
     reactor.cc
     remote_method.cc
     request_tracker.cc
+    result_tracker.cc
     rpc.cc
     rpc_context.cc
     rpc_controller.cc
@@ -85,6 +86,7 @@ ADD_EXPORTABLE_LIBRARY(krpc
 add_executable(protoc-gen-krpc protoc-gen-krpc.cc)
 target_link_libraries(protoc-gen-krpc
     ${KUDU_BASE_LIBS}
+    rpc_header_proto
     protoc
     protobuf
     gutil
@@ -111,7 +113,8 @@ target_link_libraries(rtest_krpc
   rtest_diff_package_proto)
 
 # Tests
-set(KUDU_TEST_LINK_LIBS rtest_krpc krpc ${KUDU_MIN_TEST_LIBS})
+set(KUDU_TEST_LINK_LIBS rtest_krpc krpc rpc_header_proto ${KUDU_MIN_TEST_LIBS})
+ADD_KUDU_TEST(exactly_once_rpc-test)
 ADD_KUDU_TEST(mt-rpc-test RUN_SERIAL true)
 ADD_KUDU_TEST(reactor-test)
 ADD_KUDU_TEST(request_tracker-test)

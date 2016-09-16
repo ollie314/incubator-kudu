@@ -112,6 +112,69 @@ class TestColumnPredicate : public KuduTest {
               ColumnPredicate::None(column),
               PredicateType::None);
 
+    // [---> AND
+    // [--->
+    // =
+    // [--->
+    TestMerge(ColumnPredicate::Range(column, &values[1], nullptr),
+              ColumnPredicate::Range(column, &values[1], nullptr),
+              ColumnPredicate::Range(column, &values[1], nullptr),
+              PredicateType::Range);
+
+    // [-----> AND
+    //   [--->
+    // =
+    //   [--->
+    TestMerge(ColumnPredicate::Range(column, &values[1], nullptr),
+              ColumnPredicate::Range(column, &values[2], nullptr),
+              ColumnPredicate::Range(column, &values[2], nullptr),
+              PredicateType::Range);
+
+    // <---) AND
+    // <---)
+    // =
+    // <---)
+    TestMerge(ColumnPredicate::Range(column, nullptr, &values[4]),
+              ColumnPredicate::Range(column, nullptr, &values[4]),
+              ColumnPredicate::Range(column, nullptr, &values[4]),
+              PredicateType::Range);
+
+    //   <---) AND
+    // <---)
+    // =
+    // <---)
+    TestMerge(ColumnPredicate::Range(column, nullptr, &values[6]),
+              ColumnPredicate::Range(column, nullptr, &values[4]),
+              ColumnPredicate::Range(column, nullptr, &values[4]),
+              PredicateType::Range);
+
+    // <---) AND
+    // [--->
+    // =
+    // [---)
+    TestMerge(ColumnPredicate::Range(column, nullptr, &values[4]),
+              ColumnPredicate::Range(column, &values[1], nullptr),
+              ColumnPredicate::Range(column, &values[1], &values[4]),
+              PredicateType::Range);
+
+    // <---)     AND
+    //     [--->
+    // =
+    // None
+    TestMerge(ColumnPredicate::Range(column, nullptr, &values[4]),
+              ColumnPredicate::Range(column, &values[4], nullptr),
+              ColumnPredicate::None(column),
+              PredicateType::None);
+
+    // <---)       AND
+    //       [--->
+    // =
+    // None
+    TestMerge(ColumnPredicate::Range(column, nullptr, &values[2]),
+              ColumnPredicate::Range(column, &values[4], nullptr),
+              ColumnPredicate::None(column),
+              PredicateType::None);
+
     // Range + Equality
 
     //   [---) AND
@@ -160,6 +223,60 @@ class TestColumnPredicate : public KuduTest {
               ColumnPredicate::None(column),
               PredicateType::None);
 
+    //   [---> AND
+    // |
+    // =
+    // None
+    TestMerge(ColumnPredicate::Range(column, &values[3], nullptr),
+              ColumnPredicate::Equality(column, &values[1]),
+              ColumnPredicate::None(column),
+              PredicateType::None);
+
+    // [---> AND
+    // |
+    // =
+    // |
+    TestMerge(ColumnPredicate::Range(column, &values[1], nullptr),
+              ColumnPredicate::Equality(column, &values[1]),
+              ColumnPredicate::Equality(column, &values[1]),
+              PredicateType::Equality);
+
+    // [-----> AND
+    //   |
+    // =
+    //   |
+    TestMerge(ColumnPredicate::Range(column, &values[0], nullptr),
+              ColumnPredicate::Equality(column, &values[2]),
+              ColumnPredicate::Equality(column, &values[2]),
+              PredicateType::Equality);
+
+    // <---) AND
+    //   |
+    // =
+    //   |
+    TestMerge(ColumnPredicate::Range(column, nullptr, &values[3]),
+              ColumnPredicate::Equality(column, &values[1]),
+              ColumnPredicate::Equality(column, &values[1]),
+              PredicateType::Equality);
+
+    // <---) AND
+    //     |
+    // =
+    // None
+    TestMerge(ColumnPredicate::Range(column, nullptr, &values[3]),
+              ColumnPredicate::Equality(column, &values[3]),
+              ColumnPredicate::None(column),
+              PredicateType::None);
+
+    // <---)    AND
+    //       |
+    // =
+    // None
+    TestMerge(ColumnPredicate::Range(column, nullptr, &values[1]),
+              ColumnPredicate::Equality(column, &values[3]),
+              ColumnPredicate::None(column),
+              PredicateType::None);
+
     // None
 
     // None AND
@@ -168,6 +285,24 @@ class TestColumnPredicate : public KuduTest {
     // None
     TestMerge(ColumnPredicate::None(column),
               ColumnPredicate::Range(column, &values[1], &values[5]),
+              ColumnPredicate::None(column),
+              PredicateType::None);
+
+    // None AND
+    // <----)
+    // =
+    // None
+    TestMerge(ColumnPredicate::None(column),
+              ColumnPredicate::Range(column, nullptr, &values[5]),
+              ColumnPredicate::None(column),
+              PredicateType::None);
+
+    // None AND
+    // [---->
+    // =
+    // None
+    TestMerge(ColumnPredicate::None(column),
+              ColumnPredicate::Range(column, &values[1], nullptr),
               ColumnPredicate::None(column),
               PredicateType::None);
 
@@ -225,6 +360,24 @@ class TestColumnPredicate : public KuduTest {
     TestMerge(ColumnPredicate::IsNotNull(column),
               ColumnPredicate::Range(column, &values[0], &values[2]),
               ColumnPredicate::Range(column, &values[0], &values[2]),
+              PredicateType::Range);
+
+    // IS NOT NULL AND
+    // <------)
+    // =
+    // <------)
+    TestMerge(ColumnPredicate::IsNotNull(column),
+              ColumnPredicate::Range(column, nullptr, &values[2]),
+              ColumnPredicate::Range(column, nullptr, &values[2]),
+              PredicateType::Range);
+
+    // IS NOT NULL AND
+    // [------>
+    // =
+    // [------>
+    TestMerge(ColumnPredicate::IsNotNull(column),
+              ColumnPredicate::Range(column, &values[2], nullptr),
+              ColumnPredicate::Range(column, &values[2], nullptr),
               PredicateType::Range);
   }
 };
@@ -296,11 +449,11 @@ TEST_F(TestColumnPredicate, TestInclusiveRange) {
     int32_t max = INT32_MAX;
 
     ASSERT_EQ(ColumnPredicate::Range(column, &zero, &three),
-              ColumnPredicate::InclusiveRange(column, &zero, &two, &arena));
+              *ColumnPredicate::InclusiveRange(column, &zero, &two, &arena));
     ASSERT_EQ(ColumnPredicate::Range(column, &zero, nullptr),
-              ColumnPredicate::InclusiveRange(column, &zero, &max, &arena));
+              *ColumnPredicate::InclusiveRange(column, &zero, &max, &arena));
 
-    ASSERT_EQ(boost::none, ColumnPredicate::InclusiveRange(column, nullptr, &max, &arena));
+    ASSERT_FALSE(ColumnPredicate::InclusiveRange(column, nullptr, &max, &arena));
   }
   {
     ColumnSchema column("c", INT32, true);
@@ -310,12 +463,12 @@ TEST_F(TestColumnPredicate, TestInclusiveRange) {
     int32_t max = INT32_MAX;
 
     ASSERT_EQ(ColumnPredicate::Range(column, &zero, &three),
-              ColumnPredicate::InclusiveRange(column, &zero, &two, &arena));
+              *ColumnPredicate::InclusiveRange(column, &zero, &two, &arena));
     ASSERT_EQ(ColumnPredicate::Range(column, &zero, nullptr),
-              ColumnPredicate::InclusiveRange(column, &zero, &max, &arena));
+              *ColumnPredicate::InclusiveRange(column, &zero, &max, &arena));
 
     ASSERT_EQ(ColumnPredicate::IsNotNull(column),
-              ColumnPredicate::InclusiveRange(column, nullptr, &max, &arena));
+              *ColumnPredicate::InclusiveRange(column, nullptr, &max, &arena));
   }
   {
     ColumnSchema column("c", STRING);
@@ -324,8 +477,87 @@ TEST_F(TestColumnPredicate, TestInclusiveRange) {
     Slice three("\0\0\0", 3);
 
     ASSERT_EQ(ColumnPredicate::Range(column, &zero, &three),
-              ColumnPredicate::InclusiveRange(column, &zero, &two, &arena));
+              *ColumnPredicate::InclusiveRange(column, &zero, &two, &arena));
   }
+}
+
+// Test that the exclusive range constructor handles transforming to inclusive
+// lower bound correctly.
+TEST_F(TestColumnPredicate, TestExclusive) {
+  Arena arena(1024, 1024 * 1024);
+  {
+    ColumnSchema column("c", INT32);
+    int32_t zero = 0;
+    int32_t one = 1;
+    int32_t three = 3;
+    int32_t max = INT32_MAX;
+
+    ASSERT_EQ(ColumnPredicate::Range(column, &one, &three),
+              ColumnPredicate::ExclusiveRange(column, &zero, &three, &arena));
+
+    ASSERT_EQ(ColumnPredicate::Range(column, &one, &max),
+              ColumnPredicate::ExclusiveRange(column, &zero, &max, &arena));
+
+    ASSERT_EQ(PredicateType::None,
+              ColumnPredicate::ExclusiveRange(column, &max, nullptr, &arena).predicate_type());
+
+    ASSERT_EQ(PredicateType::None,
+              ColumnPredicate::ExclusiveRange(column, &zero, &one, &arena).predicate_type());
+
+    ASSERT_EQ(PredicateType::None,
+              ColumnPredicate::ExclusiveRange(column, &zero, &zero, &arena).predicate_type());
+  }
+  {
+    ColumnSchema column("c", STRING);
+    Slice zero("", 0);
+    Slice one("\0", 1);
+    Slice two("\0\0", 2);
+
+    ASSERT_EQ(ColumnPredicate::Range(column, &one, &two),
+              ColumnPredicate::ExclusiveRange(column, &zero, &two, &arena));
+  }
+}
+
+// Test that column predicate comparison works correctly: ordered by predicate
+// type first, then size of the column type.
+TEST_F(TestColumnPredicate, TestSelectivity) {
+  int32_t one_32 = 1;
+  int64_t one_64 = 1;
+  double_t one_d = 1.0;
+  Slice one_s("one", 3);
+
+  ColumnSchema column_i32("a", INT32, true);
+  ColumnSchema column_i64("b", INT64, true);
+  ColumnSchema column_d("c", DOUBLE, true);
+  ColumnSchema column_s("d", STRING, true);
+
+  // Predicate type
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_i32, &one_32),
+                                  ColumnPredicate::Range(column_d, &one_d, nullptr)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_i32, &one_32),
+                                  ColumnPredicate::IsNotNull(column_s)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Range(column_i64, &one_64, nullptr),
+                                  ColumnPredicate::IsNotNull(column_i32)),
+            0);
+
+  // Size of column type
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_i32, &one_32),
+                                  ColumnPredicate::Equality(column_i64, &one_64)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_i32, &one_32),
+                                  ColumnPredicate::Equality(column_d, &one_d)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_i32, &one_32),
+                                  ColumnPredicate::Equality(column_s, &one_s)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_i64, &one_64),
+                                  ColumnPredicate::Equality(column_s, &one_s)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_d, &one_d),
+                                  ColumnPredicate::Equality(column_s, &one_s)),
+            0);
 }
 
 } // namespace kudu

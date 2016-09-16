@@ -25,6 +25,8 @@ made.
 | [CFile format](cfile.md) | Tablet | N/A |
 | [Codegen API and impl. details](codegen.md) | Server | N/A |
 | [Consensus design](consensus.md) | Consensus | N/A |
+| [Raft config change design](raft-config-change.md) | Consensus | N/A |
+| [Tablet Copy design](raft-tablet-copy.md) | Consensus | N/A |
 | [Master design](master.md) | Master | N/A |
 | [RPC design and impl. details](rpc.md) | RPC | N/A |
 | [Tablet design, impl. details and comparison to other systems](tablet.md) | Tablet | N/A |
@@ -36,3 +38,5 @@ made.
 | [(old) Heartbeating between tservers and multiple masters](old-multi-master-heartbeating.md) | Master | [gerrit](http://gerrit.cloudera.org:8080/2495) |
 | [Scan Token API](scan-tokens.md) | Client | [gerrit](http://gerrit.cloudera.org:8080/2443) |
 | [Full multi-master support for Kudu 1.0](multi-master-1.0.md) | Master, Client | [gerrit](http://gerrit.cloudera.org:8080/2527) |
+| [Non-covering Range Partitions](non-covering-range-partitions.md) | Master, Client | [gerrit](http://gerrit.cloudera.org:8080/2772) |
+| [Permanent failure handling of masters for Kudu 1.0](master-perm-failure-1.0.md) | Master | |

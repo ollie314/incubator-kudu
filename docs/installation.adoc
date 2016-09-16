@@ -16,7 +16,7 @@
 // under the License.
 
 [[installation]]
-= Installing Apache Kudu (incubating)
+= Installing Apache Kudu
 
 :author: Kudu Team
 :imagesdir: ./images
@@ -40,13 +40,14 @@ To upgrade Kudu from a previous version, see <<upgrade>>.
 
 == Prerequisites and Requirements
 .Hardware
-- A host to run the Kudu master.
+- One or more hosts to run Kudu masters. It is recommended to have either one master
+(no fault tolerance), three masters (can tolerate one failure), or five masters (two failures).
 - One or more hosts to run Kudu tablet servers. When using replication, a minimum of
 three tablet servers is necessary.
 
 .Operating System Requirements
 Linux::
-    - RHEL 6, RHEL 7, Ubuntu 14.04 (Trusty), or SLES 12.
+    - RHEL 6, RHEL 7, CentOS 6, CentOS 7, Ubuntu 14.04 (Trusty), Ubuntu 16.04 (Xenial), Debian 8 (Jessie), or SLES 12.
     - A kernel and fileystem that support _hole punching_. Hole punching is the use of the
       `fallocate(2)` system call with the `FALLOC_FL_PUNCH_HOLE` option set. See
       link:troubleshooting.html#req_hole_punching[troubleshooting hole punching] for more
@@ -76,18 +77,21 @@ You can install Kudu using packages managed by the operating system.
 [cols=">s,<,<",options="header"]
 |===
 | OS  | Repository  | Individual Packages
-| RHEL | link:http://archive.cloudera.com/beta/kudu/redhat/6/x86_64/kudu/cloudera-kudu.repo[RHEL 6],
-         link:http://archive.cloudera.com/beta/kudu/redhat/7/x86_64/kudu/cloudera-kudu.repo[RHEL 7] |
-         link:http://archive.cloudera.com/beta/kudu/redhat/6/x86_64/kudu/0.8.0/RPMS/x86_64/[RHEL 6],
-         link:http://archive.cloudera.com/beta/kudu/redhat/7/x86_64/kudu/0.8.0/RPMS/x86_64/[RHEL 7]
-| Ubuntu | link:http://archive.cloudera.com/beta/kudu/ubuntu/trusty/amd64/kudu/cloudera.list[Trusty] |  http://archive.cloudera.com/beta/kudu/ubuntu/trusty/amd64/kudu/pool/contrib/k/kudu/[Trusty]
+| RHEL or CentOS | link:http://archive.cloudera.com/beta/kudu/redhat/6/x86_64/kudu/cloudera-kudu.repo[RHEL 6 or CentOS 6],
+                   link:http://archive.cloudera.com/beta/kudu/redhat/7/x86_64/kudu/cloudera-kudu.repo[RHEL 7 or CentOS 7] |
+                   link:http://archive.cloudera.com/beta/kudu/redhat/6/x86_64/kudu/0/RPMS/x86_64/[RHEL 6 or CentOS 6],
+                   link:http://archive.cloudera.com/beta/kudu/redhat/7/x86_64/kudu/0/RPMS/x86_64/[RHEL 7 or CentOS 7]
+| SLES | link:http://archive.cloudera.com/beta/kudu/sles/12/x86_64/kudu/cloudera-kudu.repo[SLES 12] |
+         link:http://archive.cloudera.com/beta/kudu/sles/12/x86_64/kudu/0/RPMS/x86_64/[SLES 12]
+| Ubuntu | link:http://archive.cloudera.com/beta/kudu/ubuntu/trusty/amd64/kudu/cloudera.list[Trusty],
+           link:http://archive.cloudera.com/beta/kudu/ubuntu/xenial/amd64/kudu/cloudera.list[Xenial] |
+           link:http://archive.cloudera.com/beta/kudu/ubuntu/trusty/amd64/kudu/pool/contrib/k/kudu/[Trusty],
+           link:http://archive.cloudera.com/beta/kudu/ubuntu/xenial/amd64/kudu/pool/contrib/k/kudu/[Xenial]
+| Debian | link:http://archive.cloudera.com/beta/kudu/debian/jessie/amd64/kudu/cloudera.list[Jessie] |
+           link:http://archive.cloudera.com/beta/kudu/debian/jessie/amd64/kudu/pool/contrib/k/kudu/[Jessie]
 |===
 
-NOTE: For later versions of Ubuntu, the Ubuntu Trusty packages are reported to install, though they have not been extensively tested.
-
-NOTE: packages are not yet provided for SLES.
-
-=== Install On RHEL Hosts
+=== Install on RHEL or CentOS Hosts
 
 . Download and configure the Kudu repositories for your operating system, or manually
 download individual RPMs, using the appropriate link from <<kudu_package_locations>>.
@@ -104,11 +108,40 @@ sudo yum install kudu-client-devel            # Kudu C++ client SDK
 ----
 
 . To manually install the Kudu RPMs, first download them, then use the command
-`sudo rpm -ivh <RPM to install>` and install the
-`kudu-master` and `kudu-tserver` packages on the appropriate hosts. These packages
-provide the operating system commands to start and stop Kudu.
+`sudo rpm -ivh <RPM to install>` to install them.
 
-=== Install On Ubuntu or Debian Hosts
+. Note: the `kudu-master` and `kudu-tserver` packages are only necessary on hosts
+where there is a master or tserver respectively (and completely unnecessary if
+using Cloudera Manager). Each provides configuration files and an init.d script to
+manage the corresponding Kudu process. Once installed, the Kudu process is started
+and stopped automatically when the host starts up and shuts down.
+
+=== Install on SLES Hosts
+
+. Download and configure the Kudu repositories for your operating system, or manually
+download individual RPMs, using the appropriate link from <<kudu_package_locations>>.
+
+. If using a Zypper repository, use the following commands to install Kudu packages on
+each host, after saving the `cloudera-kudu.repo` file to `/etc/zypp/repos.d`.
++
+----
+sudo zypper install kudu                      # Base Kudu files
+sudo zypper install kudu-master               # Kudu master init.d service script and default configuration
+sudo zypper install kudu-tserver              # Kudu tablet server init.d service script and default configuration
+sudo zypper install kudu-client0              # Kudu C++ client shared library
+sudo zypper install kudu-client-devel         # Kudu C++ client SDK
+----
+
+. To manually install the Kudu RPMs, first download them, then use the command
+`sudo rpm -ivh <RPM to install>` to install them.
+
+. Note: the `kudu-master` and `kudu-tserver` packages are only necessary on hosts
+where there is a master or tserver respectively (and completely unnecessary if
+using Cloudera Manager). Each provides configuration files and an init.d script to
+manage the corresponding Kudu process. Once installed, the Kudu process is started
+and stopped automatically when the host starts up and shuts down.
+
+=== Install on Ubuntu or Debian Hosts
 
 . If using an Ubuntu or Debian repository, use the following commands to install Kudu
 packages on each host after saving the `cloudera.list` file to `/etc/apt/sources.list.d/`.
@@ -121,8 +154,14 @@ sudo apt-get install libkuduclient0           # Kudu C++ client shared library
 sudo apt-get install libkuduclient-dev        # Kudu C++ client SDK
 ----
 
-. To manually install individual DEBs, first download them, then use the command
-`sudo dpkg -i <DEB to install>` to install them.
+. To manually install the Kudu RPMs, first download them, then use the command
+`sudo rpm -ivh <RPM to install>` to install them.
+
+. Note: the `kudu-master` and `kudu-tserver` packages are only necessary on hosts
+where there is a master or tserver respectively (and completely unnecessary if
+using Cloudera Manager). Each provides configuration files and an init.d script to
+manage the corresponding Kudu process. Once installed, the Kudu process is started
+and stopped automatically when the host starts up and shuts down.
 
 === Verify the Installation
 
@@ -141,7 +180,7 @@ sudo apt-get install libkuduclient-dev        # Kudu C++ client SDK
     link:troubleshooting.html#ntp[problem with ntp].
   - If it's something else that doesn't seem obvious or if you've tried the above solutions without
     luck, you can ask for help on the
-    link:https://groups.google.com/forum/#!forum/kudu-user[user mailing list].
+    link:http://kudu.apache.org/community.html[user mailing list].
 
 // end::verify_install[]
 
@@ -184,8 +223,8 @@ them to the default runlevel.
 +
 [source,bash]
 ----
-$ sudo chkconfig kudu-master on                # RHEL / CentOS
-$ sudo chkconfig kudu-tserver on               # RHEL / CentOS
+$ sudo chkconfig kudu-master on                # RHEL / CentOS / SLES
+$ sudo chkconfig kudu-tserver on               # RHEL / CentOS / SLES
 
 $ sudo update-rc.d kudu-master defaults        # Debian / Ubuntu
 $ sudo update-rc.d kudu-tserver defaults       # Debian / Ubuntu
@@ -214,9 +253,8 @@ on a version older than 7.0, the Red Hat Developer Toolset must be installed
 . Install the prerequisite libraries, if they are not installed.
 +
 ----
-$ sudo yum install gcc gcc-c++ autoconf automake libtool \
-  boost-static boost-devel cyrus-sasl-devel \
-  cyrus-sasl-plain patch pkgconfig make rsync vim-common gdb git
+$ sudo yum install gcc gcc-c++ autoconf automake libtool cyrus-sasl-devel \
+  cyrus-sasl-plain patch pkgconfig make rsync vim-common gdb unzip redhat-lsb-core git
 ----
 
 . If building on RHEL or CentOS older than 7.0, install the Red Hat Developer
@@ -240,7 +278,7 @@ $ sudo yum install gem ruby-devel zlib-devel
 +
 [source,bash]
 ----
-$ git clone https://github.com/apache/incubator-kudu kudu
+$ git clone https://github.com/apache/kudu
 $ cd kudu
 ----
 
@@ -294,9 +332,8 @@ automated deployment scenario. It skips the steps marked *Optional* above.
 ----
 #!/bin/bash
 
-sudo yum -y install gcc gcc-c++ autoconf automake libtool \
-  boost-static boost-devel cyrus-sasl-devel \
-  cyrus-sasl-plain patch pkgconfig make rsync vim-common gdb git
+sudo yum -y install gcc gcc-c++ autoconf automake libtool cyrus-sasl-devel \
+  cyrus-sasl-plain patch pkgconfig make rsync vim-common gdb unzip redhat-lsb-core git
 DTLS_RPM=rhscl-devtoolset-3-epel-6-x86_64.noarch.rpm
 DTLS_RPM_URL=https://www.softwarecollections.org/en/scls/rhscl/devtoolset-3/epel-6-x86_64/download/${DTLS_RPM}
 wget ${DTLS_RPM_URL} -O ${DTLS_RPM}
@@ -320,9 +357,9 @@ make -j4
 . Install the prerequisite libraries, if they are not installed.
 +
 ----
-$ sudo apt-get install git autoconf automake libboost-thread-dev \
-  libboost-system-dev curl gcc g++ libsasl2-dev libsasl2-modules \
-  libtool ntp patch pkg-config make rsync unzip vim-common gdb python
+$ sudo apt-get install git autoconf automake \
+  curl gcc g++ libsasl2-dev libsasl2-modules \
+  libtool ntp patch pkg-config make rsync unzip vim-common gdb python lsb-release
 ----
 
 . Optional: Install additional packages to build the documentation
@@ -335,7 +372,7 @@ $ sudo apt-get install xsltproc zlib1g-dev
 +
 [source,bash]
 ----
-$ git clone https://github.com/apache/incubator-kudu kudu
+$ git clone https://github.com/apache/kudu
 $ cd kudu
 ----
 
@@ -384,10 +421,10 @@ the steps marked *Optional* above.
 ----
 #!/bin/bash
 
-sudo apt-get -y install git autoconf automake libboost-thread-dev \
-  libboost-system-dev curl gcc g++ libsasl2-dev libsasl2-modules \
-  libtool ntp patch pkg-config make rsync unzip vim-common gdb python
-git clone https://github.com/apache/incubator-kudu kudu
+sudo apt-get -y install git autoconf automake \
+  curl gcc g++ libsasl2-dev libsasl2-modules \
+  libtool ntp patch pkg-config make rsync unzip vim-common gdb python lsb-release
+git clone https://github.com/apache/kudu
 cd kudu
 thirdparty/build-if-necessary.sh
 mkdir -p build/release
@@ -401,35 +438,19 @@ make -j4
 
 [[sles_from_source]]
 === SUSE Linux Enterprise Server
-Building Kudu on SLES requires building Boost from source, since SLES does not
-have system packages containing Boost static libraries. Boost may be built
-anywhere, provided that the `BOOST_ROOT` environment variable is set to the
-location while invoking CMake to build Kudu. In the instructions below, Boost is
-built alongside Kudu.
 
 . Install the prerequisite libraries, if they are not installed.
 +
 ----
 $ sudo zypper install autoconf automake curl cyrus-sasl-devel gcc gcc-c++ \
-  gdb git libtool make ntp patch pkg-config python rsync unzip vim
-----
-
-. Install Boost.
-+
-----
-wget https://downloads.sourceforge.net/project/boost/boost/1.59.0/boost_1_59_0.tar.gz
-tar xzf boost_1_59_0.tar.gz
-pushd boost_1_59_0
-./bootstrap.sh
-./b2 --with-system --with-thread
-popd
+  gdb git libtool make ntp patch pkg-config python rsync unzip vim lsb-release
 ----
 
 . Clone the Git repository and change to the new `kudu` directory.
 +
 [source,bash]
 ----
-$ git clone https://github.com/apache/incubator-kudu kudu
+$ git clone https://github.com/apache/kudu
 $ cd kudu
 ----
 
@@ -448,8 +469,7 @@ except for the `kudu` directory itself.
 ----
 mkdir -p build/release
 cd build/release
-BOOST_ROOT=../../../boost_1_59_0 \
-  ../../thirdparty/installed/bin/cmake \
+../../thirdparty/installed/bin/cmake \
   -DCMAKE_BUILD_TYPE=release \
   ../..
 make -j4
@@ -475,20 +495,13 @@ the steps marked *Optional* above.
 #!/bin/bash
 
 sudo zypper install autoconf automake curl cyrus-sasl-devel gcc gcc-c++ \
-  gdb git libtool make ntp patch pkg-config python rsync unzip vim
-wget https://downloads.sourceforge.net/project/boost/boost/1.59.0/boost_1_59_0.tar.gz
-tar xzf boost_1_59_0.tar.gz
-pushd boost_1_59_0
-./bootstrap.sh
-./b2 --with-system --with-thread
-popd
-git clone https://github.com/apache/incubator-kudu kudu
+  gdb git libtool make ntp patch pkg-config python rsync unzip vim lsb-release
+git clone https://github.com/apache/kudu
 cd kudu
 thirdparty/build-if-necessary.sh
 mkdir -p build/release
 cd build/release
-BOOST_ROOT=../../../boost_1_59_0 \
-  ../../thirdparty/installed/bin/cmake \
+../../thirdparty/installed/bin/cmake \
   -DCMAKE_BUILD_TYPE=release \
   ../..
 make -j4
@@ -497,10 +510,9 @@ make -j4
 
 [[osx_from_source]]
 === OS X
-The Xcode toolchain is necessary for compiling Kudu. Use `xcode-select --install`
-to install the Xcode Command Line Tools if Xcode is not already installed. These
-instructions use link:http://brew.sh/[Homebrew] to install dependencies, but
-manual dependency installation is possible.
+The link:https://developer.apple.com/xcode/[Xcode] package is necessary for
+compiling Kudu. Some of the instructions below use link:http://brew.sh/[Homebrew]
+to install dependencies, but manual dependency installation is possible.
 
 [WARNING]
 .OS X Known Issues
@@ -513,14 +525,14 @@ for more information.
 . Install the prerequisite libraries, if they are not installed.
 +
 ----
-$ brew install autoconf automake cmake libtool pkg-config boost pstree
+$ brew install autoconf automake cmake libtool pkg-config pstree
 ----
 
 . Clone the Git repository and change to the new `kudu` directory.
 +
 [source,bash]
 ----
-$ git clone https://github.com/apache/incubator-kudu kudu
+$ git clone https://github.com/apache/kudu
 $ cd kudu
 ----
 
@@ -528,6 +540,24 @@ $ cd kudu
 +
 [source,bash]
 ----
+$ thirdparty/build-if-necessary.sh
+----
+  - If different versions of the dependencies are installed and used when calling
+`thirdparty/build-if-necessary.sh`, you may get stuck with output similar to the
+following:
++
+----
+./configure: line 16299: error near unexpected token `newline'
+./configure: line 16299: `  PKG_CHECK_MODULES('
+----
++
+The thirdparty builds may be cached and may reflect the incorrect versions of the
+dependencies. Ensure that you have the correct dependencies listed in Step 1, clean
+the workspace, and then try to re-build.
++
+[source,bash]
+----
+$ git clean -fdx
 $ thirdparty/build-if-necessary.sh
 ----
 
@@ -551,8 +581,8 @@ are installed.
 ----
 #!/bin/bash
 
-brew install autoconf automake cmake libtool pkg-config boost pstree
-git clone https://github.com/apache/incubator-kudu kudu
+brew install autoconf automake cmake libtool pkg-config pstree
+git clone https://github.com/apache/kudu
 cd kudu
 thirdparty/build-if-necessary.sh
 mkdir -p build/release
@@ -623,38 +653,22 @@ in `java/kudu-client/target/apidocs/index.html`.
 // end::view_api[]
 
 [[upgrade]]
-== Upgrade from 0.7.1 to 0.8.0
+== Upgrade from a Previous Version of Kudu
 
-Before upgrading, see <<client_compatibility>> and <<api_compatibility>>.
-To upgrade from Kudu 0.7.1 to 0.8.0, perform the following high-level steps, which
-are detailed in <<upgrade_procedure>>:
+Before upgrading, you should read the link:release_notes.html[Release Notes] for
+the version of Kudu that you are about to install. Pay close attention to the
+incompatibilities, upgrade, and downgrade notes that are documented there.
 
-. Shut down all Kudu services.
-. Install the new Kudu packages or parcels, or install Kudu 0.8.0 from source.
-. Restart all Kudu services.
+Additionally, during the beta period:
 
-It is technically possible to upgrade Kudu using rolling restarts, but it has not
-been tested and is not recommended.
+- Upgrades are only supported when going from the previous latest version to
+  the newest released version.
 
-NOTE: For the duration of the Kudu Beta, upgrade instructions are only given for going
-from the previous latest version to the newest.
-
-[[client_compatibility]]
-=== Client compatibility
-
-Masters and tablet servers should be upgraded before clients are upgraded. For specific
-information about client compatibility, see the
-link:release_notes.html#rn_0.8.0_incompatible_changes[Incompatible Changes] section
-of the release notes.
-
-[[api_compatibility]]
-
-=== API Compatibility
-
-The Kudu 0.8.0 client API is compatible with Kudu 0.7.1.
+- Rolling upgrades are not supported. Please shut down all Kudu services before
+  upgrading the software.
 
 [[upgrade_procedure]]
-=== Upgrade procedure
+=== Upgrade Procedure
 
 . Stop the Kudu master and tablet server services:
 +
@@ -671,6 +685,13 @@ $ sudo service kudu-tserver stop
 ----
 sudo yum clean all
 sudo yum upgrade kudu
+----
+ - On SLES hosts:
++
+[source,bash]
+----
+sudo zypper clean --all
+sudo zypper update kudu
 ----
  - On Ubuntu or Debian hosts:
 +

@@ -34,6 +34,7 @@
 #include "kudu/rpc/messenger.h"
 #include "kudu/server/server_base.proxy.h"
 #include "kudu/tablet/tablet_peer.h"
+#include "kudu/tserver/heartbeater.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/tserver_admin.proxy.h"
@@ -76,7 +77,6 @@ class TsTabletManagerITest : public KuduTest {
       : schema_(SimpleIntKeyKuduSchema()) {
   }
   virtual void SetUp() OVERRIDE;
-  virtual void TearDown() OVERRIDE;
 
  protected:
   const KuduSchema schema_;
@@ -99,11 +99,6 @@ void TsTabletManagerITest::SetUp() {
   ASSERT_OK(cluster_->CreateClient(nullptr, &client_));
 }
 
-void TsTabletManagerITest::TearDown() {
-  cluster_->Shutdown();
-  KuduTest::TearDown();
-}
-
 // Test that when the leader changes, the tablet manager gets notified and
 // includes that information in the next tablet report.
 TEST_F(TsTabletManagerITest, TestReportNewLeaderOnLeaderChange) {
@@ -120,6 +115,7 @@ TEST_F(TsTabletManagerITest, TestReportNewLeaderOnLeaderChange) {
   gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
   ASSERT_OK(table_creator->table_name(kTableName)
             .schema(&schema_)
+            .set_range_partition_columns({ "key" })
             .num_replicas(kNumReplicas)
             .Create());
   ASSERT_OK(client_->OpenTable(kTableName, &table));
@@ -165,16 +161,18 @@ TEST_F(TsTabletManagerITest, TestReportNewLeaderOnLeaderChange) {
     for (int replica = 0; replica < kNumReplicas; replica++) {
       // The MarkDirty() callback is on an async thread so it might take the
       // follower a few milliseconds to execute it. Wait for that to happen.
-      TSTabletManager* tablet_manager =
-          cluster_->mini_tablet_server(replica)->server()->tablet_manager();
+      Heartbeater* heartbeater =
+          cluster_->mini_tablet_server(replica)->server()->heartbeater();
+      vector<TabletReportPB> reports;
       for (int retry = 0; retry <= 12; retry++) {
-        if (tablet_manager->GetNumDirtyTabletsForTests() > 0) break;
+        reports = heartbeater->GenerateIncrementalTabletReportsForTests();
+        ASSERT_EQ(1, reports.size());
+        if (!reports[0].updated_tablets().empty()) break;
         SleepFor(MonoDelta::FromMilliseconds(1 << retry));
       }
 
       // Ensure that our tablet reports are consistent.
-      TabletReportPB report;
-      tablet_manager->GenerateIncrementalTabletReport(&report);
+      TabletReportPB& report = reports[0];
       ASSERT_EQ(1, report.updated_tablets_size()) << "Wrong report size:\n" << report.DebugString();
       ReportedTabletPB reported_tablet = report.updated_tablets(0);
       ASSERT_TRUE(reported_tablet.has_committed_consensus_state());

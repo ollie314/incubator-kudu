@@ -40,17 +40,17 @@
 #include "kudu/rpc/messenger.h"
 #include "kudu/server/server_base.proxy.h"
 #include "kudu/tablet/local_tablet_writer.h"
-#include "kudu/tablet/maintenance_manager.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_peer.h"
 #include "kudu/tserver/mini_tablet_server.h"
-#include "kudu/tserver/remote_bootstrap.proxy.h"
+#include "kudu/tserver/tablet_copy.proxy.h"
 #include "kudu/tserver/scanners.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/tablet_server_test_util.h"
 #include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/tserver/ts_tablet_manager.h"
+#include "kudu/util/maintenance_manager.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/test_graph.h"
 #include "kudu/util/test_util.h"
@@ -109,14 +109,14 @@ class TabletServerTestBase : public KuduTest {
     mini_server_.reset(new MiniTabletServer(GetTestPath("TabletServerTest-fsroot"), 0));
     mini_server_->options()->master_addresses.clear();
     mini_server_->options()->master_addresses.push_back(HostPort("255.255.255.255", 1));
-    CHECK_OK(mini_server_->Start());
+    ASSERT_OK(mini_server_->Start());
 
     // Set up a tablet inside the server.
-    CHECK_OK(mini_server_->AddTestTablet(kTableId, kTabletId, schema_));
-    CHECK(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet_peer_));
+    ASSERT_OK(mini_server_->AddTestTablet(kTableId, kTabletId, schema_));
+    ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet_peer_));
 
     // Creating a tablet is async, we wait here instead of having to handle errors later.
-    CHECK_OK(WaitForTabletRunning(kTabletId));
+    ASSERT_OK(WaitForTabletRunning(kTabletId));
 
     // Connect to it.
     ResetClientProxies();
@@ -125,7 +125,9 @@ class TabletServerTestBase : public KuduTest {
   Status WaitForTabletRunning(const char *tablet_id) {
     scoped_refptr<tablet::TabletPeer> tablet_peer;
     RETURN_NOT_OK(mini_server_->server()->tablet_manager()->GetTabletPeer(tablet_id, &tablet_peer));
-    return tablet_peer->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10));
+    RETURN_NOT_OK(tablet_peer->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10)));
+    RETURN_NOT_OK(tablet_peer->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10)));
+    return Status::OK();
   }
 
   void UpdateTestRowRemote(int tid,
@@ -350,18 +352,23 @@ class TabletServerTestBase : public KuduTest {
     mini_server_->options()->master_addresses.push_back(HostPort("255.255.255.255", 1));
     // this should open the tablet created on StartTabletServer()
     RETURN_NOT_OK(mini_server_->Start());
-    RETURN_NOT_OK(mini_server_->WaitStarted());
 
-    if (!mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet_peer_)) {
+    // Don't RETURN_NOT_OK immediately -- even if we fail, we may still get a TabletPeer object
+    // which has information about the failure.
+    Status wait_status = mini_server_->WaitStarted();
+    bool found_peer = mini_server_->server()->tablet_manager()->LookupTablet(
+        kTabletId, &tablet_peer_);
+    RETURN_NOT_OK(wait_status);
+    if (!found_peer) {
       return Status::NotFound("Tablet was not found");
     }
+
     // Connect to it.
     ResetClientProxies();
 
     // Opening a tablet is async, we wait here instead of having to handle errors later.
     RETURN_NOT_OK(WaitForTabletRunning(kTabletId));
     return Status::OK();
-
   }
 
   // Verifies that a set of expected rows (key, value) is present in the tablet.

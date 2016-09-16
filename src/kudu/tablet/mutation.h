@@ -51,7 +51,18 @@ class Mutation {
   }
 
   Timestamp timestamp() const { return timestamp_; }
+
+  Mutation *next() { return next_; }
   const Mutation *next() const { return next_; }
+
+  // Same as 'next()' but loads with 'Acquire' ordering semantics.
+  // This must be used when traversing the mutation list associated with
+  // an in-memory store.
+  const Mutation* acquire_next() const {
+    return reinterpret_cast<const Mutation*>(base::subtle::Acquire_Load(
+        reinterpret_cast<const AtomicWord*>(&next_)));
+  }
+
   void set_next(Mutation *next) {
     next_ = next;
   }
@@ -82,8 +93,6 @@ class Mutation {
   template<bool ATOMIC>
   void DoAppendToList(Mutation **list);
 
-  DISALLOW_COPY_AND_ASSIGN(Mutation);
-
   // The transaction ID which made this mutation. If this transaction is not
   // committed in the snapshot of the reader, this mutation should be ignored.
   Timestamp timestamp_;
@@ -95,6 +104,8 @@ class Mutation {
 
   // The actual encoded RowChangeList
   char changelist_data_[0];
+
+  DISALLOW_COPY_AND_ASSIGN(Mutation);
 };
 
 template<class ArenaType>

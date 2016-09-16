@@ -17,7 +17,6 @@
 #ifndef KUDU_TABLET_DELTAMEMSTORE_H
 #define KUDU_TABLET_DELTAMEMSTORE_H
 
-#include <boost/thread/mutex.hpp>
 #include <deque>
 #include <gtest/gtest_prod.h>
 #include <memory>
@@ -203,6 +202,8 @@ class DMSIterator : public DeltaIterator {
   string ToString() const OVERRIDE;
 
   virtual bool HasNext() OVERRIDE;
+
+  bool MayHaveDeltas() override;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(DMSIterator);

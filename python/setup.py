@@ -28,11 +28,11 @@ from distutils.command.clean import clean as _clean
 from distutils.extension import Extension
 import os
 
-if Cython.__version__ < '0.19.1':
-    raise Exception('Please upgrade to Cython 0.19.1 or newer')
+if Cython.__version__ < '0.21.0':
+    raise Exception('Please upgrade to Cython 0.21.0 or newer')
 
 MAJOR = 0
-MINOR = 2
+MINOR = 3
 MICRO = 0
 VERSION = '%d.%d.%d' % (MAJOR, MINOR, MICRO)
 ISRELEASED = True
@@ -127,7 +127,7 @@ extensions = cythonize(extensions)
 write_version_py()
 
 LONG_DESCRIPTION = open(os.path.join(setup_dir, "README.md")).read()
-DESCRIPTION = "Python interface to the Apache Kudu (incubating) C++ Client API"
+DESCRIPTION = "Python interface to the Apache Kudu C++ Client API"
 
 CLASSIFIERS = [
     'Development Status :: 3 - Alpha',
@@ -154,14 +154,14 @@ setup(
         'build_ext': build_ext
     },
     setup_requires=['pytest-runner'],
-    tests_require=['pytest'],
+    tests_require=['pytest', 'multiprocessing'],
     install_requires=['cython >= 0.21'],
     description=DESCRIPTION,
     long_description=LONG_DESCRIPTION,
     license='Apache License, Version 2.0',
     classifiers=CLASSIFIERS,
-    maintainer="Apache Kudu (incubating) team",
-    maintainer_email="dev@kudu.incubator.apache.org",
+    maintainer="Apache Kudu team",
+    maintainer_email="dev@kudu.apache.org",
     url=URL,
     test_suite="kudu.tests"
 )

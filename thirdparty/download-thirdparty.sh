@@ -48,6 +48,11 @@ fetch_and_expand() {
     exit 1
   fi
 
+  TAR_CMD=tar
+  if [[ "$OSTYPE" == "darwin"* ]] && which gtar &>/dev/null; then
+    TAR_CMD=gtar
+  fi
+
   FULL_URL="${CLOUDFRONT_URL_PREFIX}/${FILENAME}"
   SUCCESS=0
   # Loop in case we encounter a corrupted archive and we need to re-download it.
@@ -60,14 +65,14 @@ fetch_and_expand() {
     fi
 
     echo "Unpacking $FILENAME"
-    if echo "$FILENAME" | egrep -q '\.zip$'; then
+    if [[ "$FILENAME" =~ \.zip$ ]]; then
       if ! unzip -q "$FILENAME"; then
         echo "Error unzipping $FILENAME, removing file"
         rm "$FILENAME"
         continue
       fi
-    elif echo "$FILENAME" | egrep -q '(\.tar\.gz|\.tgz)$'; then
-      if ! tar xf "$FILENAME"; then
+    elif [[ "$FILENAME" =~ \.(tar\.gz|tgz)$ ]]; then
+      if ! $TAR_CMD xf "$FILENAME"; then
         echo "Error untarring $FILENAME, removing file"
         rm "$FILENAME"
         continue
@@ -83,6 +88,7 @@ fetch_and_expand() {
 
   if [ $SUCCESS -ne 1 ]; then
     echo "Error: failed to fetch and unpack $FILENAME"
+    exit 1
   fi
 
   # Allow for not removing previously-downloaded artifacts.
@@ -246,6 +252,17 @@ fi
 
 if [ -n "$OS_LINUX" -a ! -d $NVML_DIR ]; then
   fetch_and_expand nvml-${NVML_VERSION}.tar.gz
+fi
+
+BOOST_PATCHLEVEL=1
+delete_if_wrong_patchlevel $BOOST_DIR $BOOST_PATCHLEVEL
+if [ ! -d $BOOST_DIR ]; then
+  fetch_and_expand boost_${BOOST_VERSION}.tar.gz
+  pushd $BOOST_DIR
+  patch -p0 < $TP_DIR/patches/boost-issue-12179-fix-compilation-errors.patch
+  touch patchlevel-$BOOST_PATCHLEVEL
+  popd
+  echo
 fi
 
 echo "---------------"

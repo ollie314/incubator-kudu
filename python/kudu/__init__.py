@@ -17,7 +17,8 @@
 
 from kudu.client import (Client, Table, Scanner, Session,  # noqa
                          Insert, Update, Delete, Predicate,
-                         TimeDelta, KuduError,
+                         TimeDelta, KuduError, ScanTokenBuilder,
+                         ScanToken,
                          FLUSH_AUTO_BACKGROUND,
                          FLUSH_AUTO_SYNC,
                          FLUSH_MANUAL)
@@ -28,7 +29,7 @@ from kudu.errors import (KuduException, KuduBadStatus, KuduNotFound,  # noqa
 
 from kudu.schema import (int8, int16, int32, int64, string_ as string,  # noqa
                          double_ as double, float_, binary,
-                         timestamp,
+                         unixtime_micros,
                          KuduType,
                          SchemaBuilder, ColumnSpec, Schema, ColumnSchema,
                          COMPRESSION_DEFAULT,

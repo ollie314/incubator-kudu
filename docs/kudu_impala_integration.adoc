@@ -16,7 +16,7 @@
 // under the License.
 
 [[kudu_impala]]
-= Using Apache Kudu (incubating) with Apache Impala (incubating)
+= Using Apache Kudu with Apache Impala (incubating)
 :author: Kudu Team
 :imagesdir: ./images
 :icons: font
@@ -174,12 +174,12 @@ hosted on `cloudera.com`.
 
 .Procedure
 
-- Download the `deploy.py` from https://github.com/cloudera/impala-kudu/blob/feature/kudu/infra/deploy/deploy.py
+- Download the `deploy.py` from https://github.com/apache/incubator-impala/blob/master/infra/deploy/deploy.py
 using `curl` or another utility of your choice.
 +
 [source,bash]
 ----
-$ curl -O https://raw.githubusercontent.com/cloudera/impala-kudu/feature/kudu/infra/deploy/deploy.py
+$ curl -O https://raw.githubusercontent.com/apache/incubator-impala/master/infra/deploy/deploy.py
 ----
 +
 - Run the `deploy.py` script. The syntax below creates a standalone IMPALA_KUDU
@@ -238,7 +238,10 @@ alongside another Impala instance if you use packages.
 [cols=">s,<,<",options="header"]
 |===
 | OS  | Repository  | Individual Packages
-| RHEL | link:http://archive.cloudera.com/beta/impala-kudu/redhat/6/x86_64/impala-kudu/cloudera-impala-kudu.repo[RHEL 6] |  link:http://archive.cloudera.com/beta/impala-kudu/redhat/6/x86_64/impala-kudu/0.5.0/RPMS/x86_64/[RHEL 6]
+| RHEL or CentOS | link:http://archive.cloudera.com/beta/impala-kudu/redhat/6/x86_64/impala-kudu/cloudera-impala-kudu.repo[RHEL 6 or CentOS 6],
+                   link:http://archive.cloudera.com/beta/impala-kudu/redhat/7/x86_64/impala-kudu/cloudera-impala-kudu.repo[RHEL 7 or CentOS 7] |
+                   link:http://archive.cloudera.com/beta/impala-kudu/redhat/6/x86_64/impala-kudu/0/RPMS/x86_64/[RHEL 6 or CentOS 6],
+                   link:http://archive.cloudera.com/beta/impala-kudu/redhat/7/x86_64/impala-kudu/0/RPMS/x86_64/[RHEL 7 or CentOS 7]
 | Ubuntu | link:http://archive.cloudera.com/beta/impala-kudu/ubuntu/trusty/amd64/impala-kudu/cloudera.list[Trusty] |  http://archive.cloudera.com/beta/impala-kudu/ubuntu/trusty/amd64/impala-kudu/pool/contrib/i/impala-kudu/[Trusty]
 |===
 
@@ -271,7 +274,10 @@ Instead, follow <<install_impala_kudu_packages>>.
 [cols=">s,<,<",options="header"]
 |===
 | OS  | Repository  | Individual Packages
-| RHEL | link:http://archive.cloudera.com/beta/impala-kudu/redhat/6/x86_64/impala-kudu/cloudera-impala-kudu.repo[RHEL 6] |  link:http://archive.cloudera.com/beta/impala-kudu/redhat/6/x86_64/impala-kudu/0.5.0/RPMS/x86_64/[RHEL 6]
+| RHEL or CentOS | link:http://archive.cloudera.com/beta/impala-kudu/redhat/6/x86_64/impala-kudu/cloudera-impala-kudu.repo[RHEL 6 or CentOS 6],
+                   link:http://archive.cloudera.com/beta/impala-kudu/redhat/7/x86_64/impala-kudu/cloudera-impala-kudu.repo[RHEL 7 or CentOS 7] |
+                   link:http://archive.cloudera.com/beta/impala-kudu/redhat/6/x86_64/impala-kudu/0/RPMS/x86_64/[RHEL 6 or CentOS 6],
+                   link:http://archive.cloudera.com/beta/impala-kudu/redhat/7/x86_64/impala-kudu/0/RPMS/x86_64/[RHEL 7 or CentOS 7]
 | Ubuntu | link:http://archive.cloudera.com/beta/impala-kudu/ubuntu/trusty/amd64/impala-kudu/cloudera.list[Trusty] |  http://archive.cloudera.com/beta/impala-kudu/ubuntu/trusty/amd64/impala-kudu/pool/contrib/i/impala-kudu/[Trusty]
 |===
 
@@ -305,7 +311,7 @@ provides the Impala query to map to an existing Kudu table in the web UI.
 
 - Be sure you are using the `impala-shell` binary provided by the Impala_Kudu package,
 rather than the default CDH Impala binary. The following shows how to verify this
-using the `alternatives` command on a RHEL 6 host.
+using the `alternatives` command on a RHEL or CentOS host.
 +
 [source,bash]
 ----
@@ -372,7 +378,7 @@ CREATE TABLE my_first_table
   id BIGINT,
   name STRING
 )
-DISTRIBUTE BY HASH (id) INTO 16 BUCKETS
+DISTRIBUTE BY HASH INTO 16 BUCKETS
 TBLPROPERTIES(
   'storage_handler' = 'com.cloudera.kudu.hive.KuduStorageHandler',
   'kudu.table_name' = 'my_first_table',
@@ -404,6 +410,7 @@ property. In this example, the primary key columns are `ts` and `name`.
 [source,sql]
 ----
 CREATE TABLE new_table
+DISTRIBUTE BY HASH INTO 16 BUCKETS
 TBLPROPERTIES(
   'storage_handler' = 'com.cloudera.kudu.hive.KuduStorageHandler',
   'kudu.table_name' = 'new_table',
@@ -430,8 +437,8 @@ like `SELECT name as new_name`.
 Tables are divided into tablets which are each served by one or more tablet
 servers. Ideally, tablets should split a table's data relatively equally. Kudu currently
 has no mechanism for automatically (or manually) splitting a pre-existing tablet.
-Until this feature has been implemented, you must pre-split your table when you create
-it, When designing your table schema, consider primary keys that will allow you to
+Until this feature has been implemented, *you must pre-split your table when you create
+it*. When designing your table schema, consider primary keys that will allow you to
 pre-split your table into tablets which grow at similar rates. You can provide split
 points using a `DISTRIBUTE BY` clause when creating a table using Impala:
 
@@ -455,13 +462,13 @@ CREATE TABLE cust_behavior (
   rating INT,
   fulfilled_date BIGINT
 )
-DISTRIBUTE BY RANGE(_id)
-SPLIT ROWS((1439560049342),
-           (1439566253755),
-           (1439572458168),
-           (1439578662581),
-           (1439584866994),
-           (1439591071407))
+DISTRIBUTE BY RANGE (_id)
+  SPLIT ROWS((1439560049342),
+             (1439566253755),
+             (1439572458168),
+             (1439578662581),
+             (1439584866994),
+             (1439591071407))
 TBLPROPERTIES(
   'storage_handler' = 'com.cloudera.kudu.hive.KuduStorageHandler',
   'kudu.table_name' = 'cust_behavior',
@@ -491,12 +498,13 @@ use the following SQL:
 
 [source,sql]
 ----
-CREATE DATABASE impala_kudu
+CREATE DATABASE impala_kudu;
 USE impala_kudu;
 CREATE TABLE my_first_table (
   id BIGINT,
   name STRING
 )
+DISTRIBUTE BY HASH INTO 4 BUCKETS
 TBLPROPERTIES(
   'storage_handler' = 'com.cloudera.kudu.hive.KuduStorageHandler',
   'kudu.table_name' = 'my_first_table',
@@ -605,13 +613,13 @@ CREATE TABLE customers (
   name STRING,
   purchase_count int32,
 )
-DISTRIBUTE BY RANGE(state)
-SPLIT ROWS(('al'),
-           ('ak'),
-           ('ar'),
-           ...
-           ('wv'),
-           ('wy'))
+DISTRIBUTE BY RANGE (state)
+  SPLIT ROWS (('al'),
+              ('ak'),
+              ('ar'),
+              ...
+              ('wv'),
+              ('wy'))
 TBLPROPERTIES(
   'storage_handler' = 'com.cloudera.kudu.hive.KuduStorageHandler',
   'kudu.table_name' = 'customers',
@@ -666,7 +674,7 @@ CREATE TABLE cust_behavior (
   rating INT,
   fulfilled_date BIGINT
 )
-DISTRIBUTE BY HASH (id) INTO 16 BUCKETS
+DISTRIBUTE BY HASH INTO 16 BUCKETS
 TBLPROPERTIES(
   'storage_handler' = 'com.cloudera.kudu.hive.KuduStorageHandler',
   'kudu.table_name' = 'cust_behavior',
@@ -701,14 +709,14 @@ CREATE TABLE customers (
   name STRING,
   purchase_count int32,
 )
-DISTRIBUTE BY RANGE(state, name)
-  SPLIT ROWS(('al', ''),
-             ('al', 'm'),
-             ('ak', ''),
-             ('ak', 'm'),
-             ...
-             ('wy', ''),
-             ('wy', 'm'))
+DISTRIBUTE BY RANGE (state, name)
+  SPLIT ROWS (('al', ''),
+              ('al', 'm'),
+              ('ak', ''),
+              ('ak', 'm'),
+              ...
+              ('wy', ''),
+              ('wy', 'm'))
 TBLPROPERTIES(
   'storage_handler' = 'com.cloudera.kudu.hive.KuduStorageHandler',
   'kudu.table_name' = 'customers',
@@ -727,6 +735,10 @@ buckets, and then applying range partitioning to split each bucket into four tab
 based upon the value of the `sku` string. Writes are spread across at least four tablets
 (and possibly up to 16). When you query for a contiguous range of `sku` values, you have a
 good chance of only needing to read from a quarter of the tablets to fulfill the query.
+
+NOTE: By default, the entire primary key is hashed when you use `DISTRIBUTE BY HASH`.
+To hash on only part of the primary key, specify it by using syntax like `DISTRIBUTE
+BY HASH (id, sku)`.
 
 [source,sql]
 ----
@@ -747,9 +759,9 @@ CREATE TABLE cust_behavior (
 )
 DISTRIBUTE BY HASH (id) INTO 4 BUCKETS,
 RANGE (sku)
-  SPLIT ROWS(('g'),
-             ('o'),
-             ('u'))
+  SPLIT ROWS (('g'),
+              ('o'),
+              ('u'))
 TBLPROPERTIES(
   'storage_handler' = 'com.cloudera.kudu.hive.KuduStorageHandler',
   'kudu.table_name' = 'cust_behavior',
@@ -794,6 +806,61 @@ TBLPROPERTIES(
 The example creates 16 buckets. You could also use `HASH (id, sku) INTO 16 BUCKETS`.
 However, a scan for `sku` values would almost always impact all 16 buckets, rather
 than possibly being limited to 4.
+
+// Not ready for 0.10 but don't want to lose the work
+////
+
+.Non-Covering Range Partitions
+Kudu TODO:VERSION and higher supports the use of non-covering range partitions,
+which address scenarios like the following:
+
+- Without non-covering range partitions, in the case of time-series data or other
+  schemas which need to account for constantly-increasing primary keys, tablets
+  serving old data will be relatively fixed in size, while tablets receiving new
+  data will grow without bounds.
+
+- In cases where you want to partition data based on its category, such as sales
+  region or product type, without non-covering range partitions you must know all
+  of the partitions ahead of time or manually recreate your table if partitions
+  need to be added or removed, such as the introduction or elimination of a product
+  type.
+
+Non-covering range partitions have some caveats. Be sure to read the
+link:/docs/schema_design.html [Schema Design guide].
+
+This example creates a tablet per year (5 tablets total), for storing log data. It uses `RANGE BOUND`
+to ensure that the table only accepts data from 2011 to 2017. Keys outside of these
+ranges will be rejected.
+
+[source,sql]
+----
+CREATE TABLE sales_by_year (year INT32, sale_id INT32, amount INT32)
+PRIMARY KEY (sale_id, year)
+DISTRIBUTE BY RANGE (year)
+              RANGE BOUND ((2011), (2016))
+              SPLIT ROWS ((2012), (2013), (2014), (2015), (2016));
+----
+
+When records start coming in for 2017, they will be rejected. At that point, the `2017`
+range should be added. An `alter table add range partition` or `alter table drop range
+partition` operation allows you to add or drop a range partition.
+
+The next example creates a table per sales region. Data for regions other than `North
+America`, `Europe`, or `Asia` will be rejected. This example does not use explicit
+split rows, but the range bounds provide implicit split rows, so three tablets would
+be  created. If a new range is added, a new tablet is created.
+
+[source,sql]
+----
+CREATE TABLE sales_by_region (region STRING, sale_id INT32, amount INT32)
+PRIMARY KEY (sale_id, region)
+DISTRIBUTE BY RANGE (region)
+              RANGE BOUND (("North America"), ("North America\0")),
+              RANGE BOUND (("Europe"), ("Europe\0")),
+              RANGE BOUND (("Asia"), ("Asia\0"));
+----
+
+////
 
 [[partitioning_rules_of_thumb]]
 ==== Partitioning Rules of Thumb

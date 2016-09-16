@@ -18,6 +18,7 @@
 #include "kudu/client/client.h"
 #include "kudu/client/error_collector.h"
 
+#include <mutex>
 #include <vector>
 
 #include "kudu/gutil/stl_util.h"
@@ -26,29 +27,30 @@ namespace kudu {
 namespace client {
 namespace internal {
 
-ErrorCollector::ErrorCollector() {
-}
-
 ErrorCollector::~ErrorCollector() {
   STLDeleteElements(&errors_);
 }
 
 void ErrorCollector::AddError(gscoped_ptr<KuduError> error) {
-  lock_guard<simple_spinlock> l(&lock_);
+  std::lock_guard<simple_spinlock> l(lock_);
   errors_.push_back(error.release());
 }
 
-int ErrorCollector::CountErrors() const {
-  lock_guard<simple_spinlock> l(&lock_);
+size_t ErrorCollector::CountErrors() const {
+  std::lock_guard<simple_spinlock> l(lock_);
   return errors_.size();
 }
 
 void ErrorCollector::GetErrors(std::vector<KuduError*>* errors, bool* overflowed) {
-  lock_guard<simple_spinlock> l(&lock_);
-  errors->swap(errors_);
-  *overflowed = false;
+  std::lock_guard<simple_spinlock> l(lock_);
+  if (errors != nullptr) {
+    errors->clear();
+    errors->swap(errors_);
+  }
+  if (overflowed != nullptr) {
+    *overflowed = false;
+  }
 }
-
 
 } // namespace internal
 } // namespace client

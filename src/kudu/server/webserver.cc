@@ -16,18 +16,20 @@
 // under the License.
 #include "kudu/server/webserver.h"
 
-#include <algorithm>
-#include <stdio.h>
+#include <cstdio>
 #include <signal.h>
-#include <string>
+
+#include <algorithm>
+#include <functional>
 #include <map>
+#include <mutex>
+#include <sstream>
+#include <string>
 #include <vector>
-#include <boost/lexical_cast.hpp>
-#include <boost/bind.hpp>
-#include <boost/mem_fn.hpp>
+
 #include <boost/algorithm/string.hpp>
-#include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <gflags/gflags.h>
 #include <squeasel.h>
 
 #include "kudu/gutil/map-util.h"
@@ -39,6 +41,7 @@
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/util/env.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/locks.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/url-coding.h"
 #include "kudu/util/version_info.h"
@@ -47,10 +50,10 @@
 typedef sig_t sighandler_t;
 #endif
 
-using std::string;
-using std::stringstream;
-using std::vector;
 using std::make_pair;
+using std::ostringstream;
+using std::string;
+using std::vector;
 
 DEFINE_int32(webserver_max_post_length_bytes, 1024 * 1024,
              "The maximum length of a POST request that will be accepted by "
@@ -64,7 +67,7 @@ Webserver::Webserver(const WebserverOptions& opts)
   : opts_(opts),
     context_(nullptr) {
   string host = opts.bind_interface.empty() ? "0.0.0.0" : opts.bind_interface;
-  http_address_ = host + ":" + boost::lexical_cast<string>(opts.port);
+  http_address_ = host + ":" + std::to_string(opts.port);
 }
 
 Webserver::~Webserver() {
@@ -72,7 +75,7 @@ Webserver::~Webserver() {
   STLDeleteValues(&path_handlers_);
 }
 
-void Webserver::RootHandler(const Webserver::WebRequest& args, stringstream* output) {
+void Webserver::RootHandler(const Webserver::WebRequest& args, ostringstream* output) {
   (*output) << "<h2>Status Pages</h2>";
   for (const PathHandlerMap::value_type& handler : path_handlers_) {
     if (handler.second->is_on_nav_bar()) {
@@ -148,7 +151,7 @@ Status Webserver::Start() {
     // Mongoose doesn't log anything if it can't stat the password file (but will if it
     // can't open it, which it tries to do during a request)
     if (!Env::Default()->FileExists(opts_.password_file)) {
-      stringstream ss;
+      ostringstream ss;
       ss << "Webserver: Password file does not exist: " << opts_.password_file;
       return Status::InvalidArgument(ss.str());
     }
@@ -190,7 +193,7 @@ Status Webserver::Start() {
   signal(SIGCHLD, sig_chld);
 
   if (context_ == nullptr) {
-    stringstream error_msg;
+    ostringstream error_msg;
     error_msg << "Webserver: Could not start on address " << http_address_;
     Sockaddr addr;
     addr.set_port(opts_.port);
@@ -199,7 +202,8 @@ Status Webserver::Start() {
   }
 
   PathHandlerCallback default_callback =
-    boost::bind<void>(boost::mem_fn(&Webserver::RootHandler), this, _1, _2);
+    std::bind<void>(std::mem_fn(&Webserver::RootHandler),
+                    this, std::placeholders::_1, std::placeholders::_2);
 
   RegisterPathHandler("/", "Home", default_callback);
 
@@ -266,7 +270,7 @@ int Webserver::BeginRequestCallback(struct sq_connection* connection,
                                     struct sq_request_info* request_info) {
   PathHandler* handler;
   {
-    boost::shared_lock<boost::shared_mutex> lock(lock_);
+    shared_lock<RWMutex> l(lock_);
     PathHandlerMap::const_iterator it = path_handlers_.find(request_info->uri);
     if (it == path_handlers_.end()) {
       // Let Mongoose deal with this request; returning NULL will fall through
@@ -337,7 +341,7 @@ int Webserver::RunPathHandler(const PathHandler& handler,
     use_style = false;
   }
 
-  stringstream output;
+  ostringstream output;
   if (use_style) BootstrapPageHeader(&output);
   for (const PathHandlerCallback& callback_ : handler.callbacks()) {
     callback_(req, &output);
@@ -365,7 +369,7 @@ int Webserver::RunPathHandler(const PathHandler& handler,
 
 void Webserver::RegisterPathHandler(const string& path, const string& alias,
     const PathHandlerCallback& callback, bool is_styled, bool is_on_nav_bar) {
-  boost::lock_guard<boost::shared_mutex> lock(lock_);
+  std::lock_guard<RWMutex> l(lock_);
   auto it = path_handlers_.find(path);
   if (it == path_handlers_.end()) {
     it = path_handlers_.insert(
@@ -377,6 +381,7 @@ void Webserver::RegisterPathHandler(const string& path, const string& alias,
 const char* const PAGE_HEADER = "<!DOCTYPE html>"
 " <html>"
 "   <head><title>Kudu</title>"
+" <meta charset='utf-8'/>"
 " <link href='/bootstrap/css/bootstrap.min.css' rel='stylesheet' media='screen' />"
 " <link href='/kudu.css' rel='stylesheet' />"
 " </head>"
@@ -400,7 +405,7 @@ static const char* const NAVIGATION_BAR_SUFFIX =
 "    </div>"
 "    <div class='container-fluid'>";
 
-void Webserver::BootstrapPageHeader(stringstream* output) {
+void Webserver::BootstrapPageHeader(ostringstream* output) {
   (*output) << PAGE_HEADER;
   (*output) << NAVIGATION_BAR_PREFIX;
   for (const PathHandlerMap::value_type& handler : path_handlers_) {
@@ -423,12 +428,12 @@ bool Webserver::static_pages_available() const {
 }
 
 void Webserver::set_footer_html(const std::string& html) {
-  boost::lock_guard<boost::shared_mutex> l(lock_);
+  std::lock_guard<RWMutex> l(lock_);
   footer_html_ = html;
 }
 
-void Webserver::BootstrapPageFooter(stringstream* output) {
-  boost::shared_lock<boost::shared_mutex> l(lock_);
+void Webserver::BootstrapPageFooter(ostringstream* output) {
+  shared_lock<RWMutex> l(lock_);
   *output << "</div>\n"; // end bootstrap 'container' div
   if (!footer_html_.empty()) {
     *output << "<footer class=\"footer\"><div class=\"container text-muted\">";

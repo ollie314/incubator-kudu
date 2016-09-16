@@ -22,10 +22,18 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>org.kududb</groupId>
+    <groupId>org.apache.kudu</groupId>
     <artifactId>kudu-parent</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
+    <version>1.1.0-SNAPSHOT</version>
     <packaging>pom</packaging>
+
+    <!-- inherit from the ASF POM for distribution management -->
+    <parent>
+      <groupId>org.apache</groupId>
+      <artifactId>apache</artifactId>
+      <version>18</version>
+      <relativePath/>
+    </parent>
 
     <name>Kudu</name>
 
@@ -52,7 +60,7 @@
         <async.version>1.4.1</async.version>
         <commons-io.version>2.4</commons-io.version>
         <guava.version>18.0</guava.version>
-        <hadoop.version>2.6.0-cdh5.4.7</hadoop.version>
+        <hadoop.version>2.7.2</hadoop.version>
         <jsr305.version>3.0.1</jsr305.version>
         <junit.version>4.11</junit.version>
         <log4j.version>1.2.17</log4j.version>
@@ -208,23 +216,23 @@
                     <maxmemory>2048m</maxmemory>
                     <notimestamp>true</notimestamp>
                     <doclet>
-                        org.kududb.annotations.tools.IncludePublicAnnotationsStandardDoclet
+                        org.apache.kudu.annotations.tools.IncludePublicAnnotationsStandardDoclet
                     </doclet>
                     <docletArtifact>
-                        <groupId>org.kududb</groupId>
+                        <groupId>org.apache.kudu</groupId>
                         <artifactId>interface-annotations</artifactId>
                         <version>${project.version}</version>
                     </docletArtifact>
                     <name>User API</name>
                     <description>The Kudu Application Programmer's API</description>
                     <excludePackageNames>
-                        com.google:org.kududb.cfile:org.kududb.consensus:org.kududb.log:org.kududb.master:org.kududb.rpc:org.kududb.server:org.kududb.tablet:org.kududb.tserver
+                        com.google:org.apache.kudu.cfile:org.apache.kudu.consensus:org.apache.kudu.log:org.apache.kudu.master:org.apache.kudu.rpc:org.apache.kudu.server:org.apache.kudu.tablet:org.apache.kudu.tserver
                     </excludePackageNames>
                     <includeDependencySources>false</includeDependencySources>
 
                     <dependencySourceIncludes>
                         <dependencySourceInclude>
-                            org.kududb:interface-annotations
+                            org.apache.kudu:interface-annotations
                         </dependencySourceInclude>
                     </dependencySourceIncludes>
                 </configuration>
@@ -258,19 +266,6 @@
     </repository>
  </repositories>
 
-  <distributionManagement>
-    <repository>
-      <id>cdh.releases.repo</id>
-      <url>${deploy.maven}</url>
-      <name>Releases Repository</name>
-    </repository>
-    <snapshotRepository>
-      <id>cdh.snapshots.repo</id>
-      <url>http://maven.jenkins.cloudera.com:8081/artifactory/cdh-snapshot-local</url>
-      <name>Snapshots Repository</name>
-    </snapshotRepository>
-  </distributionManagement>
-
   <profiles>
     <!-- Build the CSD.
 
@@ -280,21 +275,6 @@
       <modules>
         <module>kudu-csd</module>
       </modules>
-    </profile>
-    <profile>
-      <id>deploy-local</id>
-      <activation>
-        <activeByDefault>true</activeByDefault>
-      </activation>
-      <properties>
-         <deploy.maven>http://maven.jenkins.cloudera.com:8081/artifactory/libs-release-local</deploy.maven>
-       </properties>
-    </profile>
-    <profile>
-      <id>deploy-remote</id>
-      <properties>
-         <deploy.maven>https://repository.cloudera.com/cloudera/libs-release-local</deploy.maven>
-      </properties>
     </profile>
   </profiles>
 </project>

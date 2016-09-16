@@ -89,6 +89,10 @@ class LinkedListTest : public tserver::TabletServerIntegrationTestBase {
 
     common_flags.push_back("--skip_remove_old_recovery_dir");
 
+    // Set history retention to one day, so that we don't GC history in this test.
+    // We rely on verifying "back in time" with snapshot scans.
+    common_flags.push_back("--tablet_history_max_age_sec=86400");
+
     vector<string> ts_flags(common_flags);
     if (FLAGS_stress_flush_compact) {
       // Set the flush threshold low so that we have a mix of flushed and unflushed
@@ -113,8 +117,7 @@ class LinkedListTest : public tserver::TabletServerIntegrationTestBase {
   }
 
   void ResetClientAndTester() {
-    KuduClientBuilder builder;
-    ASSERT_OK(cluster_->CreateClient(builder, &client_));
+    ASSERT_OK(cluster_->CreateClient(nullptr, &client_));
     tester_.reset(new LinkedListTester(client_, kTableId,
                                        FLAGS_num_chains,
                                        FLAGS_num_tablets,
@@ -124,22 +127,12 @@ class LinkedListTest : public tserver::TabletServerIntegrationTestBase {
 
   void RestartCluster() {
     CHECK(cluster_);
-    cluster_->Shutdown(ExternalMiniCluster::TS_ONLY);
+    cluster_->ShutdownNodes(ClusterNodes::TS_ONLY);
     cluster_->Restart();
     ResetClientAndTester();
   }
 
  protected:
-  void AddExtraFlags(const string& flags_str, vector<string>* flags) {
-    if (flags_str.empty()) {
-      return;
-    }
-    vector<string> split_flags = strings::Split(flags_str, " ");
-    for (const string& flag : split_flags) {
-      flags->push_back(flag);
-    }
-  }
-
   shared_ptr<KuduClient> client_;
   gscoped_ptr<LinkedListTester> tester_;
 };

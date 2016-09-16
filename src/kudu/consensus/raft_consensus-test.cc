@@ -17,6 +17,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <memory>
 
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol-test-util.h"
@@ -39,6 +40,7 @@ METRIC_DECLARE_entity(tablet);
 
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 
 namespace kudu {
 namespace consensus {
@@ -66,7 +68,7 @@ class MockQueue : public PeerMessageQueue {
   explicit MockQueue(const scoped_refptr<MetricEntity>& metric_entity, log::Log* log)
     : PeerMessageQueue(metric_entity, log, FakeRaftPeerPB(kLocalPeerUuid), kTestTablet) {}
   MOCK_METHOD1(Init, void(const OpId& locally_replicated_index));
-  MOCK_METHOD3(SetLeaderMode, void(const OpId& committed_opid,
+  MOCK_METHOD3(SetLeaderMode, void(int64_t committed_opid,
                                    int64_t current_term,
                                    const RaftConfigPB& active_config));
   MOCK_METHOD0(SetNonLeaderMode, void());
@@ -76,12 +78,13 @@ class MockQueue : public PeerMessageQueue {
   }
   MOCK_METHOD2(AppendOperationsMock, Status(const vector<ReplicateRefPtr>& msgs,
                                             const StatusCallback& callback));
+  MOCK_METHOD1(TruncateOpsAfter, void(const OpId& op_id));
   MOCK_METHOD1(TrackPeer, void(const string&));
   MOCK_METHOD1(UntrackPeer, void(const string&));
   MOCK_METHOD4(RequestForPeer, Status(const std::string& uuid,
                                       ConsensusRequestPB* request,
                                       std::vector<ReplicateRefPtr>* msg_refs,
-                                      bool* needs_remote_bootstrap));
+                                      bool* needs_tablet_copy));
   MOCK_METHOD3(ResponseFromPeer, void(const std::string& peer_uuid,
                                       const ConsensusResponsePB& response,
                                       bool* more_pending));
@@ -101,7 +104,7 @@ class RaftConsensusSpy : public RaftConsensus {
   typedef Callback<Status(const scoped_refptr<ConsensusRound>& round)> AppendCallback;
 
   RaftConsensusSpy(const ConsensusOptions& options,
-                   gscoped_ptr<ConsensusMetadata> cmeta,
+                   unique_ptr<ConsensusMetadata> cmeta,
                    gscoped_ptr<PeerProxyFactory> proxy_factory,
                    gscoped_ptr<PeerMessageQueue> queue,
                    gscoped_ptr<PeerManager> peer_manager,
@@ -205,7 +208,7 @@ class RaftConsensusTest : public KuduTest {
 
     string peer_uuid = config_.peers(num_peers - 1).permanent_uuid();
 
-    gscoped_ptr<ConsensusMetadata> cmeta;
+    unique_ptr<ConsensusMetadata> cmeta;
     CHECK_OK(ConsensusMetadata::Create(fs_manager_.get(), kTestTablet, peer_uuid,
                                        config_, initial_term, &cmeta));
 
@@ -321,6 +324,7 @@ ConsensusRequestPB RaftConsensusTest::MakeConsensusRequest(int64_t caller_term,
   request.set_caller_term(caller_term);
   request.set_caller_uuid(caller_uuid);
   request.set_tablet_id(kTestTablet);
+  request.set_all_replicated_index(0);
   *request.mutable_preceding_id() = preceding_opid;
   return request;
 }
@@ -332,90 +336,6 @@ void RaftConsensusTest::AddNoOpToConsensusRequest(ConsensusRequestPB* request,
   noop_msg->set_op_type(NO_OP);
   noop_msg->set_timestamp(clock_->Now().ToUint64());
   noop_msg->mutable_noop_request();
-}
-
-// Tests that the committed index moves along with the majority replicated
-// index when the terms are the same.
-TEST_F(RaftConsensusTest, TestCommittedIndexWhenInSameTerm) {
-  SetUpConsensus();
-  SetUpGeneralExpectations();
-  EXPECT_CALL(*peer_manager_, UpdateRaftConfig(_))
-      .Times(1)
-      .WillOnce(Return(Status::OK()));
-  EXPECT_CALL(*queue_, Init(_))
-      .Times(1);
-  EXPECT_CALL(*queue_, SetLeaderMode(_, _, _))
-      .Times(1);
-  EXPECT_CALL(*consensus_.get(), AppendNewRoundToQueueUnlocked(_))
-      .Times(11);
-  EXPECT_CALL(*queue_, AppendOperationsMock(_, _))
-      .Times(11).WillRepeatedly(Return(Status::OK()));
-
-  ConsensusBootstrapInfo info;
-  ASSERT_OK(consensus_->Start(info));
-  ASSERT_OK(consensus_->EmulateElection());
-
-  // Commit the first noop round, created on EmulateElection();
-  OpId committed_index;
-  ASSERT_FALSE(rounds_.empty()) << "rounds_ is empty!";
-  consensus_->UpdateMajorityReplicated(rounds_[0]->id(), &committed_index);
-
-  ASSERT_OPID_EQ(rounds_[0]->id(), committed_index);
-
-  // Append 10 rounds
-  for (int i = 0; i < 10; i++) {
-    scoped_refptr<ConsensusRound> round = AppendNoOpRound();
-    // queue reports majority replicated index in the leader's term
-    // committed index should move accordingly.
-    consensus_->UpdateMajorityReplicated(round->id(), &committed_index);
-    ASSERT_OPID_EQ(round->id(), committed_index);
-  }
-}
-
-// Tests that, when terms change, the commit index only advances when the majority
-// replicated index is in the current term.
-TEST_F(RaftConsensusTest, TestCommittedIndexWhenTermsChange) {
-  SetUpConsensus();
-  SetUpGeneralExpectations();
-  EXPECT_CALL(*peer_manager_, UpdateRaftConfig(_))
-      .Times(2)
-      .WillRepeatedly(Return(Status::OK()));
-  EXPECT_CALL(*queue_, Init(_))
-      .Times(1);
-  EXPECT_CALL(*consensus_.get(), AppendNewRoundToQueueUnlocked(_))
-      .Times(3);
-  EXPECT_CALL(*queue_, AppendOperationsMock(_, _))
-      .Times(3).WillRepeatedly(Return(Status::OK()));;
-
-  ConsensusBootstrapInfo info;
-  ASSERT_OK(consensus_->Start(info));
-  ASSERT_OK(consensus_->EmulateElection());
-
-  OpId committed_index;
-  consensus_->UpdateMajorityReplicated(rounds_[0]->id(), &committed_index);
-  ASSERT_OPID_EQ(rounds_[0]->id(), committed_index);
-
-  // Append another round in the current term (besides the original config round).
-  scoped_refptr<ConsensusRound> round = AppendNoOpRound();
-
-  // Now emulate an election, the same guy will be leader but the term
-  // will change.
-  ASSERT_OK(consensus_->EmulateElection());
-
-  // Now tell consensus that 'round' has been majority replicated, this _shouldn't_
-  // advance the committed index, since that belongs to a previous term.
-  OpId new_committed_index;
-  consensus_->UpdateMajorityReplicated(round->id(), &new_committed_index);
-  ASSERT_OPID_EQ(committed_index, new_committed_index);
-
-  const scoped_refptr<ConsensusRound>& last_config_round = rounds_[2];
-
-  // Now notify that the last change config was committed, this should advance the
-  // commit index to the id of the last change config.
-  consensus_->UpdateMajorityReplicated(last_config_round->id(), &committed_index);
-
-  DumpRounds();
-  ASSERT_OPID_EQ(last_config_round->id(), committed_index);
 }
 
 // Asserts that a ConsensusRound has an OpId set in its ReplicateMsg.
@@ -451,7 +371,7 @@ TEST_F(RaftConsensusTest, TestPendingTransactions) {
 
   {
     InSequence dummy;
-    // On start we expect 10 NO_OPs to be enqueues, with 5 of those having
+    // On start we expect 10 NO_OPs to be enqueued, with 5 of those having
     // their commit continuation called immediately.
     EXPECT_CALL(*consensus_.get(), StartConsensusOnlyRoundUnlocked(_))
         .Times(10);
@@ -467,7 +387,6 @@ TEST_F(RaftConsensusTest, TestPendingTransactions) {
   ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(txn_factory_.get()));
   ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(peer_manager_));
   ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(consensus_.get()));
-
   // Now we test what this peer does with the pending operations once it's elected leader.
   {
     InSequence dummy;
@@ -502,30 +421,20 @@ TEST_F(RaftConsensusTest, TestPendingTransactions) {
   EXPECT_CALL(*queue_, Close())
       .Times(1);
 
-  // Now tell consensus all original orphaned replicates were majority replicated.
-  // This should not advance the committed index because we haven't replicated
-  // anything in the current term.
-  OpId committed_index;
-  consensus_->UpdateMajorityReplicated(info.orphaned_replicates.back()->id(),
-                                       &committed_index);
-  // Should still be the last committed in the the wal.
-  ASSERT_OPID_EQ(committed_index, info.last_committed_id);
-
   // Now mark the last operation (the no-op round) as committed.
   // This should advance the committed index, since that round in on our current term,
   // and we should be able to commit all previous rounds.
-  OpId cc_round_id = info.orphaned_replicates.back()->id();
-  cc_round_id.set_term(11);
-  cc_round_id.set_index(cc_round_id.index() + 1);
-  consensus_->UpdateMajorityReplicated(cc_round_id,
-                                       &committed_index);
-
-  ASSERT_OPID_EQ(committed_index, cc_round_id);
+  int64_t cc_round_index = info.orphaned_replicates.back()->id().index() + 1;
+  consensus_->NotifyCommitIndex(cc_round_index);
 }
 
 MATCHER_P2(RoundHasOpId, term, index, "") {
   LOG(INFO) << "expected: " << MakeOpId(term, index) << ", actual: " << arg->id();
   return arg->id().term() == term && arg->id().index() == index;
+}
+
+MATCHER_P2(EqOpId, term, index, "") {
+  return arg.term() == term && arg.index() == index;
 }
 
 // Tests the case where a a leader is elected and pushed a sequence of
@@ -584,6 +493,7 @@ TEST_F(RaftConsensusTest, TestAbortOperations) {
   }
   EXPECT_CALL(*consensus_.get(),
               NonTxRoundReplicationFinished(RoundHasOpId(3, 6), _, IsOk())).Times(1);
+  EXPECT_CALL(*queue_, TruncateOpsAfter(EqOpId(2, 5))).Times(1);
 
   // Nothing's committed so far, so now just send an Update() message
   // emulating another guy got elected leader and is overwriting a suffix
@@ -597,6 +507,7 @@ TEST_F(RaftConsensusTest, TestAbortOperations) {
   const string PEER_0_UUID = "peer-0";
   request.set_caller_uuid(PEER_0_UUID);
   request.set_tablet_id(kTestTablet);
+  request.set_all_replicated_index(0);
   request.mutable_preceding_id()->CopyFrom(MakeOpId(2, 4));
 
   ReplicateMsg* replicate = request.add_ops();
@@ -617,7 +528,7 @@ TEST_F(RaftConsensusTest, TestAbortOperations) {
     replicate->set_timestamp(clock_->Now().ToUint64());
   }
 
-  request.mutable_committed_index()->CopyFrom(MakeOpId(3, 6));
+  request.set_committed_index(6);
 
   ConsensusResponsePB response;
   ASSERT_OK(consensus_->Update(&request, &response));
@@ -633,7 +544,7 @@ TEST_F(RaftConsensusTest, TestAbortOperations) {
 
   request.mutable_ops()->Clear();
   request.mutable_preceding_id()->CopyFrom(MakeOpId(3, 9));
-  request.mutable_committed_index()->CopyFrom(MakeOpId(3, 9));
+  request.set_committed_index(9);
 
   ASSERT_OK(consensus_->Update(&request, &response));
   ASSERT_FALSE(response.has_error());
@@ -685,8 +596,10 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
   ASSERT_OPID_EQ(response.status().last_received_current_leader(),  noop_opid);
 
   // New leader heartbeat. Term increase to 2.
-  // Expect current term replicated to be nothing (MinimumOpId) but log
-  // replicated to be everything sent so far.
+  // The preceding_opid is the no-op replicated above. This will match on the
+  // follower side, so it can update its last_received_current_leader to
+  // the same operation (indicating to the queue that it doesn't need to re-replicate
+  // this operation).
   caller_term = 2;
   caller_uuid = config_.peers(1).permanent_uuid();
   preceding_opid = noop_opid;
@@ -696,7 +609,7 @@ TEST_F(RaftConsensusTest, TestResetRcvdFromCurrentLeaderOnNewTerm) {
   ASSERT_FALSE(response.status().has_error()) << response.ShortDebugString();
   ASSERT_EQ(caller_term, response.responder_term());
   ASSERT_OPID_EQ(response.status().last_received(), preceding_opid);
-  ASSERT_OPID_EQ(response.status().last_received_current_leader(), MinimumOpId());
+  ASSERT_OPID_EQ(response.status().last_received_current_leader(), preceding_opid);
 
   // Append a no-op.
   noop_opid = MakeOpId(caller_term, ++log_index);

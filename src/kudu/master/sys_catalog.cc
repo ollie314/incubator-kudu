@@ -17,8 +17,12 @@
 
 #include "kudu/master/sys_catalog.h"
 
+#include <algorithm>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <iterator>
+#include <memory>
+#include <set>
 
 #include "kudu/common/partial_row.h"
 #include "kudu/common/partition.h"
@@ -31,6 +35,8 @@
 #include "kudu/consensus/opid_util.h"
 #include "kudu/consensus/quorum_util.h"
 #include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/casts.h"
+#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
@@ -53,6 +59,7 @@ TAG_FLAG(sys_catalog_fail_during_write, unsafe);
 
 using kudu::consensus::CONSENSUS_CONFIG_COMMITTED;
 using kudu::consensus::ConsensusMetadata;
+using kudu::consensus::ConsensusStatePB;
 using kudu::consensus::RaftConfigPB;
 using kudu::consensus::RaftPeerPB;
 using kudu::log::Log;
@@ -60,6 +67,7 @@ using kudu::log::LogAnchorRegistry;
 using kudu::tablet::LatchTransactionCompletionCallback;
 using kudu::tablet::Tablet;
 using kudu::tablet::TabletPeer;
+using kudu::tablet::TabletStatusListener;
 using kudu::tserver::WriteRequestPB;
 using kudu::tserver::WriteResponsePB;
 using std::shared_ptr;
@@ -69,20 +77,20 @@ using strings::Substitute;
 namespace kudu {
 namespace master {
 
-static const char* const kSysCatalogTabletId = "00000000000000000000000000000000";
-
 static const char* const kSysCatalogTableColType = "entry_type";
 static const char* const kSysCatalogTableColId = "entry_id";
 static const char* const kSysCatalogTableColMetadata = "metadata";
 
-const char* SysCatalogTable::kInjectedFailureStatusMsg = "INJECTED FAILURE";
+const char* const SysCatalogTable::kSysCatalogTabletId =
+    "00000000000000000000000000000000";
+const char* const SysCatalogTable::kInjectedFailureStatusMsg =
+    "INJECTED FAILURE";
 
 SysCatalogTable::SysCatalogTable(Master* master, MetricRegistry* metrics,
                                  ElectedLeaderCallback leader_cb)
     : metric_registry_(metrics),
       master_(master),
-      leader_cb_(std::move(leader_cb)),
-      old_role_(RaftPeerPB::FOLLOWER) {
+      leader_cb_(std::move(leader_cb)) {
   CHECK_OK(ThreadPoolBuilder("apply").Build(&apply_pool_));
 }
 
@@ -107,27 +115,41 @@ Status SysCatalogTable::Load(FsManager *fs_manager) {
     return(Status::Corruption("Unexpected schema", metadata->schema().ToString()));
   }
 
-  // Allow for statically and explicitly assigning the consensus configuration and roles through
-  // the master configuration on startup.
-  //
-  // TODO: The following assumptions need revisiting:
-  // 1. We always believe the local config options for who is in the consensus configuration.
-  // 2. We always want to look up all node's UUIDs on start (via RPC).
-  //    - TODO: Cache UUIDs. See KUDU-526.
   if (master_->opts().IsDistributed()) {
-    LOG(INFO) << "Configuring consensus for distributed operation...";
-
+    LOG(INFO) << "Verifying existing consensus state";
     string tablet_id = metadata->tablet_id();
-    gscoped_ptr<ConsensusMetadata> cmeta;
+    unique_ptr<ConsensusMetadata> cmeta;
     RETURN_NOT_OK_PREPEND(ConsensusMetadata::Load(fs_manager, tablet_id,
                                                   fs_manager->uuid(), &cmeta),
                           "Unable to load consensus metadata for tablet " + tablet_id);
+    ConsensusStatePB cstate = cmeta->ToConsensusStatePB(CONSENSUS_CONFIG_COMMITTED);
+    RETURN_NOT_OK(consensus::VerifyConsensusState(
+        cstate, consensus::COMMITTED_QUORUM));
 
-    RaftConfigPB config;
-    RETURN_NOT_OK(SetupDistributedConfig(master_->opts(), &config));
-    cmeta->set_committed_config(config);
-    RETURN_NOT_OK_PREPEND(cmeta->Flush(),
-                          "Unable to persist consensus metadata for tablet " + tablet_id);
+    // Make sure the set of masters passed in at start time matches the set in
+    // the on-disk cmeta.
+    set<string> peer_addrs_from_opts;
+    for (const auto& hp : master_->opts().master_addresses) {
+      peer_addrs_from_opts.insert(hp.ToString());
+    }
+    set<string> peer_addrs_from_disk;
+    for (const auto& p : cstate.config().peers()) {
+      HostPort hp;
+      RETURN_NOT_OK(HostPortFromPB(p.last_known_addr(), &hp));
+      peer_addrs_from_disk.insert(hp.ToString());
+    }
+    vector<string> symm_diff;
+    std::set_symmetric_difference(peer_addrs_from_opts.begin(),
+                                  peer_addrs_from_opts.end(),
+                                  peer_addrs_from_disk.begin(),
+                                  peer_addrs_from_disk.end(),
+                                  std::back_inserter(symm_diff));
+    if (!symm_diff.empty()) {
+      string msg = Substitute(
+          "on-disk and provided master lists are different: $0",
+          JoinStrings(symm_diff, " "));
+      return Status::InvalidArgument(msg);
+    }
   }
 
   RETURN_NOT_OK(SetupTablet(metadata));
@@ -143,7 +165,7 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
 
   vector<KuduPartialRow> split_rows;
   vector<Partition> partitions;
-  RETURN_NOT_OK(partition_schema.CreatePartitions(split_rows, schema, &partitions));
+  RETURN_NOT_OK(partition_schema.CreatePartitions(split_rows, {}, schema, &partitions));
   DCHECK_EQ(1, partitions.size());
 
   RETURN_NOT_OK(tablet::TabletMetadata::CreateNew(fs_manager,
@@ -157,10 +179,10 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
 
   RaftConfigPB config;
   if (master_->opts().IsDistributed()) {
-    RETURN_NOT_OK_PREPEND(SetupDistributedConfig(master_->opts(), &config),
-                          "Failed to initialize distributed config");
+    RETURN_NOT_OK_PREPEND(CreateDistributedConfig(master_->opts(), &config),
+                          "Failed to create new distributed Raft config");
   } else {
-    config.set_local(true);
+    config.set_obsolete_local(true);
     config.set_opid_index(consensus::kInvalidOpIdIndex);
     RaftPeerPB* peer = config.add_peers();
     peer->set_permanent_uuid(fs_manager->uuid());
@@ -168,7 +190,7 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
   }
 
   string tablet_id = metadata->tablet_id();
-  gscoped_ptr<ConsensusMetadata> cmeta;
+  unique_ptr<ConsensusMetadata> cmeta;
   RETURN_NOT_OK_PREPEND(ConsensusMetadata::Create(fs_manager, tablet_id, fs_manager->uuid(),
                                                   config, consensus::kMinimumTerm, &cmeta),
                         "Unable to persist consensus metadata for tablet " + tablet_id);
@@ -176,12 +198,12 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
   return SetupTablet(metadata);
 }
 
-Status SysCatalogTable::SetupDistributedConfig(const MasterOptions& options,
-                                               RaftConfigPB* committed_config) {
+Status SysCatalogTable::CreateDistributedConfig(const MasterOptions& options,
+                                                RaftConfigPB* committed_config) {
   DCHECK(options.IsDistributed());
 
   RaftConfigPB new_config;
-  new_config.set_local(false);
+  new_config.set_obsolete_local(false);
   new_config.set_opid_index(consensus::kInvalidOpIdIndex);
 
   // Build the set of followers from our server options.
@@ -207,9 +229,6 @@ Status SysCatalogTable::SetupDistributedConfig(const MasterOptions& options,
       LOG(INFO) << peer.ShortDebugString()
                 << " has no permanent_uuid. Determining permanent_uuid...";
       RaftPeerPB new_peer = peer;
-      // TODO: Use ConsensusMetadata to cache the results of these lookups so
-      // we only require RPC access to the full consensus configuration on first startup.
-      // See KUDU-526.
       RETURN_NOT_OK_PREPEND(consensus::SetPermanentUuidForRemotePeer(master_->messenger(),
                                                                      &new_peer),
                             Substitute("Unable to resolve UUID for peer $0",
@@ -239,8 +258,7 @@ void SysCatalogTable::SysCatalogStateChanged(const string& tablet_id, const stri
                         << "Latest consensus state: " << cstate.ShortDebugString();
   RaftPeerPB::Role new_role = GetConsensusRole(tablet_peer_->permanent_uuid(), cstate);
   LOG_WITH_PREFIX(INFO) << "This master's current role is: "
-                        << RaftPeerPB::Role_Name(new_role)
-                        << ", previous role was: " << RaftPeerPB::Role_Name(old_role_);
+                        << RaftPeerPB::Role_Name(new_role);
   if (new_role == RaftPeerPB::LEADER) {
     Status s = leader_cb_.Run();
 
@@ -270,8 +288,9 @@ Status SysCatalogTable::SetupTablet(const scoped_refptr<tablet::TabletMetadata>&
   RETURN_NOT_OK(BootstrapTablet(metadata,
                                 scoped_refptr<server::Clock>(master_->clock()),
                                 master_->mem_tracker(),
+                                scoped_refptr<rpc::ResultTracker>(),
                                 metric_registry_,
-                                tablet_peer_->status_listener(),
+                                implicit_cast<TabletStatusListener*>(tablet_peer_.get()),
                                 &tablet,
                                 &log,
                                 tablet_peer_->log_anchor_registry(),
@@ -283,6 +302,7 @@ Status SysCatalogTable::SetupTablet(const scoped_refptr<tablet::TabletMetadata>&
   RETURN_NOT_OK_PREPEND(tablet_peer_->Init(tablet,
                                            scoped_refptr<server::Clock>(master_->clock()),
                                            master_->messenger(),
+                                           scoped_refptr<rpc::ResultTracker>(),
                                            log,
                                            tablet->GetMetricEntity()),
                         "Failed to Init() TabletPeer");
@@ -334,7 +354,10 @@ Status SysCatalogTable::SyncWrite(const WriteRequestPB *req, WriteResponsePB *re
   gscoped_ptr<tablet::TransactionCompletionCallback> txn_callback(
     new LatchTransactionCompletionCallback<WriteResponsePB>(&latch, resp));
   unique_ptr<tablet::WriteTransactionState> tx_state(
-      new tablet::WriteTransactionState(tablet_peer_.get(), req, resp));
+      new tablet::WriteTransactionState(tablet_peer_.get(),
+                                        req,
+                                        nullptr, // No RequestIdPB
+                                        resp));
   tx_state->set_completion_callback(std::move(txn_callback));
 
   RETURN_NOT_OK(tablet_peer_->SubmitWrite(std::move(tx_state)));
@@ -419,8 +442,8 @@ Status SysCatalogTable::ReqAddTable(WriteRequestPB* req, const TableInfo* table)
 
   KuduPartialRow row(&schema_);
   CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLES_ENTRY));
-  CHECK_OK(row.SetString(kSysCatalogTableColId, table->id()));
-  CHECK_OK(row.SetString(kSysCatalogTableColMetadata, metadata_buf));
+  CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, table->id()));
+  CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColMetadata, metadata_buf));
   RowOperationsPBEncoder enc(req->mutable_row_operations());
   enc.Add(RowOperationsPB::INSERT, row);
   return Status::OK();
@@ -435,8 +458,8 @@ Status SysCatalogTable::ReqUpdateTable(WriteRequestPB* req, const TableInfo* tab
 
   KuduPartialRow row(&schema_);
   CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLES_ENTRY));
-  CHECK_OK(row.SetString(kSysCatalogTableColId, table->id()));
-  CHECK_OK(row.SetString(kSysCatalogTableColMetadata, metadata_buf));
+  CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, table->id()));
+  CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColMetadata, metadata_buf));
   RowOperationsPBEncoder enc(req->mutable_row_operations());
   enc.Add(RowOperationsPB::UPDATE, row);
   return Status::OK();
@@ -445,7 +468,7 @@ Status SysCatalogTable::ReqUpdateTable(WriteRequestPB* req, const TableInfo* tab
 Status SysCatalogTable::ReqDeleteTable(WriteRequestPB* req, const TableInfo* table) {
   KuduPartialRow row(&schema_);
   CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLES_ENTRY));
-  CHECK_OK(row.SetString(kSysCatalogTableColId, table->id()));
+  CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, table->id()));
   RowOperationsPBEncoder enc(req->mutable_row_operations());
   enc.Add(RowOperationsPB::DELETE, row);
   return Status::OK();
@@ -456,7 +479,9 @@ Status SysCatalogTable::VisitTables(TableVisitor* visitor) {
 
   const int8_t tables_entry = TABLES_ENTRY;
   const int type_col_idx = schema_.find_column(kSysCatalogTableColType);
-  CHECK(type_col_idx != Schema::kColumnNotFound);
+  CHECK(type_col_idx != Schema::kColumnNotFound)
+      << "Cannot find sys catalog table column " << kSysCatalogTableColType << " in schema: "
+      << schema_.ToString();
 
   auto pred_tables = ColumnPredicate::Equality(schema_.column(type_col_idx), &tables_entry);
   ScanSpec spec;
@@ -510,8 +535,8 @@ Status SysCatalogTable::ReqAddTablets(WriteRequestPB* req,
     }
 
     CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLETS_ENTRY));
-    CHECK_OK(row.SetString(kSysCatalogTableColId, tablet->tablet_id()));
-    CHECK_OK(row.SetString(kSysCatalogTableColMetadata, metadata_buf));
+    CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, tablet->tablet_id()));
+    CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColMetadata, metadata_buf));
     enc.Add(RowOperationsPB::INSERT, row);
   }
 
@@ -530,8 +555,8 @@ Status SysCatalogTable::ReqUpdateTablets(WriteRequestPB* req,
     }
 
     CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLETS_ENTRY));
-    CHECK_OK(row.SetString(kSysCatalogTableColId, tablet->tablet_id()));
-    CHECK_OK(row.SetString(kSysCatalogTableColMetadata, metadata_buf));
+    CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, tablet->tablet_id()));
+    CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColMetadata, metadata_buf));
     enc.Add(RowOperationsPB::UPDATE, row);
   }
 
@@ -544,7 +569,7 @@ Status SysCatalogTable::ReqDeleteTablets(WriteRequestPB* req,
   RowOperationsPBEncoder enc(req->mutable_row_operations());
   for (auto tablet : tablets) {
     CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLETS_ENTRY));
-    CHECK_OK(row.SetString(kSysCatalogTableColId, tablet->tablet_id()));
+    CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, tablet->tablet_id()));
     enc.Add(RowOperationsPB::DELETE, row);
   }
 

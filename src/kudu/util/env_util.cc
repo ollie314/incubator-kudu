@@ -16,18 +16,57 @@
 // under the License.
 
 #include <algorithm>
-#include <memory>
-
+#include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <memory>
 #include <string>
+#include <utility>
 
+#include "kudu/gutil/map-util.h"
+#include "kudu/gutil/strings/numbers.h"
+#include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/strings/util.h"
+#include "kudu/util/debug-util.h"
 #include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
 #include "kudu/util/status.h"
+#include "kudu/util/flag_tags.h"
 
-using strings::Substitute;
+DEFINE_int64(disk_reserved_bytes_free_for_testing, -1,
+             "For testing only! Set to number of bytes free on each filesystem. "
+             "Set to -1 to disable this test-specific override");
+TAG_FLAG(disk_reserved_bytes_free_for_testing, runtime);
+TAG_FLAG(disk_reserved_bytes_free_for_testing, unsafe);
+
+// We define some flags for testing purposes: Two prefixes and their associated
+// "bytes free" overrides.
+DEFINE_string(disk_reserved_override_prefix_1_path_for_testing, "",
+              "For testing only! Specifies a prefix to override the visible 'bytes free' on. "
+              "Use --disk_reserved_override_prefix_1_bytes_free_for_testing to set the number of "
+              "bytes free for this path prefix. Set to empty string to disable.");
+DEFINE_int64(disk_reserved_override_prefix_1_bytes_free_for_testing, -1,
+             "For testing only! Set number of bytes free on the path prefix specified by "
+             "--disk_reserved_override_prefix_1_path_for_testing. Set to -1 to disable.");
+DEFINE_string(disk_reserved_override_prefix_2_path_for_testing, "",
+              "For testing only! Specifies a prefix to override the visible 'bytes free' on. "
+              "Use --disk_reserved_override_prefix_2_bytes_free_for_testing to set the number of "
+              "bytes free for this path prefix. Set to empty string to disable.");
+DEFINE_int64(disk_reserved_override_prefix_2_bytes_free_for_testing, -1,
+             "For testing only! Set number of bytes free on the path prefix specified by "
+             "--disk_reserved_override_prefix_2_path_for_testing. Set to -1 to disable.");
+//DEFINE_string(disk_reserved_prefixes_with_bytes_free_for_testing, "",
+//             "For testing only! Syntax: '/path/a:5,/path/b:7' means a has 5 bytes free, "
+//             "b has 7 bytes free. Set to empty string to disable this test-specific override.");
+TAG_FLAG(disk_reserved_override_prefix_1_path_for_testing, unsafe);
+TAG_FLAG(disk_reserved_override_prefix_2_path_for_testing, unsafe);
+TAG_FLAG(disk_reserved_override_prefix_1_bytes_free_for_testing, unsafe);
+TAG_FLAG(disk_reserved_override_prefix_2_bytes_free_for_testing, unsafe);
+TAG_FLAG(disk_reserved_override_prefix_1_bytes_free_for_testing, runtime);
+TAG_FLAG(disk_reserved_override_prefix_2_bytes_free_for_testing, runtime);
+
 using std::shared_ptr;
+using strings::Substitute;
 
 namespace kudu {
 namespace env_util {
@@ -59,6 +98,47 @@ Status OpenFileForSequential(Env *env, const string &path,
   gscoped_ptr<SequentialFile> r;
   RETURN_NOT_OK(env->NewSequentialFile(path, &r));
   file->reset(r.release());
+  return Status::OK();
+}
+
+// If any of the override gflags specifies an override for the given path, then
+// override the free bytes to match what is specified in the flag. See the
+// definitions of these test-only flags for more information.
+static void OverrideBytesFreeWithTestingFlags(const string& path, int64_t* bytes_free) {
+  const string* prefixes[] = { &FLAGS_disk_reserved_override_prefix_1_path_for_testing,
+                               &FLAGS_disk_reserved_override_prefix_2_path_for_testing };
+  const int64_t* overrides[] = { &FLAGS_disk_reserved_override_prefix_1_bytes_free_for_testing,
+                                 &FLAGS_disk_reserved_override_prefix_2_bytes_free_for_testing };
+  for (int i = 0; i < arraysize(prefixes); i++) {
+    if (*overrides[i] != -1 && !prefixes[i]->empty() && HasPrefixString(path, *prefixes[i])) {
+      *bytes_free = *overrides[i];
+      return;
+    }
+  }
+}
+
+Status VerifySufficientDiskSpace(Env *env, const std::string& path,
+                                 int64_t requested_bytes, int64_t reserved_bytes) {
+  DCHECK_GE(requested_bytes, 0);
+
+  int64_t bytes_free;
+  RETURN_NOT_OK(env->GetBytesFree(path, &bytes_free));
+
+  // Allow overriding these values by tests.
+  if (PREDICT_FALSE(FLAGS_disk_reserved_bytes_free_for_testing > -1)) {
+    bytes_free = FLAGS_disk_reserved_bytes_free_for_testing;
+  }
+  if (PREDICT_FALSE(FLAGS_disk_reserved_override_prefix_1_bytes_free_for_testing != -1 ||
+                    FLAGS_disk_reserved_override_prefix_2_bytes_free_for_testing != -1)) {
+    OverrideBytesFreeWithTestingFlags(path, &bytes_free);
+  }
+
+  if (bytes_free - requested_bytes < reserved_bytes) {
+    return Status::IOError(Substitute("Insufficient disk space to allocate $0 bytes under path $1 "
+                                      "($2 bytes free vs $3 bytes reserved)",
+                                      requested_bytes, path, bytes_free, reserved_bytes),
+                           "", ENOSPC);
+  }
   return Status::OK();
 }
 

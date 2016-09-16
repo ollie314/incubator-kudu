@@ -40,11 +40,14 @@ set(CLIENT_SRCS
   scan_predicate.cc
   scan_token-internal.cc
   scanner-internal.cc
+  replica-internal.cc
+  resource_metrics.cc
   schema.cc
   session-internal.cc
   table-internal.cc
   table_alterer-internal.cc
   table_creator-internal.cc
+  tablet-internal.cc
   tablet_server-internal.cc
   value.cc
   write_op.cc
@@ -176,6 +179,7 @@ install(FILES
   stubs.h
   value.h
   write_op.h
+  resource_metrics.h
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/kudu/client)
 
 # Headers: common
