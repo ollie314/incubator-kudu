@@ -37,7 +37,6 @@
 namespace kudu {
 
 class HostPort;
-class ReplicaState;
 class ThreadPool;
 
 namespace rpc {
@@ -100,7 +99,7 @@ class ReplicaState {
                std::unique_ptr<ConsensusMetadata> cmeta,
                ReplicaTransactionFactory* txn_factory);
 
-  Status StartUnlocked(const OpId& last_in_wal);
+  Status StartUnlocked(const OpId& last_id_in_wal);
 
   // Locks a replica in preparation for StartUnlocked(). Makes
   // sure the replica is in kInitialized state.
@@ -185,7 +184,7 @@ class ReplicaState {
   // Changes the committed config for this replica. Checks that there is a
   // pending configuration and that it is equal to this one. Persists changes to disk.
   // Resets the pending configuration to null.
-  Status SetCommittedConfigUnlocked(const RaftConfigPB& new_config);
+  Status SetCommittedConfigUnlocked(const RaftConfigPB& committed_config);
 
   // Return the persisted configuration.
   const RaftConfigPB& GetCommittedConfigUnlocked() const;
@@ -194,9 +193,19 @@ class ReplicaState {
   // otherwise return the committed configuration.
   const RaftConfigPB& GetActiveConfigUnlocked() const;
 
+  // Enum for the 'flush' argument to SetCurrentTermUnlocked() below.
+  enum FlushToDisk {
+    SKIP_FLUSH_TO_DISK,
+    FLUSH_TO_DISK
+  };
+
   // Checks if the term change is legal. If so, sets 'current_term'
   // to 'new_term' and sets 'has voted' to no for the current term.
-  Status SetCurrentTermUnlocked(int64_t new_term) WARN_UNUSED_RESULT;
+  //
+  // If the caller knows that it will call another method soon after
+  // to flush the change to disk, it may set 'flush' to 'SKIP_FLUSH_TO_DISK'.
+  Status SetCurrentTermUnlocked(int64_t new_term,
+                                FlushToDisk flush) WARN_UNUSED_RESULT;
 
   // Returns the term set in the last config change round.
   const int64_t GetCurrentTermUnlocked() const;
@@ -277,18 +286,6 @@ class ReplicaState {
   // latest index). This must be called under the lock.
   OpId GetLastPendingTransactionOpIdUnlocked() const;
 
-  // Updates the last committed operation including removing it from the pending commits.
-  //
-  // 'commit_op_id' refers to the OpId of the actual commit operation, whereas
-  // 'committed_op_id' refers to the OpId of the original REPLICATE message which was
-  // committed.
-  //
-  // This must be called under a lock.
-  void UpdateReplicaCommittedOpIdUnlocked(const OpId& committed_op_id);
-
-  // Waits for already triggered Apply()s to commit.
-  Status WaitForOustandingApplies();
-
   // Used by replicas to cancel pending transactions. Pending transaction are those
   // that have completed prepare/replicate but are waiting on the LEADER's commit
   // to complete. This does not cancel transactions being applied.
@@ -325,6 +322,10 @@ class ReplicaState {
   // Return the current state of this object.
   // The update_lock_ must be held.
   ReplicaState::State state() const;
+
+  ConsensusMetadata* consensus_metadata_for_tests() {
+    return cmeta_.get();
+  }
 
  private:
   const ConsensusOptions options_;

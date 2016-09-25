@@ -52,7 +52,7 @@ ConsensusRound::ConsensusRound(Consensus* consensus,
     : consensus_(consensus),
       replicate_msg_(replicate_msg),
       bound_term_(-1) {
-  DCHECK_NOTNULL(replicate_msg_.get());
+  DCHECK(replicate_msg_);
 }
 
 void ConsensusRound::NotifyReplicationFinished(const Status& status) {
@@ -86,7 +86,7 @@ const shared_ptr<Consensus::ConsensusFaultHooks>& Consensus::GetFaultHooks() con
 }
 
 Status Consensus::ExecuteHook(HookPoint point) {
-  if (PREDICT_FALSE(fault_hooks_.get() != nullptr)) {
+  if (PREDICT_FALSE(fault_hooks_ != nullptr)) {
     switch (point) {
       case Consensus::PRE_START: return fault_hooks_->PreStart();
       case Consensus::POST_START: return fault_hooks_->PostStart();

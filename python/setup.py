@@ -32,7 +32,7 @@ if Cython.__version__ < '0.21.0':
     raise Exception('Please upgrade to Cython 0.21.0 or newer')
 
 MAJOR = 0
-MINOR = 3
+MINOR = 4
 MICRO = 0
 VERSION = '%d.%d.%d' % (MAJOR, MINOR, MICRO)
 ISRELEASED = True
@@ -155,7 +155,7 @@ setup(
     },
     setup_requires=['pytest-runner'],
     tests_require=['pytest', 'multiprocessing'],
-    install_requires=['cython >= 0.21'],
+    install_requires=['cython >= 0.21', 'pytz', 'six'],
     description=DESCRIPTION,
     long_description=LONG_DESCRIPTION,
     license='Apache License, Version 2.0',

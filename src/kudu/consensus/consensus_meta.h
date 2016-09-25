@@ -17,8 +17,8 @@
 #ifndef KUDU_CONSENSUS_CONSENSUS_META_H_
 #define KUDU_CONSENSUS_CONSENSUS_META_H_
 
+#include <cstdint>
 #include <memory>
-#include <stdint.h>
 #include <string>
 
 #include "kudu/consensus/metadata.pb.h"
@@ -63,7 +63,7 @@ class ConsensusMetadata {
                        const std::string& peer_uuid,
                        const RaftConfigPB& config,
                        int64_t current_term,
-                       std::unique_ptr<ConsensusMetadata>* cmeta);
+                       std::unique_ptr<ConsensusMetadata>* cmeta_out);
 
   // Load a ConsensusMetadata object from disk.
   // Returns Status::NotFound if the file could not be found. May return other
@@ -71,7 +71,7 @@ class ConsensusMetadata {
   static Status Load(FsManager* fs_manager,
                      const std::string& tablet_id,
                      const std::string& peer_uuid,
-                     std::unique_ptr<ConsensusMetadata>* cmeta);
+                     std::unique_ptr<ConsensusMetadata>* cmeta_out);
 
   // Delete the ConsensusMetadata file associated with the given tablet from
   // disk.
@@ -138,6 +138,10 @@ class ConsensusMetadata {
   // Persist current state of the protobuf to disk.
   Status Flush();
 
+  int flush_count_for_tests() const {
+    return flush_count_for_tests_;
+  }
+
  private:
   ConsensusMetadata(FsManager* fs_manager, std::string tablet_id,
                     std::string peer_uuid);
@@ -161,6 +165,9 @@ class ConsensusMetadata {
 
   // Cached role of the peer_uuid_ within the active configuration.
   RaftPeerPB::Role active_role_;
+
+  // The number of times the metadata has been flushed to disk.
+  int flush_count_for_tests_;
 
   // Durable fields.
   ConsensusMetadataPB pb_;
