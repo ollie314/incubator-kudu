@@ -1606,7 +1606,6 @@ int64_t SumResults(const KuduScanBatch& batch) {
 TEST_F(ClientTest, TestScannerKeepAlive) {
   ASSERT_NO_FATAL_FAILURE(InsertTestRows(client_table_.get(), 1000));
   // Set the scanner ttl really low
-  ANNOTATE_BENIGN_RACE(&FLAGS_scanner_ttl_ms, "Set at runtime, for tests.");
   FLAGS_scanner_ttl_ms = 100; // 100 milliseconds
   // Start a scan but don't get the whole data back
   KuduScanner scanner(client_table_.get());
@@ -2427,6 +2426,28 @@ TEST_F(ClientTest, TestFlushModesCompareOpRatesRandomSize) {
                     &t_afs);
   // AUTO_FLUSH_BACKGROUND should be faster than AUTO_FLUSH_SYNC.
   EXPECT_GT(t_afs.wall, t_afb.wall);
+}
+
+// A test to verify that it's safe to perform synchronous and/or asynchronous
+// flush while having the auto-flusher thread running in the background.
+TEST_F(ClientTest, TestAutoFlushBackgroundAndExplicitFlush) {
+  const size_t kIterNum = AllowSlowTests() ? 8192 : 1024;
+  shared_ptr<KuduSession> session(client_->NewSession());
+  // The background flush interval is short to have more contention.
+  ASSERT_OK(session->SetMutationBufferFlushInterval(3));
+  ASSERT_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_BACKGROUND));
+  for (size_t i = 0; i < kIterNum; i += 2) {
+    ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, i, i, "x"));
+    SleepFor(MonoDelta::FromMilliseconds(1));
+    session->FlushAsync(nullptr);
+    ASSERT_OK(ApplyInsertToSession(session.get(), client_table_, i + 1, i + 1, "y"));
+    SleepFor(MonoDelta::FromMilliseconds(1));
+    ASSERT_OK(session->Flush());
+  }
+  EXPECT_EQ(0, session->CountPendingErrors());
+  EXPECT_FALSE(session->HasPendingOperations());
+  // Check that all rows have reached the table.
+  EXPECT_EQ(kIterNum, CountRowsFromClient(client_table_.get()));
 }
 
 // A test which verifies that a session in AUTO_FLUSH_BACKGROUND mode can

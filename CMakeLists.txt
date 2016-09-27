@@ -15,12 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Require cmake that supports BYPRODUCTS in add_custom_command() [1].
+# Require cmake that can build LLVM [1].
 #
 # Note: cmake in thirdparty/ will always meet this minimum.
 #
-# 1. https://cmake.org/Bug/view.php?id=14963
-cmake_minimum_required(VERSION 3.2.0)
+# 1. http://llvm.org/releases/3.9.0/docs/ReleaseNotes.html
+cmake_minimum_required(VERSION 3.4.3)
 
 # Prevent builds from the top-level source directory. This ensures that build
 # output is well isolated from the source tree.
@@ -86,6 +86,14 @@ set(BUILD_SUPPORT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/build-support)
 #
 # Must be declared in the top-level CMakeLists.txt.
 set(CMAKE_SKIP_INSTALL_ALL_DEPENDENCY true)
+
+# Codegen-dependent executables need to be linked with -rdynamic; otherwise LLVM
+# can't find dependent Kudu symbols at runtime.
+#
+# Setting the ENABLE_EXPORTS target property for each codegen-dependent
+# executable is more precise, but that's a rather long target list, so we'll
+# just do it once here for all Kudu executables.
+set(CMAKE_ENABLE_EXPORTS true)
 
 # Make sure thirdparty stuff is up-to-date.
 if ("$ENV{NO_REBUILD_THIRDPARTY}" STREQUAL "")
@@ -220,6 +228,11 @@ if ("${COMPILER_FAMILY}" STREQUAL "clang")
 
   # Clang generates ambiguous member template warnings when calling the ev++ api.
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-ambiguous-member-template")
+
+  # Emit a warning when the method/function marked as deprecated
+  # in its in-line documentation but lacks the deprecated attribute
+  # ATTRIBUTE_DEPRECATED in its signature.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wdocumentation-deprecated-sync")
 
   # Only hardcode -fcolor-diagnostics if stderr is opened on a terminal. Otherwise
   # the color codes show up as noisy artifacts.
@@ -604,6 +617,15 @@ endfunction()
 # Testing
 ############################################################
 
+# Add a new binary that is compiled just like a unit test but is not executed
+# by or registered with "ctest". Useful for writing tests that use the Google
+# Test infrastructure but cannot or should not be run pre-commit.
+function(ADD_KUDU_TEST_NO_CTEST REL_TEST_NAME)
+  get_filename_component(TEST_NAME ${REL_TEST_NAME} NAME_WE)
+  add_executable(${TEST_NAME} "${REL_TEST_NAME}.cc")
+  target_link_libraries(${TEST_NAME} ${KUDU_TEST_LINK_LIBS})
+endfunction()
+
 # Add a new test case, with or without an executable that should be built.
 #
 # REL_TEST_NAME is the name of the test. It may be a single component
@@ -616,13 +638,13 @@ function(ADD_KUDU_TEST REL_TEST_NAME)
   if(NO_TESTS)
     return()
   endif()
+
   get_filename_component(TEST_NAME ${REL_TEST_NAME} NAME_WE)
 
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${REL_TEST_NAME}.cc)
     # This test has a corresponding .cc file, set it up as an executable.
     set(TEST_PATH "${EXECUTABLE_OUTPUT_PATH}/${TEST_NAME}")
-    add_executable(${TEST_NAME} "${REL_TEST_NAME}.cc")
-    target_link_libraries(${TEST_NAME} ${KUDU_TEST_LINK_LIBS})
+    ADD_KUDU_TEST_NO_CTEST(${REL_TEST_NAME})
   else()
     # No executable, just invoke the test (probably a script) directly.
     get_filename_component(TEST_NAME_WITH_EXT ${REL_TEST_NAME} NAME)

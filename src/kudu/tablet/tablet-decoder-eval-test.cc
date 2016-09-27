@@ -24,6 +24,11 @@
 #include "kudu/common/schema.h"
 #include "kudu/tablet/tablet-test-base.h"
 
+DEFINE_int32(decoder_eval_test_nrepeats, 1, "Number of times to repeat per tablet");
+DEFINE_int32(decoder_eval_test_lower, 0, "Lower bound on the predicate [lower, upper)");
+DEFINE_int32(decoder_eval_test_upper, 50, "Upper bound on the predicate [lower, upper)");
+DEFINE_int32(decoder_eval_test_strlen, 10, "Number of strings per cell");
+
 namespace kudu {
 namespace tablet {
 
@@ -31,16 +36,11 @@ using strings::Substitute;
 
 enum Setup {
 #ifdef ADDRESS_SANITIZER
-  SMALL = 100, MEDIUM = 3000, LARGE = 10000
+  EMPTY = 0, SMALL = 100, MEDIUM = 3000, LARGE = 10000
 #else
-  SMALL = 100, MEDIUM = 5000, LARGE = 100000
+  EMPTY = 0, SMALL = 100, MEDIUM = 5000, LARGE = 100000
 #endif
 };
-
-DEFINE_int32(decoder_eval_test_nrepeats, 1, "Number of times to repeat per tablet");
-DEFINE_int32(decoder_eval_test_lower, 0, "Lower bound on the predicate [lower, upper)");
-DEFINE_int32(decoder_eval_test_upper, 50, "Upper bound on the predicate [lower, upper)");
-DEFINE_int32(decoder_eval_test_strlen, 10, "Number of strings per cell");
 
 class TabletDecoderEvalTest : public KuduTabletTest,
                               public ::testing::WithParamInterface<Setup> {
@@ -287,6 +287,12 @@ TEST_P(TabletDecoderEvalTest, NullableHighCardinality) {
   TestNullableScanAndFilter(50000, 30, 200, 75);
 }
 
+TEST_P(TabletDecoderEvalTest, CompletelyNullColumn) {
+  // Fill a tablet with pattern [0, 50) but with all values being NULL.
+  // Query for values [30, 50).
+  TestNullableScanAndFilter(50, 30, 50, 50);
+}
+
 TEST_P(TabletDecoderEvalTest, MultipleColumns) {
   // Fill a tablet with pattern [0, 10) and query a:[0, 5) AND b:[3, 10).
   // To be considered correct, returned columns must align as they do in the
@@ -294,7 +300,8 @@ TEST_P(TabletDecoderEvalTest, MultipleColumns) {
   TestMultipleColumnPredicates(10, 3, 5);
 }
 
-INSTANTIATE_TEST_CASE_P(DecoderEvaluation, TabletDecoderEvalTest, ::testing::Values(SMALL,
+INSTANTIATE_TEST_CASE_P(DecoderEvaluation, TabletDecoderEvalTest, ::testing::Values(EMPTY,
+                                                                                    SMALL,
                                                                                     MEDIUM,
                                                                                     LARGE));
 
