@@ -768,10 +768,14 @@ cdef class Column:
                                    len(self.name))
 
         try:
-            if op == 1: # <=
+            if op == 0: # <
+                cmp_op = KUDU_LESS
+            elif op == 1: # <=
                 cmp_op = KUDU_LESS_EQUAL
             elif op == 2: # ==
                 cmp_op = KUDU_EQUAL
+            elif op == 4: # >
+                cmp_op = KUDU_GREATER
             elif op == 5: # >=
                 cmp_op = KUDU_GREATER_EQUAL
             else:
@@ -1403,7 +1407,7 @@ cdef class ScanToken:
         """
         cdef string buf
         check_status(self._token.Serialize(&buf))
-        return frombytes(buf)
+        return buf
 
     def deserialize_into_scanner(self, Client client, serialized_token):
         """
@@ -1422,7 +1426,7 @@ cdef class ScanToken:
         cdef:
             Scanner result = Scanner()
             KuduScanner* _scanner
-        check_status(self._token.DeserializeIntoScanner(client.cp, tobytes(serialized_token), &_scanner))
+        check_status(self._token.DeserializeIntoScanner(client.cp, serialized_token, &_scanner))
         result.scanner = _scanner
         return result
 
