@@ -81,6 +81,11 @@ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake_modules")
 include(CMakeParseArguments)
 
 set(BUILD_SUPPORT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/build-support)
+set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty)
+set(THIRDPARTY_INSTALL_DIR ${THIRDPARTY_DIR}/installed)
+set(THIRDPARTY_INSTALL_COMMON_DIR ${THIRDPARTY_INSTALL_DIR}/common)
+set(THIRDPARTY_INSTALL_UNINSTRUMENTED_DIR ${THIRDPARTY_INSTALL_DIR}/uninstrumented)
+set(THIRDPARTY_INSTALL_TSAN_DIR ${THIRDPARTY_INSTALL_DIR}/tsan)
 
 # Allow "make install" to not depend on all targets.
 #
@@ -97,8 +102,11 @@ set(CMAKE_ENABLE_EXPORTS true)
 
 # Make sure thirdparty stuff is up-to-date.
 if ("$ENV{NO_REBUILD_THIRDPARTY}" STREQUAL "")
+  if (${KUDU_USE_TSAN})
+    set(TP_ARGS "tsan")
+  endif()
   execute_process(
-    COMMAND ${CMAKE_SOURCE_DIR}/thirdparty/build-if-necessary.sh
+    COMMAND ${THIRDPARTY_DIR}/build-if-necessary.sh ${TP_ARGS}
     RESULT_VARIABLE THIRDPARTY_SCRIPT_RESULT)
   if (NOT (${THIRDPARTY_SCRIPT_RESULT} EQUAL 0))
     message(FATAL_ERROR "Thirdparty was built unsuccessfully, terminating.")
@@ -132,15 +140,6 @@ set(CXX_COMMON_FLAGS "-fno-strict-aliasing -msse4.2 -Wall -Wno-sign-compare -Wno
 
 # We want access to the PRI* print format macros.
 add_definitions(-D__STDC_FORMAT_MACROS)
-
-# Explicitly disable the new gcc5 ABI. Until clang supports abi tags [1], Kudu's
-# generated code (which always uses clang) must be built against the old ABI.
-# There's no recourse for using both ABIs in the same process; gcc's advice [2]
-# is to build everything against the old ABI.
-#
-# 1. https://llvm.org/bugs/show_bug.cgi?id=23529
-# 2. https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html
-add_definitions(-D_GLIBCXX_USE_CXX11_ABI=0)
 
 # We want short macros from util/status.h.
 add_definitions(-DKUDU_HEADERS_USE_SHORT_STATUS_MACROS=1)
@@ -351,11 +350,12 @@ if (${KUDU_USE_TSAN})
   add_definitions("-D_GLIBCXX_EXTERN_TEMPLATE=0")
 
   # Compile and link against the thirdparty TSAN instrumented libstdcxx.
-  set(TSAN_GCC_DIR "${CMAKE_SOURCE_DIR}/thirdparty/installed-deps-tsan/gcc")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-rpath,${TSAN_GCC_DIR}/lib -fsanitize=thread")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -nostdinc++ -L${TSAN_GCC_DIR}/lib")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -isystem ${TSAN_GCC_DIR}/include/c++/4.9.3")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -isystem ${TSAN_GCC_DIR}/include/c++/4.9.3/backward")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-rpath,${THIRDPARTY_INSTALL_TSAN_DIR}/lib")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=thread")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -nostdinc++")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -L${THIRDPARTY_INSTALL_TSAN_DIR}/lib")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -isystem ${THIRDPARTY_INSTALL_TSAN_DIR}/include/c++/v1")
 
   # Strictly speaking, TSAN doesn't require dynamic linking. But it does
   # require all code to be position independent, and the easiest way to
@@ -733,14 +733,11 @@ function(ADD_THIRDPARTY_LIB LIB_NAME)
 endfunction()
 
 # Look in thirdparty prefix paths before anywhere else for system dependencies.
-set(THIRDPARTY_PREFIX ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/installed)
-set(CMAKE_PREFIX_PATH ${THIRDPARTY_PREFIX} ${CMAKE_PREFIX_PATH})
+set(CMAKE_PREFIX_PATH ${THIRDPARTY_INSTALL_COMMON_DIR} ${CMAKE_PREFIX_PATH})
 if (${KUDU_USE_TSAN})
-  set(CMAKE_PREFIX_PATH ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/installed-deps-tsan
-      ${CMAKE_PREFIX_PATH})
+  set(CMAKE_PREFIX_PATH ${THIRDPARTY_INSTALL_TSAN_DIR} ${CMAKE_PREFIX_PATH})
 else()
-  set(CMAKE_PREFIX_PATH ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/installed-deps
-      ${CMAKE_PREFIX_PATH})
+  set(CMAKE_PREFIX_PATH ${THIRDPARTY_INSTALL_UNINSTRUMENTED_DIR} ${CMAKE_PREFIX_PATH})
 endif()
 
 ## Cyrus SASL
@@ -881,7 +878,6 @@ ADD_THIRDPARTY_LIB(crcutil
 ## llvm
 # Note that llvm has a unique cmake setup. See kudu/codegen/CMakeLists.txt
 # for details.
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${THIRDPARTY_PREFIX}/share/llvm)
 find_package(LLVM REQUIRED CONFIG)
 if(${LLVM_PACKAGE_VERSION} VERSION_LESS 3.4)
   message(FATAL_ERROR "LLVM version (${LLVM_PACKAGE_VERSION}) must be at least 3.4")
@@ -913,7 +909,7 @@ endif()
 set(Boost_NO_BOOST_CMAKE ON)
 
 # Look for Boost in thirdparty only.
-set(BOOST_ROOT ${THIRDPARTY_PREFIX})
+set(BOOST_ROOT ${THIRDPARTY_INSTALL_COMMON_DIR})
 
 # As of cmake 3.5, there's still no way to force FindBoost.cmake to omit system
 # paths from its search. No combination of Boost_NO_SYSTEM_PATHS, BOOST_ROOT, or

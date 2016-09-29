@@ -62,7 +62,6 @@ popd
 for include_file in $(find $LIBRARY_DIR -name \*.h) ; do
   echo Checking standalone compilation of $include_file...
   if ! ${CXX:-g++} \
-       -D_GLIBCXX_USE_CXX11_ABI=0 \
        -o /dev/null \
        -I$LIBRARY_DIR/usr/local/include \
        $include_file ; then
@@ -76,28 +75,13 @@ for include_file in $(find $LIBRARY_DIR -name \*.h) ; do
   fi
 done
 
-# Test that client.h prohibits compilation with GCC 5's new ABI. Obviously the
-# macro below will only be set if building with GCC 5; we set it manually for
-# the purpose of the test.
-if ${CXX:-g++} \
-       -o /dev/null \
-       -D_GLIBCXX_USE_CXX11_ABI=1 \
-       -I$LIBRARY_DIR/usr/local/include \
-       $LIBRARY_DIR/usr/local/include/kudu/client/client.h ; then
-    echo
-    echo ---------------------------------------------
-    echo "GCC 5 new ABI conftest unexpectedly passed!"
-    echo ---------------------------------------------
-    exit 1
-fi
-
 # Prefer the cmake on the system path, since we expect our client library
 # to be usable with older versions of cmake. But if it isn't there,
 # use the one from thirdparty.
 CMAKE=$(which cmake || :)
 if [ -z "$CMAKE" ]; then
   # TODO: temporary hack which assumes this script is in src/build/<type>/bin
-  CMAKE=$OUTPUT_DIR/../../../thirdparty/installed/bin/cmake
+  CMAKE=$OUTPUT_DIR/../../../thirdparty/installed/common/bin/cmake
 fi
 
 # Build the client samples using the client library.
