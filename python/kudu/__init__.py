@@ -21,15 +21,17 @@ from kudu.client import (Client, Table, Scanner, Session,  # noqa
                          ScanToken,
                          FLUSH_AUTO_BACKGROUND,
                          FLUSH_AUTO_SYNC,
-                         FLUSH_MANUAL)
+                         FLUSH_MANUAL,
+                         READ_LATEST,
+                         READ_AT_SNAPSHOT)
 
 from kudu.errors import (KuduException, KuduBadStatus, KuduNotFound,  # noqa
                          KuduNotSupported,
                          KuduInvalidArgument)
 
 from kudu.schema import (int8, int16, int32, int64, string_ as string,  # noqa
-                         double_ as double, float_, binary,
-                         unixtime_micros,
+                         double_ as double, float_, float_ as float, binary,
+                         unixtime_micros, bool_ as bool,
                          KuduType,
                          SchemaBuilder, ColumnSpec, Schema, ColumnSchema,
                          COMPRESSION_DEFAULT,

@@ -389,6 +389,7 @@ void RaftConsensusITest::AddFlagsForLogRolls(vector<string>* extra_tserver_flags
   extra_tserver_flags->push_back("--log_min_segments_to_retain=1");
   extra_tserver_flags->push_back("--log_max_segments_to_retain=3");
   extra_tserver_flags->push_back("--maintenance_manager_polling_interval_ms=100");
+  extra_tserver_flags->push_back("--log_target_replay_size_mb=1");
 }
 
 // Test that we can retrieve the permanent uuid of a server running
@@ -627,7 +628,8 @@ TEST_F(RaftConsensusITest, TestCatchupAfterOpsEvicted) {
     "--log_async_preallocate_segments=false",
     // Run the maintenance manager frequently so that we don't have to wait
     // long for GC.
-    "--maintenance_manager_polling_interval_ms=100"
+    "--maintenance_manager_polling_interval_ms=100",
+    "--log_target_replay_size_mb=1"
   };
   BuildAndStart(extra_flags);
   TServerDetails* replica = (*tablet_replicas_.begin()).second;
@@ -897,10 +899,9 @@ TEST_F(RaftConsensusITest, TestChurnyElections) {
 }
 
 // The same test, except inject artificial latency when propagating notifications
-// from the queue back to consensus. This can reproduce bugs like KUDU-1078 which
-// normally only appear under high load. TODO: Re-enable once we get to the
-// bottom of KUDU-1078.
-TEST_F(RaftConsensusITest, DISABLED_TestChurnyElections_WithNotificationLatency) {
+// from the queue back to consensus. This previously reproduced bugs like KUDU-1078 which
+// normally only appear under high load.
+TEST_F(RaftConsensusITest, TestChurnyElections_WithNotificationLatency) {
   DoTestChurnyElections(WITH_NOTIFICATION_LATENCY);
 }
 
