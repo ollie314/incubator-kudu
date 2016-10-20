@@ -896,10 +896,17 @@ TEST_F(RaftConsensusQuorumTest, TestLeaderElectionWithQuiescedQuorum) {
 
     // This will force an election in which we expect to make the last
     // non-shutdown peer in the list become leader.
+    int flush_count_before = new_leader->GetReplicaStateForTests()
+        ->consensus_metadata_for_tests()->flush_count_for_tests();
     LOG(INFO) << "Running election for future leader with index " << (current_config_size - 1);
-    ASSERT_OK(new_leader->StartElection(Consensus::ELECT_EVEN_IF_LEADER_IS_ALIVE));
+    ASSERT_OK(new_leader->StartElection(Consensus::ELECT_EVEN_IF_LEADER_IS_ALIVE,
+                                        Consensus::EXTERNAL_REQUEST));
     WaitUntilLeaderForTests(new_leader.get());
     LOG(INFO) << "Election won";
+    int flush_count_after = new_leader->GetReplicaStateForTests()
+        ->consensus_metadata_for_tests()->flush_count_for_tests();
+    ASSERT_EQ(flush_count_after, flush_count_before + 1)
+        << "Expected only one consensus metadata flush for a leader election";
 
     // ... replicating a set of messages to the new leader should now be possible.
     REPLICATE_SEQUENCE_OF_MESSAGES(10,
@@ -1096,6 +1103,21 @@ TEST_F(RaftConsensusQuorumTest, TestRequestVote) {
   ASSERT_NO_FATAL_FAILURE(AssertDurableTermAndVote(kPeerIndex, last_op_id.term() + 2, "peer-0"));
   ASSERT_EQ(0, flush_count() - flush_count_before)
       << "Rejected votes for old terms should not flush";
+
+  // Ensure that replicas don't change term or flush any metadata for a pre-election
+  // request, even when they vote "yes".
+  flush_count_before = flush_count();
+  request.set_candidate_term(last_op_id.term() + 3);
+  request.set_is_pre_election(true);
+  response.Clear();
+  ASSERT_OK(peer->RequestVote(&request, &response));
+  ASSERT_TRUE(response.vote_granted());
+  ASSERT_FALSE(response.has_consensus_error());
+  ASSERT_EQ(last_op_id.term() + 2, response.responder_term());
+  ASSERT_NO_FATAL_FAILURE(AssertDurableTermAndVote(kPeerIndex, last_op_id.term() + 2, "peer-0"));
+  ASSERT_EQ(0, flush_count() - flush_count_before)
+      << "Pre-elections should not flush";
+  request.set_is_pre_election(false);
 
   //
   // Ensure replicas vote no for an old op index.

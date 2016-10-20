@@ -18,7 +18,6 @@ package org.apache.kudu.client;
 
 import org.apache.kudu.Schema;
 import org.apache.kudu.WireProtocol.AppStatusPB;
-import org.apache.kudu.client.AsyncKuduClient.RemoteTablet;
 import org.apache.kudu.tserver.Tserver.TabletServerErrorPB;
 
 import com.stumbleupon.async.Callback;
@@ -123,7 +122,7 @@ public class TestAsyncKuduSession extends BaseKuduTest {
     RemoteTablet rt =
         client.getTableLocationEntry(table.getTableId(), insert.partitionKey()).getTablet();
     String tabletId = rt.getTabletIdAsString();
-    TabletClient tc = client.clientFor(rt);
+    TabletClient tc = rt.getLeaderConnection();
     try {
       // Delete table so we get table not found error.
       client.deleteTable(TABLE_NAME).join();
@@ -195,7 +194,7 @@ public class TestAsyncKuduSession extends BaseKuduTest {
       session.setFlushMode(SessionConfiguration.FlushMode.AUTO_FLUSH_SYNC);
       session.apply(createBasicSchemaInsert(nonReplicatedTable, 1)).join();
 
-      int numClientsBefore = client.ip2client.size();
+      int numClientsBefore = client.getTabletClients().size();
 
       // Restart all the tablet servers.
       killTabletServers();
@@ -206,7 +205,7 @@ public class TestAsyncKuduSession extends BaseKuduTest {
       session.apply(createBasicSchemaInsert(nonReplicatedTable, 2)).join();
 
       // We should not have leaked an entry in the client2tablets map.
-      int numClientsAfter = client.ip2client.size();
+      int numClientsAfter = client.getTabletClients().size();
       assertEquals(numClientsBefore, numClientsAfter);
     } finally {
       restartTabletServers();

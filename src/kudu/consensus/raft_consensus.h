@@ -99,7 +99,7 @@ class RaftConsensus : public Consensus,
   // enabled, as it could result in a split-brain scenario.
   Status EmulateElection() override;
 
-  Status StartElection(ElectionMode mode) override;
+  Status StartElection(ElectionMode mode, ElectionReason reason) override;
 
   Status WaitUntilLeaderForTests(const MonoDelta& timeout) override;
 
@@ -278,7 +278,7 @@ class RaftConsensus : public Consensus,
   Status IsSingleVoterConfig(bool* single_voter) const;
 
   // Return header string for RequestVote log messages. The ReplicaState lock must be held.
-  std::string GetRequestVoteLogPrefixUnlocked() const;
+  std::string GetRequestVoteLogPrefixUnlocked(const VoteRequestPB& request) const;
 
   // Fills the response with the current status, if an update was successful.
   void FillConsensusResponseOKUnlocked(ConsensusResponsePB* response);
@@ -331,8 +331,8 @@ class RaftConsensus : public Consensus,
 
   // Callback for leader election driver. ElectionCallback is run on the
   // reactor thread, so it simply defers its work to DoElectionCallback.
-  void ElectionCallback(const ElectionResult& result);
-  void DoElectionCallback(const ElectionResult& result);
+  void ElectionCallback(ElectionReason reason, const ElectionResult& result);
+  void DoElectionCallback(ElectionReason reason, const ElectionResult& result);
 
   // Start tracking the leader for failures. This typically occurs at startup
   // and when the local peer steps down as leader.
@@ -373,9 +373,6 @@ class RaftConsensus : public Consensus,
   // The maximum delta is capped by 'FLAGS_leader_failure_exp_backoff_max_delta_ms'.
   MonoDelta LeaderElectionExpBackoffDeltaUnlocked();
 
-  // Increment the term to the next term, resetting the current leader, etc.
-  Status IncrementTermUnlocked();
-
   // Handle when the term has advanced beyond the current term.
   //
   // 'flush' may be used to control whether the term change is flushed to disk.
@@ -404,12 +401,23 @@ class RaftConsensus : public Consensus,
                              const RaftConfigPB& committed_config,
                              const std::string& reason);
 
+
+  // Handle the completion of replication of a config change operation.
+  // If 'status' is OK, this takes care of persisting the new configuration
+  // to disk as the committed configuration. A non-OK status indicates that
+  // the replication failed, in which case the pending configuration needs
+  // to be cleared such that we revert back to the old configuration.
+  void CompleteConfigChangeRoundUnlocked(ConsensusRound* round,
+                                         const Status& status);
+
   // Trigger that a non-Transaction ConsensusRound has finished replication.
   // If the replication was successful, an status will be OK. Otherwise, it
   // may be Aborted or some other error status.
   // If 'status' is OK, write a Commit message to the local WAL based on the
   // type of message it is.
   // The 'client_cb' will be invoked at the end of this execution.
+  //
+  // NOTE: this must be called with the ReplicaState lock held.
   void NonTxRoundReplicationFinished(ConsensusRound* round,
                                      const StatusCallback& client_cb,
                                      const Status& status);
@@ -422,6 +430,12 @@ class RaftConsensus : public Consensus,
   // Only virtual and protected for mocking purposes.
   Status StartConsensusOnlyRoundUnlocked(const ReplicateRefPtr& msg);
 
+  // Add a new pending operation to the ReplicaState, including the special handling
+  // necessary if this round contains a configuration change. These rounds must
+  // take effect as soon as they are received, rather than waiting for commitment
+  // (see Diego Ongaro's thesis section 4.1).
+  Status AddPendingOperationUnlocked(const scoped_refptr<ConsensusRound>& round);
+
   // Threadpool for constructing requests to peers, handling RPC callbacks,
   // etc.
   gscoped_ptr<ThreadPool> thread_pool_;
@@ -429,6 +443,10 @@ class RaftConsensus : public Consensus,
   scoped_refptr<log::Log> log_;
   scoped_refptr<server::Clock> clock_;
   gscoped_ptr<PeerProxyFactory> peer_proxy_factory_;
+
+  // When we receive a message from a remote peer telling us to start a transaction, we use
+  // this factory to start it.
+  ReplicaTransactionFactory* txn_factory_;
 
   gscoped_ptr<PeerManager> peer_manager_;
 
@@ -453,6 +471,11 @@ class RaftConsensus : public Consensus,
   // accepts operations from a leader, and passed back so that the leader knows from what
   // point to continue sending operations.
   OpId last_received_cur_leader_;
+
+  // The number of times this node has called and lost a leader election since
+  // the last time it saw a stable leader (either itself or another node).
+  // This is used to calculate back-off of the election timeout.
+  int failed_elections_since_stable_leader_;
 
   const Callback<void(const std::string& reason)> mark_dirty_clbk_;
 

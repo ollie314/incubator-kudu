@@ -91,13 +91,8 @@ class ReplicaState {
 
   typedef std::map<int64_t, scoped_refptr<ConsensusRound> > IndexToRoundMap;
 
-  typedef std::set<int64_t> OutstandingCommits;
-
-  typedef IndexToRoundMap::value_type IndexToRoundEntry;
-
   ReplicaState(ConsensusOptions options, std::string peer_uuid,
-               std::unique_ptr<ConsensusMetadata> cmeta,
-               ReplicaTransactionFactory* txn_factory);
+               std::unique_ptr<ConsensusMetadata> cmeta);
 
   Status StartUnlocked(const OpId& last_id_in_wal);
 
@@ -227,16 +222,11 @@ class ReplicaState {
   // The vote must be set; use HasVotedCurrentTermUnlocked() to check.
   const std::string& GetVotedForCurrentTermUnlocked() const;
 
-  ReplicaTransactionFactory* GetReplicaTransactionFactoryUnlocked() const;
-
   // Returns the uuid of the peer to which this replica state belongs.
   // Safe to call with or without locks held.
   const std::string& GetPeerUuid() const;
 
   const ConsensusOptions& GetOptions() const;
-
-  // Returns the operations that are not consensus committed.
-  void GetUncommittedPendingOperationsUnlocked(std::vector<scoped_refptr<ConsensusRound> >* ops);
 
   // Aborts pending operations after, but not including 'index'. The OpId with 'index'
   // will become our new last received id. If there are pending operations with indexes
@@ -266,9 +256,6 @@ class ReplicaState {
   int64_t GetCommittedIndexUnlocked() const;
   int64_t GetTermWithLastCommittedOpUnlocked() const;
 
-  // Returns OK iff an op from the current term has been committed.
-  Status CheckHasCommittedOpInCurrentTermUnlocked() const;
-
   // Returns the id of the latest pending transaction (i.e. the one with the
   // latest index). This must be called under the lock.
   OpId GetLastPendingTransactionOpIdUnlocked() const;
@@ -277,11 +264,6 @@ class ReplicaState {
   // that have completed prepare/replicate but are waiting on the LEADER's commit
   // to complete. This does not cancel transactions being applied.
   Status CancelPendingTransactions();
-
-  // Used when, for some reason, an operation that failed before it could be considered
-  // a part of the state machine. Basically restores the id gen to the state it was before
-  // generating 'id'.
-  void CancelPendingOperation(const OpId& id);
 
   // Returns the number of transactions that are currently in the pending state
   // i.e. transactions for which Prepare() is done or under way.
@@ -327,10 +309,6 @@ class ReplicaState {
   // received a replicate message from the leader but have yet to be committed.
   // The key is the index of the replicate operation.
   IndexToRoundMap pending_txns_;
-
-  // When we receive a message from a remote peer telling us to start a transaction, we use
-  // this factory to start it.
-  ReplicaTransactionFactory* txn_factory_;
 
   // The OpId of the Apply that was last triggered when the last message from the leader
   // was received. Initialized to MinimumOpId().
