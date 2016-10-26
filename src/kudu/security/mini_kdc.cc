@@ -60,7 +60,9 @@ MiniKdc::MiniKdc(const MiniKdcOptions& options)
 }
 
 MiniKdc::~MiniKdc() {
-  WARN_NOT_OK(Stop(), "Unable to stop MiniKdc");
+  if (kdc_process_) {
+    WARN_NOT_OK(Stop(), "Unable to stop MiniKdc");
+  }
 }
 
 vector<string> MiniKdc::MakeArgv(const vector<string>& in_argv) {
@@ -184,13 +186,11 @@ kdc_tcp_ports = $2
 
 [realms]
 $1 = {
-        max_renewable_life = 7d 0h 0m 0s
         acl_file = $0/kadm5.acl
         admin_keytab = $0/kadm5.keytab
-
         database_name = $0/principal
         key_stash_file = $0/.k5.$1
-        acl_file = $0/kadm5.acl
+        max_renewable_life = 7d 0h 0m 0s
 }
   )";
   string file_contents = strings::Substitute(kFileTemplate, options_.data_root,
@@ -206,13 +206,13 @@ Status MiniKdc::CreateKrb5Conf() const {
     kdc = STDERR
 
 [libdefaults]
-    default_realm = $1
-    dns_lookup_realm = false
-    dns_lookup_kdc = false
-    ticket_lifetime = 24h
-    renew_lifetime = 7d
-    forwardable = true
     default_ccache_name = $2
+    default_realm = $1
+    dns_lookup_kdc = false
+    dns_lookup_realm = false
+    forwardable = true
+    renew_lifetime = 7d
+    ticket_lifetime = 24h
 
     # The KDC is configured to only use TCP, so the client should not prefer UDP.
     udp_preference_limit = 0
@@ -283,7 +283,7 @@ Status MiniKdc::CreateUserPrincipal(const string& username) {
   string kadmin;
   RETURN_NOT_OK(GetBinaryPath("kadmin.local", &kadmin));
   RETURN_NOT_OK(Subprocess::Call(MakeArgv({
-          kadmin, "-q", strings::Substitute("add_principal -pw $0 $0", username, username)})));
+          kadmin, "-q", strings::Substitute("add_principal -pw $0 $0", username)})));
   return Status::OK();
 }
 
