@@ -323,6 +323,9 @@ cdef extern from "kudu/common/partial_row.h" namespace "kudu" nogil:
         Status SetStringCopy(Slice& col_name, Slice& val)
         Status SetStringCopy(int col_idx, Slice& val)
 
+        Status SetBinary(Slice& col_name, Slice& val)
+        Status SetBinary(int col_idx, Slice&val)
+
         Status SetBinaryCopy(const Slice& col_name, const Slice& val)
         Status SetBinaryCopy(int col_idx, const Slice& val)
 
@@ -453,9 +456,9 @@ cdef extern from "kudu/client/value.h" namespace "kudu::client" nogil:
 cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
 
     enum ReplicaSelection" kudu::client::KuduClient::ReplicaSelection":
-        LEADER_ONLY " kudu::client::KuduClient::LEADER_ONLY"
-        CLOSEST_REPLICA " kudu::client::KuduClient::CLOSEST_REPLICA"
-        FIRST_REPLICA " kudu::client::KuduClient::FIRST_REPLICA"
+        ReplicaSelection_Leader " kudu::client::KuduClient::LEADER_ONLY"
+        ReplicaSelection_Closest " kudu::client::KuduClient::CLOSEST_REPLICA"
+        ReplicaSelection_First " kudu::client::KuduClient::FIRST_REPLICA"
 
     enum ReadMode" kudu::client::KuduScanner::ReadMode":
         ReadMode_Latest " kudu::client::KuduScanner::READ_LATEST"
@@ -509,7 +512,11 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
     cdef cppclass KuduTableCreator:
         KuduTableCreator& table_name(string& name)
         KuduTableCreator& schema(KuduSchema* schema)
-        KuduTableCreator& add_hash_partitions(vector[string]& columns, int num_buckets)
+        KuduTableCreator& add_hash_partitions(vector[string]& columns,
+                                              int num_buckets)
+        KuduTableCreator& add_hash_partitions(vector[string]& columns,
+                                              int num_buckets,
+                                              int seed)
         KuduTableCreator& set_range_partition_columns(vector[string]& columns)
         KuduTableCreator& split_rows(vector[const KuduPartialRow*]& split_rows)
         KuduTableCreator& num_replicas(int n_replicas)

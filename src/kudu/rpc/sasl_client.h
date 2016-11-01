@@ -57,6 +57,10 @@ class SaslClient {
   // Must be called after Init().
   Status EnablePlain(const string& user, const string& pass);
 
+  // Enable GSSAPI authentication.
+  // Call after Init().
+  Status EnableGSSAPI();
+
   // Returns mechanism negotiated by this connection.
   // Must be called after Negotiate().
   SaslMechanism::Type negotiated_mechanism() const;
@@ -126,10 +130,11 @@ class SaslClient {
 
   // Perform a client-side step of the SASL negotiation.
   // Input is what came from the server. Output is what we will send back to the server.
-  // Return code from sasl_client_step is stored in result.
-  // Returns Status::OK if sasl_client_step returns SASL_OK or SASL_CONTINUE; otherwise,
-  // returns Status::NotAuthorized.
-  Status DoSaslStep(const string& in, const char** out, unsigned* out_len, int* result);
+  // Returns:
+  //   Status::OK if sasl_client_step returns SASL_OK.
+  //   Status::Incomplete if sasl_client_step returns SASL_CONTINUE
+  // otherwise returns an appropriate error status.
+  Status DoSaslStep(const string& in, const char** out, unsigned* out_len);
 
   // Handle case when server sends NEGOTIATE response.
   Status HandleNegotiateResponse(const SaslMessagePB& response);

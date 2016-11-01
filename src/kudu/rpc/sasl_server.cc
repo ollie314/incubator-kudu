@@ -28,7 +28,6 @@
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/split.h"
-#include "kudu/rpc/auth_store.h"
 #include "kudu/rpc/blocking_ops.h"
 #include "kudu/rpc/constants.h"
 #include "kudu/rpc/serialization.h"
@@ -71,15 +70,19 @@ SaslServer::~SaslServer() {
 }
 
 Status SaslServer::EnableAnonymous() {
-  DCHECK_EQ(server_state_, SaslNegotiationState::INITIALIZED);
+  DCHECK_EQ(server_state_, SaslNegotiationState::NEW);
   return helper_.EnableAnonymous();
 }
 
-Status SaslServer::EnablePlain(gscoped_ptr<AuthStore> authstore) {
-  DCHECK_EQ(server_state_, SaslNegotiationState::INITIALIZED);
+Status SaslServer::EnablePlain() {
+  DCHECK_EQ(server_state_, SaslNegotiationState::NEW);
   RETURN_NOT_OK(helper_.EnablePlain());
-  authstore_.swap(authstore);
   return Status::OK();
+}
+
+Status SaslServer::EnableGSSAPI() {
+  DCHECK_EQ(server_state_, SaslNegotiationState::NEW);
+  return helper_.EnableGSSAPI();
 }
 
 SaslMechanism::Type SaslServer::negotiated_mechanism() const {
@@ -87,10 +90,9 @@ SaslMechanism::Type SaslServer::negotiated_mechanism() const {
   return negotiated_mech_;
 }
 
-const std::string& SaslServer::plain_auth_user() const {
+const std::string& SaslServer::authenticated_user() const {
   DCHECK_EQ(server_state_, SaslNegotiationState::NEGOTIATED);
-  DCHECK_EQ(negotiated_mech_, SaslMechanism::PLAIN);
-  return plain_auth_user_;
+  return authenticated_user_;
 }
 
 void SaslServer::set_local_addr(const Sockaddr& addr) {
@@ -126,19 +128,28 @@ Status SaslServer::Init(const string& service_type) {
   unsigned secflags = 0;
 
   sasl_conn_t* sasl_conn = nullptr;
-  int result = sasl_server_new(
-      service_type.c_str(),         // Registered name of the service using SASL. Required.
-      helper_.server_fqdn(),        // The fully qualified domain name of this server.
-      nullptr,                      // Permits multiple user realms on server. NULL == use default.
-      helper_.local_addr_string(),  // Local and remote IP address strings. (NULL disables
-      helper_.remote_addr_string(), //   mechanisms which require this info.)
-      &callbacks_[0],               // Connection-specific callbacks.
-      secflags,                     // Security flags.
-      &sasl_conn);
+  Status s = WrapSaslCall(nullptr /* no conn */, [&]() {
+      return sasl_server_new(
+          // Registered name of the service using SASL. Required.
+          service_type.c_str(),
+          // The fully qualified domain name of this server.
+          helper_.server_fqdn(),
+          // Permits multiple user realms on server. NULL == use default.
+          nullptr,
+          // Local and remote IP address strings. (NULL disables
+          // mechanisms which require this info.)
+          helper_.local_addr_string(),
+          helper_.remote_addr_string(),
+          // Connection-specific callbacks.
+          &callbacks_[0],
+          // Security flags.
+          secflags,
+          &sasl_conn);
+    });
 
-  if (PREDICT_FALSE(result != SASL_OK)) {
+  if (PREDICT_FALSE(!s.ok())) {
     return Status::RuntimeError("Unable to create new SASL server",
-        SaslErrDesc(result, sasl_conn_.get()));
+                                s.message());
   }
   sasl_conn_.reset(sasl_conn);
 
@@ -205,6 +216,14 @@ Status SaslServer::Negotiate() {
       }
     }
   }
+
+  const char* username = nullptr;
+  int rc = sasl_getprop(sasl_conn_.get(), SASL_USERNAME,
+                        reinterpret_cast<const void**>(&username));
+  // We expect that SASL_USERNAME will always get set.
+  CHECK(rc == SASL_OK && username != nullptr)
+      << "No username on authenticated connection";
+  authenticated_user_ = username;
 
   TRACE("SASL Server: Successful negotiation");
   server_state_ = SaslNegotiationState::NEGOTIATED;
@@ -348,27 +367,27 @@ Status SaslServer::HandleInitiateRequest(const SaslMessagePB& request) {
   const char* server_out = nullptr;
   uint32_t server_out_len = 0;
   TRACE("SASL Server: Calling sasl_server_start()");
-  int result = sasl_server_start(
-      sasl_conn_.get(),         // The SASL connection context created by init()
-      auth.mechanism().c_str(), // The mechanism requested by the client.
-      request.token().c_str(),  // Optional string the client gave us.
-      request.token().length(), // Client string len.
-      &server_out,              // The output of the SASL library, might not be NULL terminated
-      &server_out_len);         // Output len.
 
-  if (PREDICT_FALSE(result != SASL_OK && result != SASL_CONTINUE)) {
-    Status s = Status::NotAuthorized("Unable to negotiate SASL connection",
-        SaslErrDesc(result, sasl_conn_.get()));
+  Status s = WrapSaslCall(sasl_conn_.get(), [&]() {
+      return sasl_server_start(
+          sasl_conn_.get(),         // The SASL connection context created by init()
+          auth.mechanism().c_str(), // The mechanism requested by the client.
+          request.token().c_str(),  // Optional string the client gave us.
+          request.token().length(), // Client string len.
+          &server_out,              // The output of the SASL library, might not be NULL terminated
+          &server_out_len);         // Output len.
+    });
+  if (PREDICT_FALSE(!s.ok() && !s.IsIncomplete())) {
     RETURN_NOT_OK(SendSaslError(ErrorStatusPB::FATAL_UNAUTHORIZED, s));
     return s;
   }
   negotiated_mech_ = SaslMechanism::value_of(auth.mechanism());
 
   // We have a valid mechanism match
-  if (result == SASL_OK) {
+  if (s.ok()) {
     nego_ok_ = true;
     RETURN_NOT_OK(SendSuccessResponse(server_out, server_out_len));
-  } else { // result == SASL_CONTINUE
+  } else { // s.IsComplete() (equivalent to SASL_CONTINUE)
     RETURN_NOT_OK(SendChallengeResponse(server_out, server_out_len));
   }
   return Status::OK();
@@ -413,25 +432,23 @@ Status SaslServer::HandleResponseRequest(const SaslMessagePB& request) {
   const char* server_out = nullptr;
   uint32_t server_out_len = 0;
   TRACE("SASL Server: Calling sasl_server_step()");
-  int result = sasl_server_step(
-      sasl_conn_.get(),         // The SASL connection context created by init()
-      request.token().c_str(),  // Optional string the client gave us
-      request.token().length(), // Client string len
-      &server_out,              // The output of the SASL library, might not be NULL terminated
-      &server_out_len);         // Output len
-
-  if (result != SASL_OK && result != SASL_CONTINUE) {
-    Status s = Status::NotAuthorized("Unable to negotiate SASL connection",
-        SaslErrDesc(result, sasl_conn_.get()));
+  Status s = WrapSaslCall(sasl_conn_.get(), [&]() {
+      return sasl_server_step(
+          sasl_conn_.get(),         // The SASL connection context created by init()
+          request.token().c_str(),  // Optional string the client gave us
+          request.token().length(), // Client string len
+          &server_out,              // The output of the SASL library, might not be NULL terminated
+          &server_out_len);         // Output len
+    });
+  if (!s.ok() && !s.IsIncomplete()) {
     RETURN_NOT_OK(SendSaslError(ErrorStatusPB::FATAL_UNAUTHORIZED, s));
     return s;
   }
 
-  SaslMessagePB msg;
-  if (result == SASL_OK) {
+  if (s.ok()) {
     nego_ok_ = true;
     RETURN_NOT_OK(SendSuccessResponse(server_out, server_out_len));
-  } else { // result == SASL_CONTINUE
+  } else { // s.IsIncomplete() (equivalent to SASL_CONTINUE)
     RETURN_NOT_OK(SendChallengeResponse(server_out, server_out_len));
   }
   return Status::OK();
@@ -442,24 +459,14 @@ int SaslServer::GetOptionCb(const char* plugin_name, const char* option,
   return helper_.GetOptionCb(plugin_name, option, result, len);
 }
 
-int SaslServer::PlainAuthCb(sasl_conn_t *conn, const char *user, const char *pass,
-                            unsigned passlen, struct propctx *propctx) {
-  TRACE("SASL Server: Checking PLAIN auth credentials");
+int SaslServer::PlainAuthCb(sasl_conn_t * /*conn*/, const char * /*user*/, const char * /*pass*/,
+                            unsigned /*passlen*/, struct propctx * /*propctx*/) {
+  TRACE("SASL Server: Received PLAIN auth.");
   if (PREDICT_FALSE(!helper_.IsPlainEnabled())) {
     LOG(DFATAL) << "Password authentication callback called while PLAIN auth disabled";
     return SASL_BADPARAM;
   }
-  if (PREDICT_FALSE(!authstore_)) {
-    LOG(DFATAL) << "AuthStore not initialized";
-    return SASL_FAIL;
-  }
-  Status s = authstore_->Authenticate(user, string(pass, passlen));
-  TRACE("SASL Server: PLAIN user authentication status: $0", s.ToString());
-  if (!s.ok()) {
-    LOG(INFO) << "Failed login for user: " << user;
-    return SASL_FAIL;
-  }
-  plain_auth_user_ = user; // Store username of authenticated user.
+  // We always allow PLAIN authentication to succeed.
   return SASL_OK;
 }
 

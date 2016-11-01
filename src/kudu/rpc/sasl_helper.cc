@@ -47,7 +47,8 @@ SaslHelper::SaslHelper(PeerType peer_type)
   : peer_type_(peer_type),
     conn_header_exchanged_(false),
     anonymous_enabled_(false),
-    plain_enabled_(false) {
+    plain_enabled_(false),
+    gssapi_enabled_(false) {
   tag_ = (peer_type_ == SERVER) ? "Sasl Server" : "Sasl Client";
 }
 
@@ -92,7 +93,7 @@ const std::set<std::string>& SaslHelper::LocalMechs() const {
 
 const char* SaslHelper::LocalMechListString() const {
   JoinStrings(mechs_, " ", &mech_list_);
-  return mech_list_.empty() ? nullptr : mech_list_.c_str();
+  return mech_list_.c_str();
 }
 
 
@@ -118,7 +119,7 @@ int SaslHelper::GetOptionCb(const char* plugin_name, const char* option,
     if (cb_name == option) {
       *result = LocalMechListString();
       if (len != nullptr) *len = strlen(*result);
-      DVLOG(3) << tag_ << ": Enabled mech list: " << (*result == nullptr ? "NULL" : *result);
+      VLOG(4) << tag_ << ": Enabled mech list: " << *result;
       return SASL_OK;
     }
     VLOG(4) << tag_ << ": GetOptionCb: Unknown library option: " << option;
@@ -129,11 +130,7 @@ int SaslHelper::GetOptionCb(const char* plugin_name, const char* option,
 }
 
 Status SaslHelper::EnableAnonymous() {
-  if (PREDICT_FALSE(!ContainsKey(GlobalMechs(), kSaslMechAnonymous))) {
-    LOG(DFATAL) << tag_ << ": Unable to find ANONYMOUS SASL plugin";
-    return Status::InvalidArgument("Client unable to find ANONYMOUS SASL plugin");
-  }
-  AddToLocalMechList(kSaslMechAnonymous);
+  RETURN_NOT_OK(EnableMechanism(kSaslMechAnonymous));
   anonymous_enabled_ = true;
   return Status::OK();
 }
@@ -143,12 +140,23 @@ bool SaslHelper::IsAnonymousEnabled() const {
 }
 
 Status SaslHelper::EnablePlain() {
-  if (PREDICT_FALSE(!ContainsKey(GlobalMechs(), kSaslMechPlain))) {
-    LOG(DFATAL) << tag_ << ": Unable to find PLAIN SASL plugin";
-    return Status::InvalidArgument("Unable to find PLAIN SASL plugin");
-  }
-  AddToLocalMechList(kSaslMechPlain);
+  RETURN_NOT_OK(EnableMechanism(kSaslMechPlain));
   plain_enabled_ = true;
+  return Status::OK();
+}
+
+Status SaslHelper::EnableGSSAPI() {
+  RETURN_NOT_OK(EnableMechanism(kSaslMechGSSAPI));
+  gssapi_enabled_ = true;
+  return Status::OK();
+}
+
+Status SaslHelper::EnableMechanism(const string& mech) {
+  if (PREDICT_FALSE(!ContainsKey(GlobalMechs(), mech))) {
+    LOG(DFATAL) << tag_ << ": Unable to find SASL plugin: " << mech;
+    return Status::InvalidArgument("Unable to find SASL plugin", mech);
+  }
+  AddToLocalMechList(mech);
   return Status::OK();
 }
 

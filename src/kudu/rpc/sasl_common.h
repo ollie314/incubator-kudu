@@ -38,6 +38,7 @@ using std::string;
 // Constants
 extern const char* const kSaslMechAnonymous;
 extern const char* const kSaslMechPlain;
+extern const char* const kSaslMechGSSAPI;
 
 // Initialize the SASL library.
 // appname: Name of the application for logging messages & sasl plugin configuration.
@@ -53,10 +54,20 @@ extern const char* const kSaslMechPlain;
 //
 // This function is thread safe and uses a static lock.
 // This function should NOT be called during static initialization.
-Status SaslInit(const char* const app_name);
+Status SaslInit(const char* app_name);
 
-// Return a string describing the SASL error response.
-string SaslErrDesc(int status, sasl_conn_t* conn);
+// Wrap a call into the SASL library. 'call' should be a lambda which
+// returns a SASL error code.
+//
+// The result is translated into a Status as follows:
+//
+//  SASL_OK:       Status::OK()
+//  SASL_CONTINUE: Status::Incomplete()
+//  otherwise:     Status::NotAuthorized()
+//
+// The Status message is beautified to be more user-friendly compared
+// to the underlying sasl_errdetails() call.
+Status WrapSaslCall(sasl_conn_t* conn, const std::function<int()>& call);
 
 // Return <ip>;<port> string formatted for SASL library use.
 string SaslIpPortString(const Sockaddr& addr);
@@ -89,9 +100,11 @@ struct SaslMechanism {
   enum Type {
     INVALID,
     ANONYMOUS,
-    PLAIN
+    PLAIN,
+    GSSAPI
   };
   static Type value_of(const std::string& mech);
+  static const char* name_of(Type val);
 };
 
 } // namespace rpc

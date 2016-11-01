@@ -24,7 +24,7 @@ from multiprocessing import Pool
 import datetime
 
 def _get_scan_token_results(input):
-    client = kudu.Client("{0}:{1}".format(input[1], input[2]))
+    client = kudu.connect(input[1], input[2])
     scanner = client.deserialize_token_into_scanner(input[0])
     scanner.open()
     return scanner.read_all_tuples()
@@ -43,7 +43,7 @@ class TestScanToken(TestScanBase):
         Given the input serialized tokens, spawn new threads,
         execute them and validate the results
         """
-        input =  [(token.serialize(), self.master_host, self.master_port)
+        input =  [(token.serialize(), self.master_hosts, self.master_ports)
                 for token in tokens]
 
         # Begin process pool
@@ -97,13 +97,9 @@ class TestScanToken(TestScanBase):
         in parallel with seperate clients.
         """
         builder = self.table.scan_token_builder()
-        lower_bound = builder.new_bound()
-        lower_bound['key'] = 50
-        upper_bound = builder.new_bound()
-        upper_bound['key'] = 55
         builder.set_fault_tolerant()\
-            .add_lower_bound(lower_bound)\
-            .add_upper_bound(upper_bound)
+            .add_lower_bound([50])\
+            .add_upper_bound([55])
 
         # Serialize execute and verify
         self._subtest_serialize_thread_and_verify(builder.build(),
@@ -243,3 +239,30 @@ class TestScanToken(TestScanBase):
         # Test a single precision float predicate
         # Does a row check count only
         self._test_float_pred()
+
+    def test_binary_pred(self):
+        # Test a binary predicate
+        self._test_binary_pred()
+
+    def test_scan_selection(self):
+        """
+        This test confirms that setting the scan selection policy on the
+        ScanTokenBuilder does not cause any errors . There is no way to
+        confirm that the policy was actually set. This functionality is
+        tested in the C++ test:
+            ClientTest.TestReplicatedMultiTabletTableFailover.
+        """
+
+        for policy in ['leader', kudu.CLOSEST_REPLICA, 2]:
+            builder = self.table.scan_token_builder()
+            builder.set_selection(policy)
+            tokens = builder.build()
+
+            tuples = []
+            for token in tokens:
+                scanner = token.into_kudu_scanner()
+                scanner.open()
+                tuples.extend(scanner.read_all_tuples())
+
+            self.assertEqual(sorted(tuples),
+                             sorted(self.tuples))

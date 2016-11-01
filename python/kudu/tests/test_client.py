@@ -83,7 +83,7 @@ class TestClient(KuduTestBase, unittest.TestCase):
             self.client.delete_table(name)
 
     def test_is_multimaster(self):
-        assert not self.client.is_multimaster
+        assert self.client.is_multimaster
 
     def test_delete_table(self):
         name = "peekaboo"
@@ -134,6 +134,13 @@ class TestClient(KuduTestBase, unittest.TestCase):
                 partitioning=Partitioning().set_range_partition_columns([]))
             self.client.delete_table(name)
 
+            self.client.create_table(
+                name, self.schema,
+                partitioning=Partitioning().add_hash_partitions(['key'],
+                                                                2,
+                                                                seed=342310))
+            self.client.delete_table(name)
+
         finally:
             try:
                 self.client.delete_table(name)
@@ -150,10 +157,7 @@ class TestClient(KuduTestBase, unittest.TestCase):
         table = self.client.table(self.ex_table)
         session = self.client.new_session()
         for i in range(nrows):
-            op = table.new_insert()
-            op['key'] = i
-            op['int_val'] = i * 2
-            op['string_val'] = 'hello_%d' % i
+            op = table.new_insert((i, i*2, 'hello_%d' % i))
             session.apply(op)
 
         # Cannot apply the same insert twice, C++ client does not indicate an
@@ -173,10 +177,9 @@ class TestClient(KuduTestBase, unittest.TestCase):
         op['unixtime_micros_val'] = datetime.datetime(2016, 10, 30, 10, 12)
         session.apply(op)
 
-        op = table.new_upsert()
-        op['key'] = 2
-        op['int_val'] = 222
-        op['string_val'] = 'upserted'
+        op = table.new_upsert({0: 2,
+                               1: 222,
+                               2: 'upserted'})
         session.apply(op)
         session.flush()
 
@@ -190,8 +193,7 @@ class TestClient(KuduTestBase, unittest.TestCase):
 
         # Delete the rows we just wrote
         for i in range(nrows):
-            op = table.new_delete()
-            op['key'] = i
+            op = table.new_delete({'key': i})
             session.apply(op)
         session.flush()
 
@@ -224,7 +226,7 @@ class TestClient(KuduTestBase, unittest.TestCase):
 
     def test_connect_timeouts(self):
         # it works! any other way to check
-        kudu.connect(self.master_host, self.master_port,
+        kudu.connect(self.master_hosts, self.master_ports,
                      admin_timeout_ms=100,
                      rpc_timeout_ms=100)
 

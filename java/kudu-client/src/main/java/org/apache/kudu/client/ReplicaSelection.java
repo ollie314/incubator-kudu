@@ -14,19 +14,23 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+package org.apache.kudu.client;
 
-#include "kudu/rpc/constants.h"
+import org.apache.kudu.annotations.InterfaceAudience;
+import org.apache.kudu.annotations.InterfaceStability;
 
-using std::set;
-
-namespace kudu {
-namespace rpc {
-
-const char* const kMagicNumber = "hrpc";
-const char* const kSaslAppName = "kudu";
-const char* const kSaslProtoName = "kudu";
-set<RpcFeatureFlag> kSupportedServerRpcFeatureFlags = { APPLICATION_FEATURE_FLAGS };
-set<RpcFeatureFlag> kSupportedClientRpcFeatureFlags = { APPLICATION_FEATURE_FLAGS };
-
-} // namespace rpc
-} // namespace kudu
+/**
+ * Policy with which to choose amongst multiple replicas.
+ */
+@InterfaceAudience.Public
+@InterfaceStability.Evolving
+public enum ReplicaSelection {
+  /**
+   * Select the LEADER replica.
+   */
+  LEADER_ONLY,
+  /**
+   * Select the closest replica to the client, or a random one if all replicas are equidistant.
+   */
+  CLOSEST_REPLICA
+}

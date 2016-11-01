@@ -133,32 +133,23 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
 
   private final AsyncKuduClient kuduClient;
 
-  private final String uuid;
-
-  private final String host;
-
-  private final int port;
-
   private final long socketReadTimeoutMs;
 
   private SecureRpcHelper secureRpcHelper;
 
   private final RequestTracker requestTracker;
 
+  private final ServerInfo serverInfo;
+
   // If an uncaught exception forced us to shutdown this TabletClient, we'll handle the retry
   // differently by also clearing the caches.
   private volatile boolean gotUncaughtException = false;
 
-  private final boolean local;
-
-  public TabletClient(AsyncKuduClient client, String uuid, String host, int port, boolean local) {
+  public TabletClient(AsyncKuduClient client, ServerInfo serverInfo) {
     this.kuduClient = client;
-    this.uuid = uuid;
     this.socketReadTimeoutMs = client.getDefaultSocketReadTimeoutMs();
-    this.host = host;
-    this.port = port;
     this.requestTracker = client.getRequestTracker();
-    this.local = local;
+    this.serverInfo = serverInfo;
   }
 
   <R> void sendRpc(KuduRpc<R> rpc) {
@@ -430,7 +421,7 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
     }
 
     Pair<Object, Object> decoded = null;
-    Exception exception = null;
+    KuduException exception = null;
     Status retryableHeaderError = Status.OK();
     if (header.hasIsError() && header.getIsError()) {
       RpcHeader.ErrorStatusPB.Builder errorBuilder = RpcHeader.ErrorStatusPB.newBuilder();
@@ -449,8 +440,8 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
       }
     } else {
       try {
-        decoded = rpc.deserialize(response, this.uuid);
-      } catch (Exception ex) {
+        decoded = rpc.deserialize(response, this.serverInfo.getUuid());
+      } catch (KuduException ex) {
         exception = ex;
       }
     }
@@ -530,12 +521,12 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
   /**
    * Takes care of a few kinds of TS errors that we handle differently, like tablets or leaders
    * moving. Builds and returns an exception if we don't know what to do with it.
-   * @param rpc The original RPC call that triggered the error.
-   * @param error The error the TS sent.
-   * @return An exception if we couldn't dispatch the error, or null.
+   * @param rpc the original RPC call that triggered the error
+   * @param error the error the TS sent
+   * @return an exception if we couldn't dispatch the error, or null
    */
-  private Exception dispatchTSErrorOrReturnException(KuduRpc rpc,
-                                                     Tserver.TabletServerErrorPB error) {
+  private KuduException dispatchTSErrorOrReturnException(KuduRpc rpc,
+                                                         Tserver.TabletServerErrorPB error) {
     WireProtocol.AppStatusPB.ErrorCode code = error.getStatus().getCode();
     Status status = Status.fromTabletServerErrorPB(error);
     if (error.getCode() == Tserver.TabletServerErrorPB.Code.TABLET_NOT_FOUND) {
@@ -556,12 +547,12 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
   /**
    * Provides different handling for various kinds of master errors: re-uses the
    * mechanisms already in place for handling tablet server errors as much as possible.
-   * @param rpc The original RPC call that triggered the error.
-   * @param error The error the master sent.
-   * @return An exception if we couldn't dispatch the error, or null.
+   * @param rpc the original RPC call that triggered the error
+   * @param error the error the master sent
+   * @return an exception if we couldn't dispatch the error, or null
    */
-  private Exception dispatchMasterErrorOrReturnException(KuduRpc rpc,
-                                                         Master.MasterErrorPB error) {
+  private KuduException dispatchMasterErrorOrReturnException(KuduRpc rpc,
+                                                             Master.MasterErrorPB error) {
     WireProtocol.AppStatusPB.ErrorCode code = error.getStatus().getCode();
     Status status = Status.fromMasterErrorPB(error);
     if (error.getCode() == Master.MasterErrorPB.Code.NOT_THE_LEADER) {
@@ -821,10 +812,12 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
 
   private ChannelBuffer header() {
     RpcHeader.ConnectionContextPB.Builder builder = RpcHeader.ConnectionContextPB.newBuilder();
+
+    // The UserInformationPB is deprecated, but used by servers prior to Kudu 1.1.
     RpcHeader.UserInformationPB.Builder userBuilder = RpcHeader.UserInformationPB.newBuilder();
-    userBuilder.setEffectiveUser(SecureRpcHelper.USER_AND_PASSWORD); // TODO set real user
+    userBuilder.setEffectiveUser(SecureRpcHelper.USER_AND_PASSWORD);
     userBuilder.setRealUser(SecureRpcHelper.USER_AND_PASSWORD);
-    builder.setUserInfo(userBuilder.build());
+    builder.setDEPRECATEDUserInfo(userBuilder.build());
     RpcHeader.ConnectionContextPB pb = builder.build();
     RpcHeader.RequestHeader header = RpcHeader.RequestHeader.newBuilder().setCallId
         (CONNECTION_CTX_CALL_ID).build();
@@ -832,40 +825,11 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
   }
 
   private String getPeerUuidLoggingString() {
-    return "[Peer " + uuid + "] ";
+    return "[Peer " + serverInfo.getUuid() + "] ";
   }
 
-  /**
-   * Returns this tablet server's uuid.
-   * @return a string that contains this tablet server's uuid
-   */
-  String getUuid() {
-    return uuid;
-  }
-
-  /**
-   * Returns if this server is on this client's host.
-   * @return true if the server is local, else false
-   */
-  boolean isLocal() {
-    return local;
-  }
-
-  /**
-   * Returns this tablet server's port.
-   * @return a port number that this tablet server is bound to
-   */
-  int getPort() {
-    return port;
-  }
-
-  /**
-   * Returns this tablet server's hostname. We might get many hostnames from the master for a single
-   * TS, and this is the one we picked to connect to originally.
-   * @returna string that contains this tablet server's hostname
-   */
-  String getHost() {
-    return host;
+  ServerInfo getServerInfo() {
+    return serverInfo;
   }
 
   public String toString() {
@@ -875,7 +839,7 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
         .append("(chan=")                   // = 6
         .append(chan)                       // ~64 (up to 66 when using IPv4)
         .append(", uuid=")                  // = 7
-        .append(uuid)                       // = 32
+        .append(serverInfo.getUuid())       // = 32
         .append(", #pending_rpcs=");        // =16
     int npending_rpcs;
     synchronized (this) {
