@@ -44,12 +44,14 @@
 #include "kudu/util/errno.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/status.h"
 #include "kudu/util/thread.h"
 #include "kudu/util/threadpool.h"
 #include "kudu/util/thread_restrictions.h"
 #include "kudu/util/trace.h"
-#include "kudu/util/status.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/util/net/ssl_factory.h"
+#include "kudu/util/net/ssl_socket.h"
 
 // When compiling on Mac OS X, use 'kqueue' instead of the default, 'select', for the event loop.
 // Otherwise we run into problems because 'select' can't handle connections when more than 1024
@@ -63,7 +65,10 @@ static const int kDefaultLibEvFlags = ev::AUTO;
 using std::string;
 using std::shared_ptr;
 
-DEFINE_int64(rpc_negotiation_timeout_ms, 3000,
+// TODO(KUDU-1580). This timeout has been bumped from 3 seconds up to
+// 15 seconds to workaround a bug. We should drop it back down when
+// KUDU-1580 is fixed.
+DEFINE_int64(rpc_negotiation_timeout_ms, 15000,
              "Timeout for negotiating an RPC connection.");
 TAG_FLAG(rpc_negotiation_timeout_ms, advanced);
 TAG_FLAG(rpc_negotiation_timeout_ms, runtime);
@@ -209,9 +214,10 @@ void ReactorThread::RegisterConnection(const scoped_refptr<Connection>& conn) {
   DCHECK(IsCurrentThread());
 
   Status s = StartConnectionNegotiation(conn);
-  if (!s.ok()) {
+  if (PREDICT_FALSE(!s.ok())) {
     LOG(ERROR) << "Server connection negotiation failed: " << s.ToString();
     DestroyConnection(conn.get(), s);
+    return;
   }
   server_conns_.push_back(conn);
 }
@@ -335,8 +341,15 @@ Status ReactorThread::FindOrStartConnection(const ConnectionId &conn_id,
   bool connect_in_progress;
   RETURN_NOT_OK(StartConnect(&sock, conn_id.remote(), &connect_in_progress));
 
+  std::unique_ptr<Socket> new_socket;
+  if (reactor()->messenger()->ssl_enabled()) {
+    new_socket = reactor()->messenger()->ssl_factory()->CreateSocket(sock.Release(), false);
+  } else {
+    new_socket.reset(new Socket(sock.Release()));
+  }
+
   // Register the new connection in our map.
-  *conn = new Connection(this, conn_id.remote(), sock.Release(), Connection::CLIENT);
+  *conn = new Connection(this, conn_id.remote(), new_socket.release(), Connection::CLIENT);
   (*conn)->set_user_credentials(conn_id.user_credentials());
 
   // Kick off blocking client connection negotiation.
@@ -594,8 +607,14 @@ class RegisterConnectionTask : public ReactorTask {
 
 void Reactor::RegisterInboundSocket(Socket *socket, const Sockaddr &remote) {
   VLOG(3) << name_ << ": new inbound connection to " << remote.ToString();
+  std::unique_ptr<Socket> new_socket;
+  if (messenger()->ssl_enabled()) {
+    new_socket = messenger()->ssl_factory()->CreateSocket(socket->Release(), true);
+  } else {
+    new_socket.reset(new Socket(socket->Release()));
+  }
   scoped_refptr<Connection> conn(
-    new Connection(&thread_, remote, socket->Release(), Connection::SERVER));
+    new Connection(&thread_, remote, new_socket.release(), Connection::SERVER));
   auto task = new RegisterConnectionTask(conn);
   ScheduleReactorTask(task);
 }

@@ -51,9 +51,9 @@ static int SaslServerPlainAuthCb(sasl_conn_t *conn, void *sasl_server, const cha
     ->PlainAuthCb(conn, user, pass, passlen, propctx);
 }
 
-SaslServer::SaslServer(string app_name, int fd)
+SaslServer::SaslServer(string app_name, Socket* socket)
     : app_name_(std::move(app_name)),
-      sock_(fd),
+      sock_(socket),
       helper_(SaslHelper::SERVER),
       server_state_(SaslNegotiationState::NEW),
       negotiated_mech_(SaslMechanism::INVALID),
@@ -63,10 +63,6 @@ SaslServer::SaslServer(string app_name, int fd)
   callbacks_.push_back(SaslBuildCallback(SASL_CB_SERVER_USERDB_CHECKPASS,
       reinterpret_cast<int (*)()>(&SaslServerPlainAuthCb), this));
   callbacks_.push_back(SaslBuildCallback(SASL_CB_LIST_END, nullptr, nullptr));
-}
-
-SaslServer::~SaslServer() {
-  sock_.Release();  // Do not close the underlying socket when this object is destroyed.
 }
 
 Status SaslServer::EnableAnonymous() {
@@ -173,7 +169,7 @@ Status SaslServer::Negotiate() {
   }
 
   // Ensure we can use blocking calls on the socket during negotiation.
-  RETURN_NOT_OK(EnsureBlockingMode(&sock_));
+  RETURN_NOT_OK(EnsureBlockingMode(sock_));
 
   faststring recv_buf;
 
@@ -185,7 +181,7 @@ Status SaslServer::Negotiate() {
     TRACE("Waiting for next SASL message...");
     RequestHeader header;
     Slice param_buf;
-    RETURN_NOT_OK(ReceiveFramedMessageBlocking(&sock_, &recv_buf, &header, &param_buf, deadline_));
+    RETURN_NOT_OK(ReceiveFramedMessageBlocking(sock_, &recv_buf, &header, &param_buf, deadline_));
 
     SaslMessagePB request;
     RETURN_NOT_OK(ParseSaslMsgRequest(header, param_buf, &request));
@@ -235,7 +231,7 @@ Status SaslServer::ValidateConnectionHeader(faststring* recv_buf) {
   size_t num_read;
   const size_t conn_header_len = kMagicNumberLength + kHeaderFlagsLength;
   recv_buf->resize(conn_header_len);
-  RETURN_NOT_OK(sock_.BlockingRecv(recv_buf->data(), conn_header_len, &num_read, deadline_));
+  RETURN_NOT_OK(sock_->BlockingRecv(recv_buf->data(), conn_header_len, &num_read, deadline_));
   DCHECK_EQ(conn_header_len, num_read);
 
   RETURN_NOT_OK(serialization::ValidateConnHeader(*recv_buf));
@@ -268,7 +264,7 @@ Status SaslServer::SendSaslMessage(const SaslMessagePB& msg) {
   // Create header with SASL-specific callId
   ResponseHeader header;
   header.set_call_id(kSaslCallId);
-  return helper_.SendSaslMessage(&sock_, header, msg, deadline_);
+  return helper_.SendSaslMessage(sock_, header, msg, deadline_);
 }
 
 Status SaslServer::SendSaslError(ErrorStatusPB::RpcErrorCodePB code, const Status& err) {
@@ -290,7 +286,7 @@ Status SaslServer::SendSaslError(ErrorStatusPB::RpcErrorCodePB code, const Statu
   msg.set_code(code);
   msg.set_message(err.ToString());
 
-  RETURN_NOT_OK(helper_.SendSaslMessage(&sock_, header, msg, deadline_));
+  RETURN_NOT_OK(helper_.SendSaslMessage(sock_, header, msg, deadline_));
   TRACE("Sent SASL error: $0", ErrorStatusPB::RpcErrorCodePB_Name(code));
   return Status::OK();
 }
@@ -468,6 +464,44 @@ int SaslServer::PlainAuthCb(sasl_conn_t * /*conn*/, const char * /*user*/, const
   }
   // We always allow PLAIN authentication to succeed.
   return SASL_OK;
+}
+
+Status SaslServer::PreflightCheckGSSAPI(const string& app_name) {
+  // Initialize a SaslServer with a null socket, and enable
+  // only GSSAPI.
+  //
+  // We aren't going to actually send/receive any messages, but
+  // this makes it easier to reuse the initialization code.
+  SaslServer server(app_name, nullptr);
+  Status s = server.EnableGSSAPI();
+  if (!s.ok()) {
+    return Status::RuntimeError(s.message());
+  }
+
+  RETURN_NOT_OK(server.Init(app_name));
+
+  // Start the SASL server as if we were accepting a connection.
+  const char* server_out = nullptr; // ignored
+  uint32_t server_out_len = 0;
+  s = WrapSaslCall(server.sasl_conn_.get(), [&]() {
+      return sasl_server_start(
+          server.sasl_conn_.get(),
+          kSaslMechGSSAPI,
+          "", 0,  // Pass a 0-length token.
+          &server_out, &server_out_len);
+    });
+
+  // We expect 'Incomplete' status to indicate that the first step of negotiation
+  // was correct.
+  if (s.IsIncomplete()) return Status::OK();
+
+  string err_msg = s.message().ToString();
+  if (err_msg == "Permission denied") {
+    // For bad keytab permissions, we get a rather vague message. So,
+    // we make it more specific for better usability.
+    err_msg = "error accessing keytab: " + err_msg;
+  }
+  return Status::RuntimeError(err_msg);
 }
 
 } // namespace rpc

@@ -39,6 +39,7 @@
 namespace kudu {
 
 class Socket;
+class SSLFactory;
 class ThreadPool;
 
 namespace rpc {
@@ -82,9 +83,13 @@ class MessengerBuilder {
   // receiving.
   MessengerBuilder &set_num_reactors(int num_reactors);
 
-  // Set the number of connection-negotiation threads that will be used to handle the
-  // blocking connection-negotiation step.
-  MessengerBuilder &set_negotiation_threads(int num_negotiation_threads);
+  // Set the minimum number of connection-negotiation threads that will be used
+  // to handle the blocking connection-negotiation step.
+  MessengerBuilder &set_min_negotiation_threads(int min_negotiation_threads);
+
+  // Set the maximum number of connection-negotiation threads that will be used
+  // to handle the blocking connection-negotiation step.
+  MessengerBuilder &set_max_negotiation_threads(int max_negotiation_threads);
 
   // Set the granularity with which connections are checked for keepalive.
   MessengerBuilder &set_coarse_timer_granularity(const MonoDelta &granularity);
@@ -98,7 +103,8 @@ class MessengerBuilder {
   const std::string name_;
   MonoDelta connection_keepalive_time_;
   int num_reactors_;
-  int num_negotiation_threads_;
+  int min_negotiation_threads_;
+  int max_negotiation_threads_;
   MonoDelta coarse_timer_granularity_;
   scoped_refptr<MetricEntity> metric_entity_;
 };
@@ -139,6 +145,10 @@ class Messenger {
   //
   // NOTE: the returned pool is not initially started. You must call
   // pool->Start(...) to begin accepting connections.
+  //
+  // If Kerberos is enabled, this also runs a pre-flight check that makes
+  // sure the environment is appropriately configured to authenticate
+  // clients via Kerberos. If not, this returns a RuntimeError.
   Status AddAcceptorPool(const Sockaddr &accept_addr,
                          std::shared_ptr<AcceptorPool>* pool);
 
@@ -172,6 +182,8 @@ class Messenger {
   void ScheduleOnReactor(const boost::function<void(const Status&)>& func,
                          MonoDelta when);
 
+  SSLFactory* ssl_factory() const { return ssl_factory_.get(); }
+
   ThreadPool* negotiation_pool() const { return negotiation_pool_.get(); }
 
   RpczStore* rpcz_store() { return rpcz_store_.get(); }
@@ -181,6 +193,8 @@ class Messenger {
   std::string name() const {
     return name_;
   }
+
+  bool ssl_enabled() const { return ssl_enabled_; }
 
   bool closing() const {
     shared_lock<rw_spinlock> l(lock_.get_lock());
@@ -212,6 +226,8 @@ class Messenger {
 
   bool closing_;
 
+  bool ssl_enabled_;
+
   // Pools which are listening on behalf of this messenger.
   // Note that the user may have called Shutdown() on one of these
   // pools, so even though we retain the reference, it may no longer
@@ -224,6 +240,8 @@ class Messenger {
   std::vector<Reactor*> reactors_;
 
   gscoped_ptr<ThreadPool> negotiation_pool_;
+
+  gscoped_ptr<SSLFactory> ssl_factory_;
 
   std::unique_ptr<RpczStore> rpcz_store_;
 

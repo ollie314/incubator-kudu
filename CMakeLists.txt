@@ -830,6 +830,34 @@ include_directories(SYSTEM ${SQUEASEL_INCLUDE_DIR})
 ADD_THIRDPARTY_LIB(squeasel
   STATIC_LIB "${SQUEASEL_STATIC_LIB}")
 
+## OpenSSL
+##
+## Version 1.0.0 or higher is required because we are using the following
+## features introduced started OpenSSL 1.0.0:
+##   * CRYPTO_THREADID and associated functions
+##   * The new breed of functions to work with the X509_EXTENSION stack
+##
+## If having multiple OpenSSL libraries installed on the system,
+## use the OPENSSL_ROOT_DIR cmake flag to specify where to look for the proper
+## version of the OpenSSL framework/library, e.g.
+##
+##   cmake -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl ...
+##
+## If no such OPENSSL_ROOT_DIR is specified, and we see that there is an OpenSSL
+## binary in thirdparty (deposited there by thirdparty/install-openssl-el6-workaround.sh)
+## then we'll use that one. See that script for more information.
+set(CENTOS_6_4_OPENSSL_DIR "${THIRDPARTY_INSTALL_DIR}/openssl-el6-workaround/usr/")
+if (NOT "${OPENSSL_ROOT_DIR}" AND
+    EXISTS "${CENTOS_6_4_OPENSSL_DIR}")
+  set(OPENSSL_ROOT_DIR "${CENTOS_6_4_OPENSSL_DIR}")
+endif()
+find_package(OpenSSL 1.0.0 REQUIRED)
+include_directories(${OPENSSL_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(openssl_ssl
+  SHARED_LIB "${OPENSSL_SSL_LIBRARY}")
+ADD_THIRDPARTY_LIB(openssl_crypto
+  SHARED_LIB "${OPENSSL_CRYPTO_LIBRARY}")
+
 ## Google PerfTools
 ##
 ## Disabled with TSAN/ASAN as well as with gold+dynamic linking (see comment
@@ -904,8 +932,8 @@ endif()
 
 ## Kerberos
 if (NOT NO_TESTS)
-  ## We rely on the Kerberos KDC binary for testing security.
-  find_package(Kdc)
+  ## We rely on the Kerberos binaries for testing security.
+  find_package(Kerberos)
 endif()
 
 ## Boost

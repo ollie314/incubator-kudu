@@ -21,7 +21,6 @@
 #include <deque>
 #include <gtest/gtest_prod.h>
 #include <memory>
-#include <queue>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -30,6 +29,7 @@
 
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
+#include "kudu/fs/data_dirs.h"
 #include "kudu/fs/fs.pb.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
@@ -44,7 +44,6 @@ class MetricEntity;
 class ThreadPool;
 
 namespace fs {
-class PathInstanceMetadataFile;
 
 namespace internal {
 class LogBlock;
@@ -149,22 +148,6 @@ struct LogBlockManagerMetrics;
 // - Evaluate and implement a solution for data integrity (e.g. per-block
 //   checksum).
 
-// A thread-safe cache that indicates whether a root path is full or not.
-// Includes expiration of the items in the cache. Cache entries are never deleted.
-class FullDiskCache {
- public:
-  // Returns true if the given 'root_path' has been marked full and the
-  // associated cache entry has not expired.
-  bool IsRootFull(const std::string& root_path, MonoTime* expires_out = nullptr) const;
-
-  // Marks the given 'root_path' as "full".
-  void MarkRootFull(const std::string& root_path);
-
- private:
-  mutable percpu_rwlock lock_;
-  std::unordered_map<std::string, MonoTime> cache_;
-};
-
 // The log-backed block manager.
 class LogBlockManager : public BlockManager {
  public:
@@ -216,29 +199,16 @@ class LogBlockManager : public BlockManager {
       BlockIdEqual,
       BlockAllocator> BlockMap;
 
-  typedef std::pair<internal::LogBlockContainer*, MonoTime> ExpiringContainerPair;
-
-  class ExpiringContainerPairGreaterThanFunctor {
-   public:
-    bool operator()(const ExpiringContainerPair& a, const ExpiringContainerPair& b) {
-      return b.second < a.second;
-    }
-  };
-
   // Adds an as of yet unseen container to this block manager.
   void AddNewContainerUnlocked(internal::LogBlockContainer* container);
 
   // Returns the next container available for writing using a round-robin
-  // selection policy, or null if no suitable container was found.
+  // selection policy, creating a new one if necessary.
   //
   // After returning, the container is considered to be in use. When
   // writing is finished, call MakeContainerAvailable() to make it
   // available to other writers.
-  //
-  // 'full_root_paths' is a blacklist containing root paths that are full.
-  // Containers with root paths in this list will not be returned.
-  internal::LogBlockContainer* GetAvailableContainer(
-      const std::unordered_set<std::string>& full_root_paths);
+  Status GetOrCreateContainer(internal::LogBlockContainer** container);
 
   // Indicate that this container is no longer in use and can be handed out
   // to other writers.
@@ -280,16 +250,10 @@ class LogBlockManager : public BlockManager {
                           internal::LogBlockContainer* container,
                           UntrackedBlockMap* block_map);
 
-  // Open a particular root path belonging to the block manager.
+  // Open a particular data directory belonging to the block manager.
   //
-  // Success or failure is set in 'result_status'. On success, also sets
-  // 'result_metadata' with an allocated metadata file.
-  void OpenRootPath(const std::string& root_path,
-                    Status* result_status,
-                    PathInstanceMetadataFile** result_metadata);
-
-  // Test for hole punching support at 'path'.
-  Status CheckHolePunch(const std::string& path);
+  // Success or failure is set in 'result_status'.
+  void OpenDataDir(DataDir* dir, Status* result_status);
 
   // Perform basic initialization.
   Status Init();
@@ -310,6 +274,9 @@ class LogBlockManager : public BlockManager {
   // Protects the block map, container structures, and 'dirty_dirs'.
   mutable simple_spinlock lock_;
 
+  // Manages and owns all of the block manager's data directories.
+  DataDirManager dd_manager_;
+
   // Maps block IDs to blocks that are now readable, either because they
   // already existed on disk when the block manager was opened, or because
   // they're WritableBlocks that were closed.
@@ -329,15 +296,8 @@ class LogBlockManager : public BlockManager {
   // excluding containers that are either in use or full.
   //
   // Does not own the containers.
-  std::deque<internal::LogBlockContainer*> available_containers_;
-
-  // Holds only those containers that would be available, were they not on
-  // disks that are past their capacity. This priority queue consists of pairs
-  // of containers and timestamps. Those timestamps represent the next time
-  // that we should check whether the disk is full. The top of the priority
-  // queue is the lowest timestamp.
-  std::priority_queue<ExpiringContainerPair, std::vector<ExpiringContainerPair>,
-                      ExpiringContainerPairGreaterThanFunctor> disk_full_containers_;
+  std::unordered_map<const DataDir*,
+                     std::deque<internal::LogBlockContainer*>> available_containers_by_data_dir_;
 
   // Tracks dirty container directories.
   //
@@ -349,25 +309,6 @@ class LogBlockManager : public BlockManager {
 
   // If true, only read operations are allowed.
   const bool read_only_;
-
-  // Filesystem paths where all block directories are found.
-  const std::vector<std::string> root_paths_;
-
-  // Index of 'root_paths_' for the next created block.
-  AtomicInt<int32> root_paths_idx_;
-
-  // Maps root paths to instance metadata files found in each root path.
-  typedef std::unordered_map<std::string, PathInstanceMetadataFile*> InstanceMap;
-  InstanceMap instances_by_root_path_;
-
-  // Maps root paths to thread pools. Each pool runs at most one thread, and
-  // so serves as a "work queue" for that particular disk.
-  typedef std::unordered_map<std::string, ThreadPool*> ThreadPoolMap;
-  ThreadPoolMap thread_pools_by_root_path_;
-
-  // A cache of which root paths are full as of the last time they were
-  // checked. This cache expires its entries after some period of time.
-  FullDiskCache full_disk_cache_;
 
   // For generating container names.
   ObjectIdGenerator oid_generator_;

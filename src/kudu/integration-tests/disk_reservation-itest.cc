@@ -26,11 +26,8 @@
 using std::string;
 using strings::Substitute;
 
-DECLARE_string(block_manager);
-
 METRIC_DECLARE_entity(server);
-METRIC_DECLARE_counter(log_block_manager_containers);
-METRIC_DECLARE_counter(log_block_manager_unavailable_containers);
+METRIC_DECLARE_gauge_uint64(data_dirs_full);
 
 namespace kudu {
 
@@ -52,11 +49,6 @@ class DiskReservationITest : public ExternalMiniClusterITestBase {
 // use other disks for data blocks until all disks are full, at which time we
 // crash. This functionality is only implemented in the log block manager.
 TEST_F(DiskReservationITest, TestFillMultipleDisks) {
-  if (FLAGS_block_manager != "log") {
-    LOG(INFO) << "This platform does not use the log block manager by default. Skipping test.";
-    return;
-  }
-
   vector<string> ts_flags;
   // Don't preallocate very many bytes so we run the "full disk" check often.
   ts_flags.push_back("--log_container_preallocate_bytes=100000");
@@ -64,6 +56,9 @@ TEST_F(DiskReservationITest, TestFillMultipleDisks) {
   ts_flags.push_back("--flush_threshold_mb=0");
   ts_flags.push_back("--maintenance_manager_polling_interval_ms=50");
   ts_flags.push_back("--disable_core_dumps");
+  // Reserve one byte so that when we simulate 0 bytes free below, we'll start
+  // failing requests.
+  ts_flags.push_back("--fs_data_dirs_reserved_bytes=1");
   ts_flags.push_back(Substitute("--fs_data_dirs=$0/a,$0/b",
                                 GetTestDataDirectory()));
   ts_flags.push_back(Substitute("--disk_reserved_override_prefix_1_path_for_testing=$0/a",
@@ -83,17 +78,6 @@ TEST_F(DiskReservationITest, TestFillMultipleDisks) {
   workload.Setup();
   workload.Start();
 
-  // Wait until we have 2 active containers.
-  while (true) {
-    int64_t num_containers;
-    ASSERT_OK(GetTsCounterValue(cluster_->tablet_server(0), &METRIC_log_block_manager_containers,
-                                &num_containers));
-    if (num_containers >= 2) break;
-    SleepFor(MonoDelta::FromMilliseconds(10));
-  }
-
-  LOG(INFO) << "Two log block containers are active";
-
   // Simulate that /a has 0 bytes free.
   ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(0),
                               "disk_reserved_override_prefix_1_bytes_free_for_testing", "0"));
@@ -102,17 +86,17 @@ TEST_F(DiskReservationITest, TestFillMultipleDisks) {
                               "disk_reserved_override_prefix_2_bytes_free_for_testing",
                               Substitute("$0", 1L * 1024 * 1024 * 1024)));
 
-  // Wait until we have 1 unusable container.
+  // Wait until we have one full data dir.
   while (true) {
-    int64_t num_unavailable_containers;
+    int64_t num_full_data_dirs;
     ASSERT_OK(GetTsCounterValue(cluster_->tablet_server(0),
-                                &METRIC_log_block_manager_unavailable_containers,
-                                &num_unavailable_containers));
-    if (num_unavailable_containers >= 1) break;
+                                &METRIC_data_dirs_full,
+                                &num_full_data_dirs));
+    if (num_full_data_dirs >= 1) break;
     SleepFor(MonoDelta::FromMilliseconds(10));
   }
 
-  LOG(INFO) << "Have 1 unavailable log block container";
+  LOG(INFO) << "Have 1 full data dir";
 
   // Now simulate that all disks are full.
   ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(0),

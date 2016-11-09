@@ -27,7 +27,7 @@ from cython.operator cimport dereference as deref
 
 from libkudu_client cimport *
 from kudu.compat import tobytes, frombytes, dict_iter
-from kudu.schema cimport Schema, ColumnSchema
+from kudu.schema cimport Schema, ColumnSchema, KuduValue, KuduType
 from kudu.errors cimport check_status
 from kudu.util import to_unixtime_micros, from_unixtime_micros, from_hybridtime
 from errors import KuduException
@@ -66,6 +66,33 @@ cdef dict _type_names = {
     KUDU_BINARY : "KUDU_BINARY",
     KUDU_UNIXTIME_MICROS : "KUDU_UNIXTIME_MICROS"
 }
+
+# Range Partition Bound Type enums
+EXCLUSIVE_BOUND = PartitionType_Exclusive
+INCLUSIVE_BOUND = PartitionType_Inclusive
+
+cdef dict _partition_bound_types = {
+    'exclusive': PartitionType_Exclusive,
+    'inclusive': PartitionType_Inclusive
+}
+
+def _check_convert_range_bound_type(bound):
+    # Convert bounds types to constants and raise exception if invalid.
+    def invalid_bound_type(bound_type):
+        raise ValueError('Invalid range partition bound type: {0}'
+                         .format(bound_type))
+
+    if isinstance(bound, int):
+        if bound >= len(_partition_bound_types) \
+                or bound < 0:
+            invalid_bound_type(bound)
+        else:
+            return bound
+    else:
+        try:
+            return _partition_bound_types[bound.lower()]
+        except KeyError:
+            invalid_bound_type(bound)
 
 
 cdef class TimeDelta:
@@ -304,7 +331,7 @@ cdef class Client:
         try:
             c.table_name(tobytes(table_name))
             c.schema(schema.schema)
-            self._apply_partitioning(c, partitioning)
+            self._apply_partitioning(c, partitioning, schema)
             if n_replicas:
                 c.num_replicas(n_replicas)
             s = c.Create()
@@ -312,10 +339,13 @@ cdef class Client:
         finally:
             del c
 
-    cdef _apply_partitioning(self, KuduTableCreator* c, part):
+    cdef _apply_partitioning(self, KuduTableCreator* c, part, Schema schema):
         cdef:
             vector[string] v
-            PartialRow py_row
+            PartialRow lower_bound
+            PartialRow upper_bound
+            PartialRow split_row
+
         # Apply hash partitioning.
         for col_names, num_buckets, seed in part._hash_partitions:
             v.clear()
@@ -331,6 +361,32 @@ cdef class Client:
             for n in part._range_partition_cols:
                 v.push_back(tobytes(n))
             c.set_range_partition_columns(v)
+            if part._range_partitions:
+                for partition in part._range_partitions:
+                    if not isinstance(partition[0], PartialRow):
+                        lower_bound = schema.new_row(partition[0])
+                    else:
+                        lower_bound = partition[0]
+                    lower_bound._own = 0
+                    if not isinstance(partition[1], PartialRow):
+                        upper_bound = schema.new_row(partition[1])
+                    else:
+                        upper_bound = partition[1]
+                    upper_bound._own = 0
+                    c.add_range_partition(
+                        lower_bound.row,
+                        upper_bound.row,
+                        _check_convert_range_bound_type(partition[2]),
+                        _check_convert_range_bound_type(partition[3])
+                    )
+            if part._range_partition_splits:
+                for split in part._range_partition_splits:
+                    if not isinstance(split, PartialRow):
+                        split_row = schema.new_row(split)
+                    else:
+                        split_row = split
+                    split_row._own = 0
+                    c.add_range_partition_split(split_row.row)
 
     def delete_table(self, table_name):
         """
@@ -447,6 +503,7 @@ cdef class Client:
         result = []
         for i in range(tservers.size()):
             ts = TabletServer()
+            ts._own = 1
             result.append(ts._init(tservers[i]))
         return result
 
@@ -592,14 +649,26 @@ cdef class TabletServer:
 
     cdef:
         const KuduTabletServer* _tserver
+        public bint _own
 
     cdef _init(self, const KuduTabletServer* tserver):
         self._tserver = tserver
+        self._own = 0
         return self
 
     def __dealloc__(self):
-        if self._tserver != NULL:
+        if self._tserver != NULL and self._own:
             del self._tserver
+
+    def __richcmp__(TabletServer self, TabletServer other, int op):
+        if op == 2: # ==
+            return ((self.uuid(), self.hostname(), self.port()) ==
+                    (other.uuid(), other.hostname(), other.port()))
+        elif op == 3: # !=
+            return ((self.uuid(), self.hostname(), self.port()) !=
+                    (other.uuid(), other.hostname(), other.port()))
+        else:
+            raise NotImplementedError
 
     def uuid(self):
         return frombytes(self._tserver.uuid())
@@ -650,13 +719,18 @@ cdef class Table:
         return Column(self, spec)
 
     property name:
-
+        """Name of the table."""
         def __get__(self):
             return frombytes(self.ptr().name())
 
+    property id:
+        """Identifier string for the table."""
+        def __get__(self):
+            return frombytes(self.ptr().id())
+
     # XXX: don't love this name
     property num_columns:
-
+        """Number of columns in the table's schema."""
         def __get__(self):
             return len(self.schema)
 
@@ -814,38 +888,10 @@ cdef class Column:
                           self.spec.type.name))
         return result
 
-    cdef KuduValue* box_value(self, object obj) except NULL:
-        cdef:
-            KuduValue* val
-            Slice slc
-
-        if (self.spec.type.name[:3] == 'int'):
-            val = KuduValue.FromInt(obj)
-        elif (self.spec.type.name in ['string', 'binary']):
-            if isinstance(obj, unicode):
-                obj = obj.encode('utf8')
-
-            slc = Slice(<char*> obj, len(obj))
-            val = KuduValue.CopyString(slc)
-        elif (self.spec.type.name == 'bool'):
-            val = KuduValue.FromBool(obj)
-        elif (self.spec.type.name == 'float'):
-            val = KuduValue.FromFloat(obj)
-        elif (self.spec.type.name == 'double'):
-            val = KuduValue.FromDouble(obj)
-        elif (self.spec.type.name == 'unixtime_micros'):
-            obj = to_unixtime_micros(obj)
-            val = KuduValue.FromInt(obj)
-        else:
-            raise TypeError("Cannot add predicate for kudu type <{0}>"
-                            .format(self.spec.type.name))
-
-        return val
-
     def __richcmp__(Column self, value, int op):
         cdef:
             KuduPredicate* pred
-            KuduValue* val
+            KuduValue val
             Slice col_name_slice
             ComparisonOp cmp_op
             Predicate result
@@ -865,10 +911,10 @@ cdef class Column:
         else:
             raise NotImplementedError
 
-        val = self.box_value(value)
+        val = self.spec.type.new_value(value)
         pred = (self.parent.ptr()
                 .NewComparisonPredicate(col_name_slice,
-                                        cmp_op, val))
+                                        cmp_op, val._value))
 
         result = Predicate()
         result.init(pred)
@@ -894,7 +940,8 @@ cdef class Column:
         """
         cdef:
             KuduPredicate* pred
-            vector[KuduValue*] vals
+            KuduValue kval
+            vector[C_KuduValue*] vals
             Slice col_name_slice
             Predicate result
             object _name = tobytes(self.name)
@@ -903,7 +950,8 @@ cdef class Column:
 
         try:
             for val in values:
-                vals.push_back(self.box_value(val))
+                kval = self.spec.type.new_value(val)
+                vals.push_back(kval._value)
         except TypeError:
             while not vals.empty():
                 _val = vals.back()
@@ -926,6 +974,8 @@ class Partitioning(object):
     def __init__(self):
         self._hash_partitions = []
         self._range_partition_cols = None
+        self._range_partitions = []
+        self._range_partition_splits = []
 
     def add_hash_partitions(self, column_names, num_buckets, seed=None):
         """
@@ -973,12 +1023,67 @@ class Partitioning(object):
         -------
         self: this object
         """
+        if isinstance(column_names, str):
+            column_names = [column_names]
         self._range_partition_cols = column_names
         return self
 
-    # TODO: implement split_rows.
-    # This is slightly tricky since currently the PartialRow constructor requires a
-    # Table object, which doesn't exist yet. Should we use tuples instead?
+    def add_range_partition(self, lower_bound=None,
+                                  upper_bound=None,
+                                  lower_bound_type='inclusive',
+                                  upper_bound_type='exclusive'):
+        """
+        Add a range partition to the table.
+
+        Multiple range partitions may be added, but they must not overlap.
+        All range splits specified by add_range_partition_split must fall
+        in a range partition. The lower bound must be less than or equal
+        to the upper bound.
+
+        If this method is not called, the table's range will be unbounded.
+
+        Parameters
+        ----------
+        lower_bound : PartialRow/list/tuple/dict
+        upper_bound : PartialRow/list/tuple/dict
+        lower_bound_type : {'inclusive', 'exclusive'} or constants
+          kudu.EXCLUSIVE_BOUND and kudu.INCLUSIVE_BOUND
+        upper_bound_type : {'inclusive', 'exclusive'} or constants
+          kudu.EXCLUSIVE_BOUND and kudu.INCLUSIVE_BOUND
+
+        Returns
+        -------
+        self : Partitioning
+        """
+        if self._range_partition_cols:
+            self._range_partitions.append(
+                (lower_bound, upper_bound, lower_bound_type, upper_bound_type)
+            )
+        else:
+            raise ValueError("Range Partition Columns must be set before " +
+                             "adding a range partition.")
+
+        return self
+
+    def add_range_partition_split(self, split_row):
+        """
+        Add a range partition split at the provided row.
+
+        Parameters
+        ----------
+        split_row : PartialRow/list/tuple/dict
+
+        Returns
+        -------
+        self : Partitioning
+        """
+        if self._range_partition_cols:
+            self._range_partition_splits.append(split_row)
+        else:
+            raise ValueError("Range Partition Columns must be set before " +
+                             "adding a range partition split.")
+
+        return self
 
 
 cdef class Predicate:
@@ -1361,6 +1466,8 @@ cdef class Scanner:
         -------
         self : Scanner
         """
+        if isinstance(names, str):
+            names = [names]
         cdef vector[string] v_names
         for name in names:
             v_names.push_back(tobytes(name))
@@ -1644,6 +1751,77 @@ cdef class Scanner:
         check_status(self.scanner.NextBatch(&batch.batch))
         return batch
 
+    def set_cache_blocks(self, cache_blocks):
+        """
+        Sets the block caching policy.
+        Returns a reference to itself to facilitate chaining.
+
+        Parameters
+        ----------
+        cache_blocks : bool
+
+        Returns
+        -------
+        self : Scanner
+        """
+        check_status(self.scanner.SetCacheBlocks(cache_blocks))
+        return self
+
+    def keep_alive(self):
+        """
+        Keep the current remote scanner alive.
+
+        Keep the current remote scanner alive on the Tablet server for an
+        additional time-to-live (set by a configuration flag on the tablet
+        server). This is useful if the interval in between NextBatch() calls is
+        big enough that the remote scanner might be garbage collected (default
+        ttl is set to 60 secs.). This does not invalidate any previously
+        fetched results.
+
+        Returns
+        -------
+        self : Scanner
+        """
+        check_status(self.scanner.KeepAlive())
+        return self
+
+    def get_current_server(self):
+        """
+        Get the TabletServer that is currently handling the scan.
+
+        More concretely, this is the server that handled the most recent open()
+        or next_batch() RPC made by the server.
+
+        Returns
+        -------
+        tserver : TabletServer
+        """
+        cdef:
+            TabletServer tserver = TabletServer()
+            KuduTabletServer* tserver_p = NULL
+
+        check_status(self.scanner.GetCurrentServer(&tserver_p))
+        tserver._own = 1
+        tserver._init(tserver_p)
+        return tserver
+
+    def close(self):
+        """
+        Close the scanner.
+
+        Closing the scanner releases resources on the server. This call does
+        not block, and will not ever fail, even if the server cannot be
+        contacted.
+
+        Note: The scanner is reset to its initial state by this function.
+        You'll have to re-add any projection, predicates, etc if you want to
+        reuse this object.
+        Note: When the Scanner object is garbage collected, this method is run.
+        This method call is only needed if you want to explicitly release the
+        resources on the server.
+        """
+        self.scanner.Close()
+
 
 cdef class ScanToken:
     """
@@ -1756,6 +1934,8 @@ cdef class ScanTokenBuilder:
         -------
         self : ScanTokenBuilder
         """
+        if isinstance(names, str):
+            names = [names]
         cdef vector[string] v_names
         for name in names:
             v_names.push_back(tobytes(name))
@@ -2108,10 +2288,6 @@ cdef class Replica:
         self._replica = replica
         return self
 
-    def __dealloc__(self):
-        if self._replica != NULL:
-            del self._replica
-
     def is_leader(self):
         return self._replica.is_leader()
 
@@ -2138,7 +2314,29 @@ cdef class KuduError:
             del self.error
 
     def failed_op(self):
-        raise NotImplementedError
+        """
+        Get debug string representation of the failed operation.
+
+        Returns
+        -------
+        op : str
+        """
+        return frombytes(self.error.failed_op().ToString())
+
+    def was_possibly_successful(self):
+        """
+        Check if there is a chance that the requested operation was successful.
+
+        In some cases, it is possible that the server did receive and
+        successfully perform the requested operation, but the client can't
+        tell whether or not it was successful. For example, if the call times
+        out, the server may still succeed in processing at a later time.
+
+        Returns
+        -------
+        result : bool
+        """
+        return self.error.was_possibly_successful()
 
     def __repr__(self):
         return "KuduError('%s')" % (self.error.status().ToString())
@@ -2159,7 +2357,11 @@ cdef class PartialRow:
         if isinstance(key, basestring):
             self.set_field(key, value)
         else:
-            self.set_loc(key, value)
+            if 0 <= key < len(self.schema):
+                self.set_loc(key, value)
+            else:
+                raise IndexError("Column index {0} is out of bounds."
+                                 .format(key))
 
     def from_record(self, record):
         """

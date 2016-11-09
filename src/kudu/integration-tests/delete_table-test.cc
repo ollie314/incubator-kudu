@@ -113,12 +113,6 @@ class DeleteTableTest : public ExternalMiniClusterITestBase {
   // Delete the given table. If the operation times out, dumps the master stacks
   // to help debug master-side deadlocks.
   void DeleteTable(const string& table_name);
-
-  // Repeatedly try to delete the tablet, retrying on failure up to the
-  // specified timeout. Deletion can fail when other operations, such as
-  // bootstrap or tablet copy, are running.
-  void DeleteTabletWithRetries(const TServerDetails* ts, const string& tablet_id,
-                               TabletDataState delete_type, const MonoDelta& timeout);
 };
 
 string DeleteTableTest::GetLeaderUUID(const string& ts_uuid, const string& tablet_id) {
@@ -215,24 +209,6 @@ void DeleteTableTest::DeleteTable(const string& table_name) {
   if (s.IsTimedOut()) {
     WARN_NOT_OK(PstackWatcher::DumpPidStacks(cluster_->master()->pid()),
                         "Couldn't dump stacks");
-  }
-  ASSERT_OK(s);
-}
-
-void DeleteTableTest::DeleteTabletWithRetries(const TServerDetails* ts,
-                                              const string& tablet_id,
-                                              TabletDataState delete_type,
-                                              const MonoDelta& timeout) {
-  MonoTime start(MonoTime::Now());
-  MonoTime deadline = start + timeout;
-  Status s;
-  while (true) {
-    s = itest::DeleteTablet(ts, tablet_id, delete_type, boost::none, timeout);
-    if (s.ok()) return;
-    if (deadline < MonoTime::Now()) {
-      break;
-    }
-    SleepFor(MonoDelta::FromMilliseconds(10));
   }
   ASSERT_OK(s);
 }
@@ -778,7 +754,8 @@ TEST_F(DeleteTableTest, TestMergeConsensusMetadata) {
   cluster_->tablet_server(2)->Shutdown();
 
   // Delete with retries because the tablet might still be bootstrapping.
-  NO_FATALS(DeleteTabletWithRetries(ts, tablet_id, TABLET_DATA_TOMBSTONED, timeout));
+  NO_FATALS(itest::DeleteTabletWithRetries(ts, tablet_id,
+                                           TABLET_DATA_TOMBSTONED, boost::none, timeout));
   NO_FATALS(WaitForTabletTombstonedOnTS(kTsIndex, tablet_id, CMETA_EXPECTED));
 
   ASSERT_OK(cluster_->tablet_server(1)->Restart());
@@ -1196,7 +1173,6 @@ TEST_P(DeleteTableTombstonedParamTest, TestTabletTombstone) {
   ASSERT_OK(cluster_->tablet_server(kTsIndex)->Restart());
   LOG(INFO) << "Waiting for second tablet to be tombstoned...";
   NO_FATALS(WaitForTabletTombstonedOnTS(kTsIndex, tablet_id, CMETA_EXPECTED));
-
   // The tombstoned tablets will still show up in ListTablets(),
   // just with their data state set as TOMBSTONED. They should also be listed
   // as NOT_STARTED because we restarted the server.
@@ -1207,13 +1183,24 @@ TEST_P(DeleteTableTombstonedParamTest, TestTabletTombstone) {
         << t.tablet_status().tablet_id() << " not tombstoned";
   }
 
+  // Check that, upon restart of the tablet server with a tombstoned tablet,
+  // we don't unnecessary "roll forward" and rewrite the tablet metadata file
+  // when it is already fully deleted.
+  int64_t orig_mtime = inspect_->GetTabletSuperBlockMTimeOrDie(kTsIndex, tablet_id);
+  cluster_->tablet_server(kTsIndex)->Shutdown();
+  ASSERT_OK(cluster_->tablet_server(kTsIndex)->Restart());
+  int64_t new_mtime = inspect_->GetTabletSuperBlockMTimeOrDie(kTsIndex, tablet_id);
+  ASSERT_EQ(orig_mtime, new_mtime)
+      << "Tablet superblock should not have been re-flushed unnecessarily";
+
   // Finally, delete all tablets on the TS, and wait for all data to be gone.
   LOG(INFO) << "Deleting all tablets...";
   for (const ListTabletsResponsePB::StatusAndSchemaPB& tablet : tablets) {
     string tablet_id = tablet.tablet_status().tablet_id();
     // We need retries here, since some of the tablets may still be
     // bootstrapping after being restarted above.
-    NO_FATALS(DeleteTabletWithRetries(ts, tablet_id, TABLET_DATA_DELETED, timeout));
+    NO_FATALS(itest::DeleteTabletWithRetries(ts, tablet_id,
+                                             TABLET_DATA_DELETED, boost::none, timeout));
   }
   ASSERT_OK(inspect_->WaitForNoDataOnTS(kTsIndex));
 }

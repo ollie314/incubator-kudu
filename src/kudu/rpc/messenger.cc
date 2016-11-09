@@ -47,6 +47,7 @@
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/util/net/ssl_factory.h"
 #include "kudu/util/status.h"
 #include "kudu/util/threadpool.h"
 #include "kudu/util/trace.h"
@@ -55,10 +56,32 @@ using std::string;
 using std::shared_ptr;
 using strings::Substitute;
 
+
+DEFINE_string(rpc_ssl_server_certificate, "", "Path to the SSL certificate to be used for the RPC "
+    "layer.");
+DEFINE_string(rpc_ssl_private_key, "",
+    "Path to the private key to be used to complement the public key present in "
+    "--ssl_server_certificate");
+DEFINE_string(rpc_ssl_certificate_authority, "",
+    "Path to the certificate authority to be used by the client side of the connection to verify "
+    "the validity of the certificate presented by the server.");
+
 DEFINE_int32(rpc_default_keepalive_time_ms, 65000,
              "If an RPC connection from a client is idle for this amount of time, the server "
              "will disconnect the client.");
+
+TAG_FLAG(rpc_ssl_server_certificate, experimental);
+TAG_FLAG(rpc_ssl_private_key, experimental);
+TAG_FLAG(rpc_ssl_certificate_authority, experimental);
 TAG_FLAG(rpc_default_keepalive_time_ms, advanced);
+
+DEFINE_bool(server_require_kerberos, false,
+            "Whether to force all inbound RPC connections to authenticate "
+            "with Kerberos");
+// TODO(todd): this flag is too coarse-grained, since secure servers still
+// need to allow non-kerberized connections authenticated by tokens. But
+// it's a useful stop-gap.
+TAG_FLAG(server_require_kerberos, experimental);
 
 namespace kudu {
 namespace rpc {
@@ -71,7 +94,8 @@ MessengerBuilder::MessengerBuilder(std::string name)
       connection_keepalive_time_(
           MonoDelta::FromMilliseconds(FLAGS_rpc_default_keepalive_time_ms)),
       num_reactors_(4),
-      num_negotiation_threads_(4),
+      min_negotiation_threads_(0),
+      max_negotiation_threads_(4),
       coarse_timer_granularity_(MonoDelta::FromMilliseconds(100)) {}
 
 MessengerBuilder& MessengerBuilder::set_connection_keepalive_time(const MonoDelta &keepalive) {
@@ -84,8 +108,13 @@ MessengerBuilder& MessengerBuilder::set_num_reactors(int num_reactors) {
   return *this;
 }
 
-MessengerBuilder& MessengerBuilder::set_negotiation_threads(int num_negotiation_threads) {
-  num_negotiation_threads_ = num_negotiation_threads;
+MessengerBuilder& MessengerBuilder::set_min_negotiation_threads(int min_negotiation_threads) {
+  min_negotiation_threads_ = min_negotiation_threads;
+  return *this;
+}
+
+MessengerBuilder& MessengerBuilder::set_max_negotiation_threads(int max_negotiation_threads) {
+  max_negotiation_threads_ = max_negotiation_threads;
   return *this;
 }
 
@@ -154,10 +183,19 @@ void Messenger::Shutdown() {
   for (Reactor* reactor : reactors_) {
     reactor->Shutdown();
   }
+  ssl_factory_.reset();
 }
 
 Status Messenger::AddAcceptorPool(const Sockaddr &accept_addr,
                                   shared_ptr<AcceptorPool>* pool) {
+  // Before listening, if we expect to require Kerberos, we want to verify
+  // that everything is set up correctly. This way we'll generate errors on
+  // startup rather than later on when we first receive a client connection.
+  if (FLAGS_server_require_kerberos) {
+    RETURN_NOT_OK_PREPEND(SaslServer::PreflightCheckGSSAPI(kSaslAppName),
+                          "GSSAPI/Kerberos not properly configured");
+  }
+
   Socket sock;
   RETURN_NOT_OK(sock.Init(0));
   RETURN_NOT_OK(sock.SetReuseAddr(true));
@@ -239,7 +277,8 @@ Messenger::Messenger(const MessengerBuilder &bld)
     reactors_.push_back(new Reactor(retain_self_, i, bld));
   }
   CHECK_OK(ThreadPoolBuilder("negotiator")
-              .set_max_threads(bld.num_negotiation_threads_)
+              .set_min_threads(bld.min_negotiation_threads_)
+              .set_max_threads(bld.max_negotiation_threads_)
               .Build(&negotiation_pool_));
 }
 
@@ -260,6 +299,15 @@ Reactor* Messenger::RemoteToReactor(const Sockaddr &remote) {
 
 Status Messenger::Init() {
   Status status;
+  ssl_enabled_ = !FLAGS_rpc_ssl_server_certificate.empty() || !FLAGS_rpc_ssl_private_key.empty()
+                   || !FLAGS_rpc_ssl_certificate_authority.empty();
+  if (ssl_enabled_) {
+    ssl_factory_.reset(new SSLFactory());
+    RETURN_NOT_OK(ssl_factory_->Init());
+    RETURN_NOT_OK(ssl_factory_->LoadCertificate(FLAGS_rpc_ssl_server_certificate));
+    RETURN_NOT_OK(ssl_factory_->LoadPrivateKey(FLAGS_rpc_ssl_private_key));
+    RETURN_NOT_OK(ssl_factory_->LoadCertificateAuthority(FLAGS_rpc_ssl_certificate_authority));
+  }
   for (Reactor* r : reactors_) {
     RETURN_NOT_OK(r->Init());
   }

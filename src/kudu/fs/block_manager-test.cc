@@ -53,7 +53,7 @@ DECLARE_uint64(log_container_max_size);
 DECLARE_int64(fs_data_dirs_reserved_bytes);
 DECLARE_int64(disk_reserved_bytes_free_for_testing);
 
-DECLARE_int32(log_block_manager_full_disk_cache_seconds);
+DECLARE_int32(fs_data_dirs_full_disk_cache_seconds);
 DECLARE_string(block_manager);
 
 // Generic block manager metrics.
@@ -69,6 +69,9 @@ METRIC_DECLARE_gauge_uint64(log_block_manager_bytes_under_management);
 METRIC_DECLARE_gauge_uint64(log_block_manager_blocks_under_management);
 METRIC_DECLARE_counter(log_block_manager_containers);
 METRIC_DECLARE_counter(log_block_manager_full_containers);
+
+// Data directory metrics.
+METRIC_DECLARE_gauge_uint64(data_dirs_full);
 
 // The LogBlockManager is only supported on Linux, since it requires hole punching.
 #define RETURN_NOT_LOG_BLOCK_MANAGER() \
@@ -116,6 +119,24 @@ class BlockManagerTest : public KuduTest {
       RETURN_NOT_OK(bm_->Create());
     }
     return bm_->Open();
+  }
+
+  void GetOnlyContainerDataFile(string* data_file) {
+    // The expected directory contents are dot, dotdot, test metadata, instance
+    // file, and one container file pair.
+    string container_data_filename;
+    vector<string> children;
+    ASSERT_OK(env_->GetChildren(GetTestDataDirectory(), &children));
+    ASSERT_EQ(6, children.size());
+    for (const string& child : children) {
+      if (HasSuffixString(child, ".data")) {
+        ASSERT_TRUE(container_data_filename.empty());
+        container_data_filename = JoinPathSegments(GetTestDataDirectory(), child);
+        break;
+      }
+    }
+    ASSERT_FALSE(container_data_filename.empty());
+    *data_file = container_data_filename;
   }
 
   void RunMultipathTest(const vector<string>& paths);
@@ -291,44 +312,53 @@ void BlockManagerTest<FileBlockManager>::RunLogContainerPreallocationTest() {
 
 template <>
 void BlockManagerTest<LogBlockManager>::RunLogContainerPreallocationTest() {
+  string kTestData = "test data";
+
+  // For this test to work properly, the preallocation window has to be at
+  // least three times the size of the test data.
+  ASSERT_GE(FLAGS_log_container_preallocate_bytes, kTestData.size() * 3);
+
   // Create a block with some test data. This should also trigger
   // preallocation of the container, provided it's supported by the kernel.
   gscoped_ptr<WritableBlock> written_block;
   ASSERT_OK(this->bm_->CreateBlock(&written_block));
+  ASSERT_OK(written_block->Append(kTestData));
   ASSERT_OK(written_block->Close());
 
-  // Now reopen the block manager and create another block. More
-  // preallocation, but it should be from the end of the previous block,
-  // not from the end of the file.
+  // We expect the container size to either be equal to the test data size (if
+  // preallocation isn't supported) or equal to the preallocation amount, which
+  // we know is greater than the test data size.
+  string container_data_filename;
+  NO_FATALS(GetOnlyContainerDataFile(&container_data_filename));
+  uint64_t size;
+  ASSERT_OK(this->env_->GetFileSizeOnDisk(container_data_filename, &size));
+  ASSERT_TRUE(size == kTestData.size() ||
+              size == FLAGS_log_container_preallocate_bytes);
+
+  // Upon writing a second block, we'd expect the container to either double in
+  // size (without preallocation) or remain the same size (with preallocation).
+  ASSERT_OK(this->bm_->CreateBlock(&written_block));
+  ASSERT_OK(written_block->Append(kTestData));
+  ASSERT_OK(written_block->Close());
+  NO_FATALS(GetOnlyContainerDataFile(&container_data_filename));
+  ASSERT_OK(this->env_->GetFileSizeOnDisk(container_data_filename, &size));
+  ASSERT_TRUE(size == kTestData.size() * 2 ||
+              size == FLAGS_log_container_preallocate_bytes);
+
+
+  // Now reopen the block manager and create another block. The block manager
+  // should be smart enough to reuse the previously preallocated amount.
   ASSERT_OK(this->ReopenBlockManager(scoped_refptr<MetricEntity>(),
                                      shared_ptr<MemTracker>(),
                                      { GetTestDataDirectory() },
                                      false));
   ASSERT_OK(this->bm_->CreateBlock(&written_block));
+  ASSERT_OK(written_block->Append(kTestData));
   ASSERT_OK(written_block->Close());
-
-  // dot, dotdot, test metadata, instance file, and one container file pair.
-  vector<string> children;
-  ASSERT_OK(this->env_->GetChildren(GetTestDataDirectory(), &children));
-  ASSERT_EQ(6, children.size());
-
-  // If preallocation was done from the end of the file (rather than the
-  // end of the previous block), the file's size would be twice the
-  // preallocation amount. That would be wrong.
-  //
-  // Instead, we expect the size to either be 0 (preallocation isn't
-  // supported) or equal to the preallocation amount.
-  bool found = false;
-  for (const string& child : children) {
-    if (HasSuffixString(child, ".data")) {
-      found = true;
-      uint64_t size;
-      ASSERT_OK(this->env_->GetFileSizeOnDisk(
-          JoinPathSegments(GetTestDataDirectory(), child), &size));
-      ASSERT_TRUE(size == 0 || size == FLAGS_log_container_preallocate_bytes);
-    }
-  }
-  ASSERT_TRUE(found);
+  NO_FATALS(GetOnlyContainerDataFile(&container_data_filename));
+  ASSERT_OK(this->env_->GetFileSizeOnDisk(container_data_filename, &size));
+  ASSERT_TRUE(size == kTestData.size() * 3 ||
+              size == FLAGS_log_container_preallocate_bytes);
 }
 
 template <>
@@ -753,7 +783,7 @@ TEST_F(LogBlockManagerTest, TestReuseBlockIds) {
     ASSERT_OK(writer->Close());
   }
 
-  ASSERT_EQ(4, bm_->available_containers_.size());
+  ASSERT_EQ(4, bm_->all_containers_.size());
 
   // Delete the original blocks.
   for (const BlockId& b : block_ids) {
@@ -818,7 +848,7 @@ TEST_F(LogBlockManagerTest, TestMetadataTruncation) {
 
   // Start corrupting the metadata file in different ways.
 
-  string path = LogBlockManager::ContainerPathForTests(bm_->available_containers_.front());
+  string path = LogBlockManager::ContainerPathForTests(bm_->all_containers_.front());
   string metadata_path = path + LogBlockManager::kContainerMetadataFileSuffix;
   string data_path = path + LogBlockManager::kContainerDataFileSuffix;
 
@@ -926,7 +956,8 @@ TEST_F(LogBlockManagerTest, TestMetadataTruncation) {
 
   // Ensure that we only ever created a single container.
   ASSERT_EQ(1, bm_->all_containers_.size());
-  ASSERT_EQ(1, bm_->available_containers_.size());
+  ASSERT_EQ(1, bm_->available_containers_by_data_dir_.size());
+  ASSERT_EQ(1, bm_->available_containers_by_data_dir_.begin()->second.size());
 
   // Find location of 2nd record in metadata file and corrupt it.
   // This is an unrecoverable error because it's in the middle of the file.
@@ -976,29 +1007,65 @@ TEST_F(LogBlockManagerTest, TestMetadataTruncation) {
                                      false));
 }
 
-TEST_F(LogBlockManagerTest, TestDiskSpaceCheck) {
-  RETURN_NOT_LOG_BLOCK_MANAGER();
+TYPED_TEST(BlockManagerTest, TestDiskSpaceCheck) {
+  // Reopen the block manager with metrics enabled.
+  MetricRegistry registry;
+  scoped_refptr<MetricEntity> entity = METRIC_ENTITY_server.Instantiate(&registry, "test");
+  ASSERT_OK(this->ReopenBlockManager(entity,
+                                     shared_ptr<MemTracker>(),
+                                     { GetTestDataDirectory() },
+                                     false));
 
-  FLAGS_log_block_manager_full_disk_cache_seconds = 0; // Don't cache device fullness.
-
+  FLAGS_fs_data_dirs_full_disk_cache_seconds = 0; // Don't cache device fullness.
   FLAGS_fs_data_dirs_reserved_bytes = 1; // Keep at least 1 byte reserved in the FS.
-  FLAGS_disk_reserved_bytes_free_for_testing = 0;
-  FLAGS_log_container_preallocate_bytes = 100;
+  FLAGS_log_container_preallocate_bytes = 0; // Disable preallocation.
 
-  vector<BlockId> created_blocks;
-  gscoped_ptr<WritableBlock> writer;
-  Status s = bm_->CreateBlock(&writer);
-  ASSERT_TRUE(s.IsIOError());
-  ASSERT_STR_CONTAINS(s.ToString(), "All data directories are full");
+  // Normally, a data dir is checked for fullness only after a block is closed;
+  // if it's now full, the next attempt at block creation will fail. Only when
+  // a data dir was last observed as full is it also checked before block creation.
+  //
+  // This behavior enforces a "soft" limit on disk space consumption but
+  // complicates testing somewhat.
+  bool data_dir_observed_full = false;
 
-  FLAGS_disk_reserved_bytes_free_for_testing = 101;
-  ASSERT_OK(bm_->CreateBlock(&writer));
+  int i = 0;
+  for (int free_space : { 0, 2, 0 }) {
+    FLAGS_disk_reserved_bytes_free_for_testing = free_space;
 
-  FLAGS_disk_reserved_bytes_free_for_testing = 0;
-  s = bm_->CreateBlock(&writer);
-  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+    for (int attempt = 0; attempt < 3; attempt++) {
+      gscoped_ptr<WritableBlock> writer;
+      LOG(INFO) << "Attempt #" << ++i;
+      Status s = this->bm_->CreateBlock(&writer);
+      if (FLAGS_disk_reserved_bytes_free_for_testing < FLAGS_fs_data_dirs_reserved_bytes) {
+        if (data_dir_observed_full) {
+          // The dir was previously observed as full, so CreateBlock() checked
+          // fullness again and failed.
+          ASSERT_TRUE(s.IsIOError());
+          ASSERT_STR_CONTAINS(s.ToString(), "All data directories are full");
+        } else {
+          ASSERT_OK(s);
+          ASSERT_OK(writer->Append("test data"));
+          ASSERT_OK(writer->Close());
 
-  ASSERT_OK(writer->Close());
+          // The dir was not previously full so CreateBlock() did not check for
+          // fullness, but given the parameters of the test, we know that the
+          // dir was observed as full at Close().
+          data_dir_observed_full = true;
+        }
+        ASSERT_EQ(1, down_cast<AtomicGauge<uint64_t>*>(
+            entity->FindOrNull(METRIC_data_dirs_full).get())->value());
+      } else {
+        // CreateBlock() succeeded regardless of the previously fullness state,
+        // and the new state is definitely not full.
+        ASSERT_OK(s);
+        ASSERT_OK(writer->Append("test data"));
+        ASSERT_OK(writer->Close());
+        data_dir_observed_full = false;
+        ASSERT_EQ(0, down_cast<AtomicGauge<uint64_t>*>(
+            entity->FindOrNull(METRIC_data_dirs_full).get())->value());
+      }
+    }
+  }
 }
 
 } // namespace fs

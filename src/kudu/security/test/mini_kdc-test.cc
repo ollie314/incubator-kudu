@@ -19,7 +19,7 @@
 
 #include <gtest/gtest.h>
 
-#include "kudu/security/mini_kdc.h"
+#include "kudu/security/test/mini_kdc.h"
 #include "kudu/util/env.h"
 #include "kudu/util/test_util.h"
 
@@ -38,14 +38,24 @@ TEST(MiniKdcTest, TestBasicOperation) {
   ASSERT_OK(kdc.Stop());
   ASSERT_OK(kdc.Start());
 
-  ASSERT_OK(kdc.CreateUserPrincipal("bob"));
-  ASSERT_OK(kdc.Kinit("bob"));
-
+  // Check that alice is kinit'd.
   string klist;
   ASSERT_OK(kdc.Klist(&klist));
   ASSERT_STR_CONTAINS(klist, "alice@KRBTEST.COM");
+
+  ASSERT_OK(kdc.CreateUserPrincipal("bob"));
+  ASSERT_OK(kdc.Kinit("bob"));
+
+  // Check that bob has replaced alice as the kinit'd principal.
+  ASSERT_OK(kdc.Klist(&klist));
+  ASSERT_STR_NOT_CONTAINS(klist, "alice@KRBTEST.COM");
   ASSERT_STR_CONTAINS(klist, "bob@KRBTEST.COM");
   ASSERT_STR_CONTAINS(klist, "krbtgt/KRBTEST.COM@KRBTEST.COM");
+
+  // Drop 'bob' credentials. We'll get a RuntimeError because klist
+  // exits with a non-zero exit code if there are no cached credentials.
+  ASSERT_OK(kdc.Kdestroy());
+  ASSERT_TRUE(kdc.Klist(&klist).IsRuntimeError());
 
   // Test keytab creation.
   string kt_path;

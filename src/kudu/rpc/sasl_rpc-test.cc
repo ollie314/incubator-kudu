@@ -18,6 +18,7 @@
 #include "kudu/rpc/rpc-test-base.h"
 
 #include <stdlib.h>
+#include <sys/stat.h>
 
 #include <functional>
 #include <memory>
@@ -29,11 +30,12 @@
 
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/constants.h"
 #include "kudu/rpc/sasl_client.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/sasl_server.h"
-#include "kudu/security/mini_kdc.h"
+#include "kudu/security/test/mini_kdc.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
@@ -54,10 +56,10 @@ class TestSaslRpc : public RpcTestBase {
 
 // Test basic initialization of the objects.
 TEST_F(TestSaslRpc, TestBasicInit) {
-  SaslServer server(kSaslAppName, -1);
+  SaslServer server(kSaslAppName, nullptr);
   server.EnableAnonymous();
   ASSERT_OK(server.Init(kSaslAppName));
-  SaslClient client(kSaslAppName, -1);
+  SaslClient client(kSaslAppName, nullptr);
   client.EnableAnonymous();
   ASSERT_OK(client.Init(kSaslAppName));
 }
@@ -106,14 +108,14 @@ static void RunNegotiationTest(const SocketCallable& server_runner,
 ////////////////////////////////////////////////////////////////////////////////
 
 static void RunAnonNegotiationServer(Socket* conn) {
-  SaslServer sasl_server(kSaslAppName, conn->GetFd());
+  SaslServer sasl_server(kSaslAppName, conn);
   CHECK_OK(sasl_server.EnableAnonymous());
   CHECK_OK(sasl_server.Init(kSaslAppName));
   CHECK_OK(sasl_server.Negotiate());
 }
 
 static void RunAnonNegotiationClient(Socket* conn) {
-  SaslClient sasl_client(kSaslAppName, conn->GetFd());
+  SaslClient sasl_client(kSaslAppName, conn);
   CHECK_OK(sasl_client.EnableAnonymous());
   CHECK_OK(sasl_client.Init(kSaslAppName));
   CHECK_OK(sasl_client.Negotiate());
@@ -127,7 +129,7 @@ TEST_F(TestSaslRpc, TestAnonNegotiation) {
 ////////////////////////////////////////////////////////////////////////////////
 
 static void RunPlainNegotiationServer(Socket* conn) {
-  SaslServer sasl_server(kSaslAppName, conn->GetFd());
+  SaslServer sasl_server(kSaslAppName, conn);
   CHECK_OK(sasl_server.EnablePlain());
   CHECK_OK(sasl_server.Init(kSaslAppName));
   CHECK_OK(sasl_server.Negotiate());
@@ -136,7 +138,7 @@ static void RunPlainNegotiationServer(Socket* conn) {
 }
 
 static void RunPlainNegotiationClient(Socket* conn) {
-  SaslClient sasl_client(kSaslAppName, conn->GetFd());
+  SaslClient sasl_client(kSaslAppName, conn);
   CHECK_OK(sasl_client.EnablePlain("my-username", "ignored password"));
   CHECK_OK(sasl_client.Init(kSaslAppName));
   CHECK_OK(sasl_client.Negotiate());
@@ -159,7 +161,7 @@ using CheckerFunction = std::function<void(const Status&, T&)>;
 static void RunGSSAPINegotiationServer(
     Socket* conn,
     const CheckerFunction<SaslServer>& post_check) {
-  SaslServer sasl_server(kSaslAppName, conn->GetFd());
+  SaslServer sasl_server(kSaslAppName, conn);
   sasl_server.set_server_fqdn("127.0.0.1");
   CHECK_OK(sasl_server.EnableGSSAPI());
   CHECK_OK(sasl_server.Init(kSaslAppName));
@@ -171,7 +173,7 @@ static void RunGSSAPINegotiationServer(
 static void RunGSSAPINegotiationClient(
     Socket* conn,
     const CheckerFunction<SaslClient>& post_check) {
-  SaslClient sasl_client(kSaslAppName, conn->GetFd());
+  SaslClient sasl_client(kSaslAppName, conn);
   sasl_client.set_server_fqdn("127.0.0.1");
   CHECK_OK(sasl_client.EnableGSSAPI());
   CHECK_OK(sasl_client.Init(kSaslAppName));
@@ -188,7 +190,7 @@ TEST_F(TestSaslRpc, TestRestrictiveServer_NonRestrictiveClient) {
 
   // Create the server principal and keytab.
   string kt_path;
-  ASSERT_OK(kdc.CreateServiceKeytab("kudu/localhost", &kt_path));
+  ASSERT_OK(kdc.CreateServiceKeytab("kudu/127.0.0.1", &kt_path));
   CHECK_ERR(setenv("KRB5_KTNAME", kt_path.c_str(), 1 /*replace*/));
 
   // Create and kinit as a client user.
@@ -205,7 +207,7 @@ TEST_F(TestSaslRpc, TestRestrictiveServer_NonRestrictiveClient) {
                   CHECK_EQ("testuser", server.authenticated_user());
                 }),
       [](Socket* conn) {
-        SaslClient sasl_client(kSaslAppName, conn->GetFd());
+        SaslClient sasl_client(kSaslAppName, conn);
         sasl_client.set_server_fqdn("127.0.0.1");
         // The client enables both PLAIN and GSSAPI.
         CHECK_OK(sasl_client.EnablePlain("foo", "bar"));
@@ -240,13 +242,13 @@ TEST_F(TestSaslRpc, TestNoMatchingMechanisms) {
                   ASSERT_STR_CONTAINS(s.ToString(), "got EOF from remote");
                 }),
       [](Socket* conn) {
-        SaslClient sasl_client(kSaslAppName, conn->GetFd());
+        SaslClient sasl_client(kSaslAppName, conn);
         sasl_client.set_server_fqdn("127.0.0.1");
         // The client enables both PLAIN and GSSAPI.
         CHECK_OK(sasl_client.EnablePlain("foo", "bar"));
         CHECK_OK(sasl_client.Init(kSaslAppName));
         Status s = sasl_client.Negotiate();
-        ASSERT_STR_CONTAINS(s.ToString(), "no mechanism available: No worthy mechs found");
+        ASSERT_STR_CONTAINS(s.ToString(), "client was missing the required SASL module");
       });
 }
 
@@ -277,8 +279,16 @@ TEST_F(TestSaslRpc, TestGSSAPINegotiation) {
 
   // Create the server principal and keytab.
   string kt_path;
-  ASSERT_OK(kdc.CreateServiceKeytab("kudu/localhost", &kt_path));
+  ASSERT_OK(kdc.CreateServiceKeytab("kudu/127.0.0.1", &kt_path));
   CHECK_ERR(setenv("KRB5_KTNAME", kt_path.c_str(), 1 /*replace*/));
+
+#if defined(__APPLE__)
+  string kErrorMsg = strings::Substitute("get-pricipal open($0): "
+                                         "No such file or directory (negative cache)",
+                                         kInvalidPath);
+#else
+  string kErrorMsg = "No Kerberos credentials available";
+#endif
 
   // Try to negotiate with no krb5 credentials on the client. It should fail on both
   // sides.
@@ -291,11 +301,10 @@ TEST_F(TestSaslRpc, TestGSSAPINegotiation) {
                   CHECK(s.IsNetworkError());
                 }),
       std::bind(RunGSSAPINegotiationClient, std::placeholders::_1,
-                [](const Status& s, SaslClient& client) {
+                [kErrorMsg](const Status& s, SaslClient& client) {
                   CHECK(s.IsNotAuthorized());
-                  CHECK_EQ(s.message(), "No Kerberos credentials available");
+                  CHECK_EQ(s.message().ToString(), kErrorMsg);
                 }));
-
 
   // Create and kinit as a client user.
   ASSERT_OK(kdc.CreateUserPrincipal("testuser"));
@@ -316,11 +325,10 @@ TEST_F(TestSaslRpc, TestGSSAPINegotiation) {
                   CHECK_EQ(SaslMechanism::GSSAPI, client.negotiated_mechanism());
                 }));
 
-
   // Change the server's keytab file so that it has inappropriate
   // credentials.
   // Authentication should now fail.
-  ASSERT_OK(kdc.CreateServiceKeytab("kudu/other-host", &kt_path));
+  ASSERT_OK(kdc.CreateServiceKeytab("otherservice/127.0.0.1", &kt_path));
   CHECK_ERR(setenv("KRB5_KTNAME", kt_path.c_str(), 1 /*replace*/));
 
   RunNegotiationTest(
@@ -328,21 +336,51 @@ TEST_F(TestSaslRpc, TestGSSAPINegotiation) {
                 [](const Status& s, SaslServer& server) {
                   CHECK(s.IsNotAuthorized());
                   ASSERT_STR_CONTAINS(s.ToString(),
-                                      "No key table entry found matching kudu/localhost");
+                                      "No key table entry found matching kudu/127.0.0.1");
                 }),
       std::bind(RunGSSAPINegotiationClient, std::placeholders::_1,
                 [](const Status& s, SaslClient& client) {
                   CHECK(s.IsNotAuthorized());
                   ASSERT_STR_CONTAINS(s.ToString(),
-                                      "No key table entry found matching kudu/localhost");
+                                      "No key table entry found matching kudu/127.0.0.1");
                 }));
 
+}
+
+// Test that the pre-flight check for servers requiring Kerberos provides
+// nice error messages for missing or bad keytabs.
+TEST_F(TestSaslRpc, TestPreflight) {
+  // Try pre-flight with no keytab.
+  Status s = SaslServer::PreflightCheckGSSAPI(kSaslAppName);
+  ASSERT_STR_MATCHES(s.ToString(), "Key table file.*not found");
+
+  // Try with a valid krb5 environment and keytab.
+  MiniKdc kdc;
+  ASSERT_OK(kdc.Start());
+  ASSERT_OK(kdc.SetKrb5Environment());
+  string kt_path;
+  ASSERT_OK(kdc.CreateServiceKeytab("kudu/127.0.0.1", &kt_path));
+  CHECK_ERR(setenv("KRB5_KTNAME", kt_path.c_str(), 1 /*replace*/));
+
+  ASSERT_OK(SaslServer::PreflightCheckGSSAPI(kSaslAppName));
+
+  // Try with an inaccessible keytab.
+  CHECK_ERR(chmod(kt_path.c_str(), 0000));
+  s = SaslServer::PreflightCheckGSSAPI(kSaslAppName);
+  ASSERT_STR_MATCHES(s.ToString(), "error accessing keytab: Permission denied");
+  CHECK_ERR(unlink(kt_path.c_str()));
+
+  // Try with a keytab that has the wrong credentials.
+  ASSERT_OK(kdc.CreateServiceKeytab("wrong-service/127.0.0.1", &kt_path));
+  CHECK_ERR(setenv("KRB5_KTNAME", kt_path.c_str(), 1 /*replace*/));
+  s = SaslServer::PreflightCheckGSSAPI(kSaslAppName);
+  ASSERT_STR_MATCHES(s.ToString(), "No key table entry found matching kudu/.*");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
 static void RunTimeoutExpectingServer(Socket* conn) {
-  SaslServer sasl_server(kSaslAppName, conn->GetFd());
+  SaslServer sasl_server(kSaslAppName, conn);
   CHECK_OK(sasl_server.EnableAnonymous());
   CHECK_OK(sasl_server.Init(kSaslAppName));
   Status s = sasl_server.Negotiate();
@@ -351,7 +389,7 @@ static void RunTimeoutExpectingServer(Socket* conn) {
 }
 
 static void RunTimeoutNegotiationClient(Socket* sock) {
-  SaslClient sasl_client(kSaslAppName, sock->GetFd());
+  SaslClient sasl_client(kSaslAppName, sock);
   CHECK_OK(sasl_client.EnableAnonymous());
   CHECK_OK(sasl_client.Init(kSaslAppName));
   MonoTime deadline = MonoTime::Now() - MonoDelta::FromMilliseconds(100L);
@@ -369,7 +407,7 @@ TEST_F(TestSaslRpc, TestClientTimeout) {
 ////////////////////////////////////////////////////////////////////////////////
 
 static void RunTimeoutNegotiationServer(Socket* sock) {
-  SaslServer sasl_server(kSaslAppName, sock->GetFd());
+  SaslServer sasl_server(kSaslAppName, sock);
   CHECK_OK(sasl_server.EnableAnonymous());
   CHECK_OK(sasl_server.Init(kSaslAppName));
   MonoTime deadline = MonoTime::Now() - MonoDelta::FromMilliseconds(100L);
@@ -380,7 +418,7 @@ static void RunTimeoutNegotiationServer(Socket* sock) {
 }
 
 static void RunTimeoutExpectingClient(Socket* conn) {
-  SaslClient sasl_client(kSaslAppName, conn->GetFd());
+  SaslClient sasl_client(kSaslAppName, conn);
   CHECK_OK(sasl_client.EnableAnonymous());
   CHECK_OK(sasl_client.Init(kSaslAppName));
   Status s = sasl_client.Negotiate();

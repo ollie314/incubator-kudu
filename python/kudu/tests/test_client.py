@@ -34,6 +34,7 @@ class TestClient(KuduTestBase, unittest.TestCase):
 
         self.assertEqual(table.name, self.ex_table)
         self.assertEqual(table.num_columns, len(self.schema))
+        self.assertIsNotNone(table.id)
 
     def test_table_column(self):
         table = self.client.table(self.ex_table)
@@ -131,7 +132,12 @@ class TestClient(KuduTestBase, unittest.TestCase):
 
             self.client.create_table(
                 name, self.schema,
-                partitioning=Partitioning().set_range_partition_columns([]))
+                partitioning=Partitioning()
+                    .set_range_partition_columns(['key'])
+                    .add_range_partition_split({'key': 10})
+                    .add_range_partition_split([20])
+                    .add_range_partition_split((30,))
+            )
             self.client.delete_table(name)
 
             self.client.create_table(
@@ -200,6 +206,31 @@ class TestClient(KuduTestBase, unittest.TestCase):
         scanner = table.scanner().open()
         assert len(scanner.read_all_tuples()) == 0
 
+    def test_failed_write_op(self):
+        # Insert row
+        table = self.client.table(self.ex_table)
+        session = self.client.new_session()
+        session.apply(table.new_insert({'key': 1}))
+        session.flush()
+
+        # Attempt to insert row again
+        session.apply(table.new_insert({'key': 1}))
+        self.assertRaises(kudu.KuduBadStatus, session.flush)
+
+        # Check errors
+        errors, overflowed = session.get_pending_errors()
+        self.assertFalse(overflowed)
+        self.assertEqual(len(errors), 1)
+        error = errors[0]
+        # This test passes because we currently always return
+        # True.
+        self.assertTrue(error.was_possibly_successful())
+        self.assertEqual(error.failed_op(), 'INSERT int32 key=1')
+
+        # Delete inserted row
+        session.apply(table.new_delete({'key': 1}))
+        session.flush()
+
     def test_session_auto_open(self):
         table = self.client.table(self.ex_table)
         scanner = table.scanner()
@@ -244,6 +275,25 @@ class TestClient(KuduTestBase, unittest.TestCase):
             assert tserver.uuid() is not None
             assert tserver.hostname() is not None
             assert tserver.port() is not None
+
+    def test_bad_partialrow(self):
+        table = self.client.table(self.ex_table)
+        op = table.new_insert()
+        # Test bad keys or indexes
+        keys = [
+            ('not-there', KeyError),
+            (len(self.schema) + 1, IndexError),
+            (-1, IndexError)
+        ]
+
+        for key in keys:
+            with self.assertRaises(key[1]):
+                op[key[0]] = 'test'
+
+        # Test incorrectly typed data
+        with self.assertRaises(TypeError):
+            op['int_val'] = 'incorrect'
+
 
 class TestMonoDelta(unittest.TestCase):
 

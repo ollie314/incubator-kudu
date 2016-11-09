@@ -33,11 +33,50 @@
 [[rn_1.1.0_new_features]]
 == New features
 
-XXX
+* The Python client has been brought up to feature parity with the Java and {cpp} clients
+  and as such the package version will be brought to 1.1 with this release (from 0.3). A
+  list of the highlights can be found below.
+    ** Improved Partial Row semantics
+    ** Range partition support
+    ** Scan Token API
+    ** Enhanced predicate support
+    ** Support for all Kudu data types (including a mapping of Python's `datetime.datetime` to
+    `UNIXTIME_MICROS`)
+    ** Alter table support
+    ** Enabled Read at Snapshot for Scanners
+    ** Enabled Scanner Replica Selection
+    ** A few bug fixes for Python 3 in addition to various other improvements.
+
+* IN LIST predicate pushdown support was added to allow optimized execution of filters which
+  match on a set of column values. Support for Spark, Map Reduce and Impala queries utilizing
+  IN LIST pushdown is not yet complete.
+
+* The Java client now features client-side request tracing in order to help troubleshoot timeouts.
+  Error messages are now augmented with traces that show which servers were contacted before the
+  timeout occured instead of just the last error. The traces also contain RPCs that were
+  required to fulfill the client's request, such as contacting the master to discover a tablet's
+  location. Note that the traces are not available for successful requests and are not
+  programatically queryable.
 
 == Optimizations and improvements
 
-XXX
+* Kudu now publishes JAR files for Spark 2.0 compiled with Scala 2.11 along with the
+  existing Spark 1.6 JAR compiled with Scala 2.10.
+
+* The Java client now allows configuring scanners to read from the closest replica instead of
+  the known leader replica. The default remains the latter. Use the relevant `ReplicaSelection`
+  enum with the scanner's builder to change this behavior.
+
+=== Command line tools
+
+* The tool `kudu tablet leader_step_down` has been added to manually force a leader to step down.
+* The tool `kudu remote_replica copy` has been added to manually copy a replica from
+  one running tablet server to another.
+* The tool `kudu local_replica delete` has been added to delete a replica of a tablet.
+* The `kudu test loadgen` tool has been added to replace the obsoleted
+  `insert-generated-rows` standalone binary. The new tool is enriched with
+  additional functionality and can be used to run load generation tests against
+  a Kudu cluster.
 
 == Wire protocol compatibility
 
@@ -48,16 +87,30 @@ XXX
 
 === Client APIs ({cpp}/Java/Python)
 
-- The {cpp} client library no longer requires the
+* The {cpp} client no longer requires the
   link:https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html[old gcc5 ABI].
   Which ABI is actually used depends on the compiler configuration. Some new distros
   (e.g. Ubuntu 16.04) will use the new ABI. Your application must use the same ABI as is
   used by the client library; an easy way to guarantee this is to use the same compiler
   to build both.
 
-- The Java client's `OperationResponse.getWriteTimestamp` method was renamed to `getWriteTimestampRaw`
+* The {cpp} client's `KuduSession::CountBufferedOperations()` method is
+  deprecated. Its behavior is inconsistent unless the session runs in the
+  `MANUAL_FLUSH` mode. Instead, to get number of buffered operations, count
+  invocations of the `KuduSession::Apply()` method since last
+  `KuduSession::Flush()` call or, if using asynchronous flushing, since last
+  invocation of the callback passed into `KuduSession::FlushAsync()`.
+
+* The Java client's `OperationResponse.getWriteTimestamp` method was renamed to `getWriteTimestampRaw`
   to emphasize that it doesn't return milliseconds, unlike what its Javadoc indicated. The renamed
   method was also hidden from the public APIs and should not be used.
+
+* The Java client's sync API (`KuduClient`, `KuduSession`, `KuduScanner`) used to throw either
+  a `NonRecoverableException` or a `TimeoutException` for a timeout, and now it's only possible for the
+  client to throw the former.
+
+* The Java client's handling of errors in `KuduSession` was modified so that subclasses of
+  `KuduException` are converted into RowErrors instead of being thrown.
 
 [[known_issues_and_limitations]]
 == Known Issues and Limitations

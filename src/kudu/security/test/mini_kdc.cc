@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "kudu/security/mini_kdc.h"
+#include "kudu/security/test/mini_kdc.h"
 
 #include <csignal>
 #include <stdlib.h>
@@ -73,7 +73,7 @@ map<string, string> MiniKdc::GetEnvVars() const {
   return {
     {"KRB5_CONFIG", JoinPathSegments(options_.data_root, "krb5.conf")},
     {"KRB5_KDC_PROFILE", JoinPathSegments(options_.data_root, "kdc.conf")},
-    {"KRB5CCNAME", "DIR:" + JoinPathSegments(options_.data_root, "krb5cc")}
+    {"KRB5CCNAME", JoinPathSegments(options_.data_root, "krb5cc")}
   };
 }
 
@@ -191,8 +191,7 @@ Status MiniKdc::Stop() {
 Status MiniKdc::CreateKdcConf() const {
   static const string kFileTemplate = R"(
 [kdcdefaults]
-kdc_ports = ""
-kdc_tcp_ports = $2
+kdc_ports = $2
 
 [realms]
 $1 = {
@@ -223,8 +222,14 @@ Status MiniKdc::CreateKrb5Conf() const {
     renew_lifetime = 7d
     ticket_lifetime = 24h
 
-    # The KDC is configured to only use TCP, so the client should not prefer UDP.
-    udp_preference_limit = 0
+    # In miniclusters, we start daemons on local loopback IPs that
+    # have no reverse DNS entries. So, disable reverse DNS.
+    rdns = false
+
+    # The server side will start its GSSAPI server using the local FQDN.
+    # However, in tests, we connect to it via a non-matching loopback IP.
+    # This enables us to connect despite that mismatch.
+    ignore_acceptor_hostname = true
 
 [realms]
     $1 = {
@@ -245,12 +250,12 @@ Status MiniKdc::WaitForKdcPorts() {
   // bind to the ports.
 
   string lsof;
-  RETURN_NOT_OK(GetBinaryPath("lsof", {"/sbin"}, &lsof));
+  RETURN_NOT_OK(GetBinaryPath("lsof", {"/sbin", "/usr/sbin"}, &lsof));
 
   vector<string> cmd = {
-    lsof, "-wbn", "-Fn",
+    lsof, "-wbn", "-Ffn",
     "-p", std::to_string(kdc_process_->pid()),
-    "-a", "-i", "4TCP"};
+    "-a", "-i", "4UDP"};
 
   string lsof_out;
   for (int i = 1; ; i++) {
@@ -267,16 +272,18 @@ Status MiniKdc::WaitForKdcPorts() {
     SleepFor(MonoDelta::FromMilliseconds(i * i));
   }
 
-  // The '-Fn' flag gets lsof to output something like:
+  // The '-Ffn' flag gets lsof to output something like:
   //   p19730
+  //   f123
   //   n*:41254
-  // The first line is the pid, which we already know. The second has the
-  // bind address and port.
+  // The first line is the pid. We ignore it.
+  // The second line is the file descriptor number. We ignore it.
+  // The third line has the bind address and port.
   vector<string> lines = strings::Split(lsof_out, "\n");
   int32_t port = -1;
-  if (lines.size() != 2 ||
-      lines[1].substr(0, 3) != "n*:" ||
-      !safe_strto32(lines[1].substr(3), &port) ||
+  if (lines.size() != 3 ||
+      lines[2].substr(0, 3) != "n*:" ||
+      !safe_strto32(lines[2].substr(3), &port) ||
       port <= 0) {
     return Status::RuntimeError("unexpected lsof output", lsof_out);
   }
@@ -316,6 +323,12 @@ Status MiniKdc::Kinit(const string& username) {
   RETURN_NOT_OK(GetBinaryPath("kinit", &kinit));
   Subprocess::Call(MakeArgv({ kinit, username }), username);
   return Status::OK();
+}
+
+Status MiniKdc::Kdestroy() {
+  string kdestroy;
+  RETURN_NOT_OK(GetBinaryPath("kdestroy", &kdestroy));
+  return Subprocess::Call(MakeArgv({ kdestroy, "-A" }));
 }
 
 Status MiniKdc::Klist(string* output) {

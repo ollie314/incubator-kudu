@@ -170,7 +170,7 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
 
     cdef cppclass KuduColumnSpec:
 
-         KuduColumnSpec* Default(KuduValue* value)
+         KuduColumnSpec* Default(C_KuduValue* value)
          KuduColumnSpec* RemoveDefault()
 
          KuduColumnSpec* Compression(CompressionType compression)
@@ -436,21 +436,21 @@ cdef extern from "kudu/client/scan_predicate.h" namespace "kudu::client" nogil:
 
 cdef extern from "kudu/client/value.h" namespace "kudu::client" nogil:
 
-    cdef cppclass KuduValue:
+    cdef cppclass C_KuduValue "kudu::client::KuduValue":
         @staticmethod
-        KuduValue* FromInt(int64_t val);
+        C_KuduValue* FromInt(int64_t val);
 
         @staticmethod
-        KuduValue* FromFloat(float val);
+        C_KuduValue* FromFloat(float val);
 
         @staticmethod
-        KuduValue* FromDouble(double val);
+        C_KuduValue* FromDouble(double val);
 
         @staticmethod
-        KuduValue* FromBool(c_bool val);
+        C_KuduValue* FromBool(c_bool val);
 
         @staticmethod
-        KuduValue* CopyString(const Slice& s);
+        C_KuduValue* CopyString(const Slice& s);
 
 
 cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
@@ -463,6 +463,10 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
     enum ReadMode" kudu::client::KuduScanner::ReadMode":
         ReadMode_Latest " kudu::client::KuduScanner::READ_LATEST"
         ReadMode_Snapshot " kudu::client::KuduScanner::READ_AT_SNAPSHOT"
+
+    enum RangePartitionBound" kudu::client::KuduTableCreator::RangePartitionBound":
+        PartitionType_Exclusive " kudu::client::KuduTableCreator::EXCLUSIVE_BOUND"
+        PartitionType_Inclusive " kudu::client::KuduTableCreator::INCLUSIVE_BOUND"
 
     cdef cppclass KuduClient:
 
@@ -518,6 +522,11 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
                                               int num_buckets,
                                               int seed)
         KuduTableCreator& set_range_partition_columns(vector[string]& columns)
+        KuduTableCreator& add_range_partition(KuduPartialRow* lower_bound,
+                                              KuduPartialRow* upper_bound,
+                                              RangePartitionBound lower_bound_type,
+                                              RangePartitionBound upper_bound_type)
+        KuduTableCreator& add_range_partition_split(KuduPartialRow* split_row)
         KuduTableCreator& split_rows(vector[const KuduPartialRow*]& split_rows)
         KuduTableCreator& num_replicas(int n_replicas)
         KuduTableCreator& wait(c_bool wait)
@@ -551,6 +560,7 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
     cdef cppclass KuduTable:
 
         string& name()
+        string& id()
         KuduSchema& schema()
         int num_replicas()
 
@@ -561,9 +571,9 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
 
         KuduPredicate* NewComparisonPredicate(const Slice& col_name,
                                               ComparisonOp op,
-                                              KuduValue* value);
+                                              C_KuduValue* value);
         KuduPredicate* NewInListPredicate(const Slice& col_name,
-                                          vector[KuduValue*]* values)
+                                          vector[C_KuduValue*]* values)
 
         KuduClient* client()
         # const PartitionSchema& partition_schema()
@@ -626,9 +636,8 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
         c_bool HasMoreRows()
         Status NextBatch(KuduScanBatch* batch)
         Status SetBatchSizeBytes(uint32_t batch_size)
-
         Status SetSelection(ReplicaSelection selection)
-
+        Status SetCacheBlocks(c_bool cache_blocks)
         Status SetReadMode(ReadMode read_mode)
         Status SetSnapshotMicros(uint64_t snapshot_timestamp_micros)
         Status SetTimeoutMillis(int millis)
@@ -637,6 +646,8 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
         Status SetFaultTolerant()
         Status AddLowerBound(const KuduPartialRow& key)
         Status AddExclusiveUpperBound(const KuduPartialRow& key)
+        Status KeepAlive()
+        Status GetCurrentServer(KuduTabletServer** server)
 
         KuduSchema GetProjectionSchema()
         const ResourceMetrics& GetResourceMetrics()
